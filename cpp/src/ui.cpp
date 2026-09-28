@@ -902,11 +902,9 @@ EngineTuner::Guard engineGuardFor(DWORD pid) {
 
 std::string multiplayerSummary() {
     if (!isConvoyCheckEnabled()) {
-        return "联机保护：拦截 TruckersMP；联运检测已关闭（允许在官方 Convoy 中使用），"
-               "但一旦无法枚举游戏模块则仍按联机拒绝写入。";
+        return "联机保护：拦截 TruckersMP（联运检测已关闭）。";
     }
-    return "联机保护：严格阻止 TruckersMP 与官方 Convoy；开启检测时读不到 game.log.txt "
-           "或模块枚举失败将标记为「无法确认」并拒绝写入；运行中每 5 秒复查。";
+    return "联机保护：阻止 TruckersMP 与官方 Convoy；状态无法确认时拒绝写入。";
 }
 
 }  // namespace
@@ -1373,7 +1371,7 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
     ::ImGui::Spacing();
 
     // 步骤 1: 扫描定位
-    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "步骤 1: 扫描定位游戏内存");
+    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 扫描");
     ::ImGui::SameLine(220.0f);
     ::ImGui::TextUnformatted("类型");
     ::ImGui::SameLine();
@@ -1389,7 +1387,7 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
     ::ImGui::TextUnformatted("游戏当前值");
     ::ImGui::SameLine(100.0f);
     ::ImGui::SetNextItemWidth(170);
-    ::ImGui::InputTextWithHint("##current", "填写当前游戏内数值", current, 32, ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::InputTextWithHint("##current", "当前数值", current, 32, ImGuiInputTextFlags_CharsDecimal);
     ::ImGui::SameLine();
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 首次扫描 ", ImVec2(120, 26))) startFirstScan(app, kind);
@@ -1402,11 +1400,11 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
     ::ImGui::Spacing();
 
     // 步骤 2: 修改生效
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "步骤 2: 修改目标数值并保持");
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "② 写入 / 锁定");
     ::ImGui::TextUnformatted("目标修改值");
     ::ImGui::SameLine(100.0f);
     ::ImGui::SetNextItemWidth(170);
-    ::ImGui::InputTextWithHint("##target", "想要修改成的数值", target, 32, ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::InputTextWithHint("##target", "目标数值", target, 32, ImGuiInputTextFlags_CharsDecimal);
     ::ImGui::SameLine();
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 写入修改(立即生效) ", ImVec2(170, 26))) writePanelValues(app, kind);
@@ -1421,7 +1419,7 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
 
     // 快速预设按钮
     if (kind == PanelKind::Money) {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "快速金额预设：");
+        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
         ::ImGui::SameLine();
         if (::ImGui::Button("+100万")) {
             double cur = 0;
@@ -1441,7 +1439,7 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
         ::ImGui::SameLine();
         if (::ImGui::Button("9.99 亿(上限)")) ::strncpy_s(target, 32, "999999999", _TRUNCATE);
     } else if (kind == PanelKind::Xp) {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "快速等级预设：");
+        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
         ::ImGui::SameLine();
         if (::ImGui::Button("5,000 (约10级)")) ::strncpy_s(target, 32, "5000", _TRUNCATE);
         ::ImGui::SameLine();
@@ -1464,34 +1462,16 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
 }
 
 void renderMoneyTab(AppState& app) {
-    ::ImGui::TextWrapped(
-        "直接在游戏运行时修改内存 —— 改完立刻在游戏里生效；游戏自动存档时会把新数值写进存档，"
-        "所以效果是持久的。");
-    ::ImGui::Spacing();
     renderValuePanel(app, PanelKind::Money, "现金（钱）",
-                     "先在游戏里看一眼现金，填到「游戏里当前的数值」，再点「① 扫描这个数值」"
-                     "（约 10~25 秒）。命中多时在游戏里花/赚点钱，填新数字点「② 收窄」。",
+                     "填游戏里的现金 → 首次扫描；金额变化后填新值 → 变动后收窄。",
                      &app.moneyType, app.moneyCurrent, app.moneyTarget, &app.moneyLock);
     ::ImGui::Spacing();
     renderValuePanel(app, PanelKind::Xp, "经验值",
-                     "经验在游戏里是 32 位整数。改经验会连带升级、拿到技能点。",
+                     "32 位整数；改动会连带升级并给技能点。",
                      &app.xpType, app.xpCurrent, app.xpTarget, &app.xpLock);
-    ::ImGui::Spacing();
-    if (::ImGui::CollapsingHeader("推荐流程 / 小提示")) {
-        ::ImGui::BulletText("1. 启动游戏（单机）并进入车内或车库；");
-        ::ImGui::BulletText("2. 点上方「附加游戏」，状态变成「已附加」；");
-        ::ImGui::BulletText("3. 看游戏里的现金，填进「当前数值」→ ① 扫描（约 10~25 秒）；");
-        ::ImGui::BulletText("4. 命中多时：让金额变化后填新数字 → ② 收窄，重复到命中 1~10 个；");
-        ::ImGui::BulletText("5. 填「要改成」的目标值 → ③ 写入内存，游戏里立刻到账；");
-        ::ImGui::BulletText("6. 想固定住就勾「锁定该数值」（每 0.25 秒写回一次）。");
-    }
 }
 
 void renderVehicleTabImpl(AppState& app) {
-    ::ImGui::TextWrapped(
-        "车辆功能基于 ETS2 动态指针链与 SCS 遥测校验，无需搜索内存，随开随用，换车/读档自动跟随当前车辆。");
-    ::ImGui::Spacing();
-
     if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock || app.autoAntiRollLock)) {
         const std::string liveStatus = app.vehicleLocker->status();
         if (app.autoFuelLock) app.fuelStatus = liveStatus;
@@ -1502,34 +1482,34 @@ void renderVehicleTabImpl(AppState& app) {
     // --- 一键车辆状态锁定 Card ---
     ::ImGui::BeginChild("##auto_vehicle", ImVec2(0, 0),
                         ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 一键车辆状态保持 (动态指针链追踪)");
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 车辆状态保持");
     ::ImGui::Separator();
     ::ImGui::Spacing();
 
     bool fuel = app.autoFuelLock;
-    if (::ImGui::Checkbox("无限油量（自动补满油箱并动态保持）", &fuel)) {
+    if (::ImGui::Checkbox("无限油量", &fuel)) {
         toggleAutoVehicleLock(app, true, fuel);
     }
     ::ImGui::SameLine(380.0f);
     if (app.autoFuelLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 锁定保持中: 100% ]");
+        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 已锁定 ]");
     } else {
         ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
     }
 
     bool damage = app.autoDamageLock;
-    if (::ImGui::Checkbox("车辆无损（车身/底盘/机件五项损伤清零）", &damage)) {
+    if (::ImGui::Checkbox("车辆无损", &damage)) {
         toggleAutoVehicleLock(app, false, damage);
     }
     ::ImGui::SameLine(380.0f);
     if (app.autoDamageLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 保持无损中: 0.00% ]");
+        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 已锁定 ]");
     } else {
         ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
     }
 
     ::ImGui::Spacing();
-    if (::ImGui::Button(" 一键全部开启 (油量+无损) ")) {
+    if (::ImGui::Button(" 全部开启 ")) {
         if (!app.autoFuelLock) toggleAutoVehicleLock(app, true, true);
         if (!app.autoDamageLock) toggleAutoVehicleLock(app, false, true);
     }
@@ -1539,39 +1519,35 @@ void renderVehicleTabImpl(AppState& app) {
         if (app.autoDamageLock) toggleAutoVehicleLock(app, false, false);
     }
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "油量遥测：%s", app.fuelStatus.c_str());
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "损伤遥测：%s", app.damageStatus.c_str());
+    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "油量：%s", app.fuelStatus.c_str());
+    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "损伤：%s", app.damageStatus.c_str());
     ::ImGui::EndChild();
 
     ::ImGui::Spacing();
 
-    // --- 防侧翻 / 动态不倒翁重心稳定 (Scheme B) Card ---
+    // --- 防侧翻 / 动态重心稳定 Card ---
     ::ImGui::BeginChild("##anti_roll", ImVec2(0, 0),
                         ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 防侧翻 / 动态重心稳定 (方案B - 不倒翁单摆重力回正)");
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 防侧翻 / 重心稳定");
     ::ImGui::Separator();
-    ::ImGui::Spacing();
-    ::ImGui::TextWrapped(
-        "原理：逆向定位 Bullet 物理引擎卡车 Actor 重心 Y 轴偏移 (Offset +0x468) 与横向防倾阻尼。"
-        "将物理重心动态置于底盘下方，形成超强单摆力矩，车辆如不倒翁般高速过弯自动回正，绝不翻车。");
     ::ImGui::Spacing();
 
     bool antiRoll = app.autoAntiRollLock;
-    if (::ImGui::Checkbox("启用防侧翻 / 不倒翁模式 (高速急转自动回正)", &antiRoll)) {
+    if (::ImGui::Checkbox("防侧翻（高速过弯自动回正）", &antiRoll)) {
         toggleAutoAntiRollLock(app, antiRoll, app.antiRollFactor);
     }
     ::ImGui::SameLine(380.0f);
     if (app.autoAntiRollLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 不倒翁生效中: %.1fx ]", app.antiRollFactor);
+        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 生效中 %.1fx ]", app.antiRollFactor);
     } else {
         ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
     }
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("防倾回正强度：");
+    ::ImGui::TextUnformatted("强度");
     ::ImGui::SameLine();
     static const float kFactors[] = {1.5f, 2.0f, 3.0f, 5.0f};
-    static const char* kFactorLabels[] = {"柔和稳态 (1.5×)", "公路巡航 (2.0×)", "不倒翁推荐 (3.0×)", "贴地飞行 (5.0×)"};
+    static const char* kFactorLabels[] = {"1.5×", "2.0×", "3.0× 推荐", "5.0×"};
     for (int i = 0; i < 4; ++i) {
         if (i > 0) ::ImGui::SameLine();
         const bool active = std::fabs(app.antiRollFactor - kFactors[i]) < 0.1f;
@@ -1590,7 +1566,7 @@ void renderVehicleTabImpl(AppState& app) {
     }
 
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "物理状态：%s", app.antiRollStatus.c_str());
+    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "状态：%s", app.antiRollStatus.c_str());
     ::ImGui::EndChild();
 
     ::ImGui::Spacing();
@@ -1598,11 +1574,9 @@ void renderVehicleTabImpl(AppState& app) {
     // --- 发动机动力调校 Card ---
     ::ImGui::BeginChild("##engine_power", ImVec2(0, 0),
                         ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 发动机动力调校与极速提升");
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 发动机动力");
     ::ImGui::Separator();
     ::ImGui::Spacing();
-    ::ImGui::TextWrapped(
-        "改写当前车辆发动机的峰值扭矩，大幅缩短提速时间；开启转速上限可同时提升极速。换车/改回原厂自动恢复。");
     ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "%s", multiplayerSummary().c_str());
     if (!app.mpDetail.empty()) {
         ::ImGui::TextColored(app.mpBlocks ? ImVec4(0.95f, 0.40f, 0.40f, 1.0f)
@@ -1611,9 +1585,9 @@ void renderVehicleTabImpl(AppState& app) {
     }
     ::ImGui::Spacing();
 
-    ::ImGui::TextUnformatted("动力倍率：");
+    ::ImGui::TextUnformatted("倍率");
     ::ImGui::SameLine();
-    static const char* kPowerPills[] = {"原厂动力 (1.0×)", "轻度增强 (1.25×)", "强力超车 (1.50×)", "暴力狂飙 (2.00×)"};
+    static const char* kPowerPills[] = {"原厂", "1.25×", "1.50×", "2.00×"};
     for (int i = 0; i < 4; ++i) {
         if (i > 0) ::ImGui::SameLine();
         const bool active = (app.enginePowerOption == i);
@@ -1630,11 +1604,11 @@ void renderVehicleTabImpl(AppState& app) {
 
     ::ImGui::Spacing();
     bool raise = app.engineRaiseLimit;
-    if (::ImGui::Checkbox("提升转速上限 +10%（突破电子限速，提高极速）", &raise)) {
+    if (::ImGui::Checkbox("转速上限 +10%", &raise)) {
         applyEnginePower(app, app.enginePowerOption, raise);
     }
     ::ImGui::SameLine(380.0f);
-    if (::ImGui::Button(" ↩ 恢复原厂动力与转速 ")) {
+    if (::ImGui::Button(" ↩ 恢复原厂 ")) {
         applyEnginePower(app, 0, false);
     }
 
@@ -1654,10 +1628,8 @@ void renderVehicleTabImpl(AppState& app) {
     ::ImGui::EndChild();
 
     ::ImGui::Spacing();
-    if (::ImGui::CollapsingHeader("高级：手动扫描（仅兼容性排查）")) {
-        ::ImGui::TextWrapped(
-            "这里保留原来的手动工具用于排查新版本，但不建议日常使用。全内存扫描会显著增加"
-            "游戏内存压力；请先存档，并且不要在内存紧张时运行。");
+    if (::ImGui::CollapsingHeader("高级：手动扫描（兼容性排查用）")) {
+        ::ImGui::TextWrapped("全内存扫描会明显增加游戏内存压力，建议先存档。");
         ::ImGui::Spacing();
         renderValuePanel(app, PanelKind::Fuel, "手动油量扫描", "仅供兼容性排查。",
                          &app.fuelType, app.fuelCurrent, app.fuelTarget, &app.fuelLock);
@@ -1665,20 +1637,9 @@ void renderVehicleTabImpl(AppState& app) {
         renderValuePanel(app, PanelKind::Damage, "手动损坏扫描", "仅供兼容性排查。",
                          &app.damageType, app.damageCurrent, app.damageTarget, &app.damageLock);
     }
-    if (::ImGui::CollapsingHeader("使用要点", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ::ImGui::BulletText("进入驾驶界面后附加游戏，再勾选所需功能；无需输入当前数值。");
-        ::ImGui::BulletText("换车、读档后沿固定指针链自动跟随当前车辆，不会重新扫描。");
-        ::ImGui::BulletText("需要现有的 scs-telemetry.dll；本机游戏目录已经安装。");
-        ::ImGui::BulletText("版本指纹或结构与 1.61.1.1 不符时只会显示失败，不会猜地址或写入。");
-        ::ImGui::BulletText("只限单机；检测到 TruckersMP 时会拒绝启用。");
-    }
 }
 
 void renderScannerTabImpl(AppState& app) {
-    ::ImGui::TextWrapped(
-        "通用扫描器：什么数值都能找（油量、里程、车速、损坏度……）。先输当前值做首次扫描，"
-        "数值变化后再用「再次扫描」逐步收窄。");
-    ::ImGui::Spacing();
     ::ImGui::TextUnformatted("类型");
     ::ImGui::SameLine();
     typeCombo("##stype", &app.scanType);
@@ -1941,10 +1902,8 @@ namespace {
 
 void renderTeleportSection(AppState& app) {
     if (!::ImGui::CollapsingHeader("地图传送（控制台 goto）", ImGuiTreeNodeFlags_DefaultOpen)) return;
-    ::ImGui::TextWrapped(
-        "通过控制台 goto 指令传送相机视口：goto 城市名 或 goto X;Y;Z。");
     ::ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.45f, 1.0f),
-                         "【注意】点击传送后，游戏视口会飞到目标地点，此时请调整好相机高度（靠近地面），按下【Ctrl + F9】即可将卡车落到该处！");
+                         "传送只移动相机；调好高度后按 Ctrl+F9 把卡车落到该处。");
     ::ImGui::Spacing();
 
     if (::ImGui::Button("读取城市列表（解密存档）", ImVec2(200, 0))) loadMapCities(app);
@@ -2046,9 +2005,6 @@ void renderTeleportSection(AppState& app) {
     ::ImGui::InputTextWithHint("##spotname", "名字", app.spotName, sizeof(app.spotName));
     ::ImGui::SameLine();
     if (::ImGui::Button("收藏当前目标", ImVec2(120, 0))) saveTeleportSpot(app);
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                         "（收藏的是上面的城市名 / 坐标输入框内容）");
     for (int i = 0; i < (int)app.teleportSpots.size(); ++i) {
         ::ImGui::PushID(i);
         if (::ImGui::Button("传送", ImVec2(60, 0))) teleportTo(app, app.teleportSpots[(size_t)i].second);
@@ -2125,13 +2081,6 @@ void renderConvoySection(AppState& app) {
     if (!::ImGui::CollapsingHeader("联运模式（Convoy / 联机）", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
-    ::ImGui::TextWrapped(
-        "欧卡2 的官方联机叫 Convoy（联运）：它没有反作弊，但和其他人一起玩时改数据会影响别人。"
-        "本程序把功能分成两类：");
-    ::ImGui::BulletText("安全功能（不写游戏内存）：控制台命令、地图传送 goto、自由相机");
-    ::ImGui::BulletText("写入功能（改游戏内存）：现金/经验、无限油量、车辆无损、发动机动力");
-    ::ImGui::Spacing();
-
     bool checkConvoy = app.checkConvoy;
     if (::ImGui::Checkbox("启用官方联运 (Convoy) 会话检测", &checkConvoy)) {
         app.checkConvoy = checkConvoy;
@@ -2141,8 +2090,7 @@ void renderConvoySection(AppState& app) {
     }
     if (!app.checkConvoy) {
         ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f),
-                             "（已关闭检测：在官方联运中可使用所有功能）");
+        ::ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "（检测已关闭）");
     }
     ::ImGui::Spacing();
 
@@ -2175,14 +2123,11 @@ void renderConvoySection(AppState& app) {
 
     if (app.checkConvoy) {
         ::ImGui::Spacing();
-        ::ImGui::TextWrapped(
-            "严格模式下联机时两类都禁用；联运模式下联机时只放开安全功能，写入功能始终禁用。"
-            "TruckersMP 无论哪种模式都全部禁用。");
         int policy = app.mpPolicy;
-        if (::ImGui::RadioButton("严格模式（推荐）：联机时禁用所有功能", &policy, 0)) {
+        if (::ImGui::RadioButton("严格模式（推荐）：联机时全部禁用", &policy, 0)) {
             setMultiplayerPolicy(app, 0);
         }
-        if (::ImGui::RadioButton("联运模式：联机时放开控制台 / 地图传送 / 自由相机", &policy, 1)) {
+        if (::ImGui::RadioButton("联运模式：联机时放开不写内存的功能", &policy, 1)) {
             setMultiplayerPolicy(app, 1);
         }
     }
@@ -2194,19 +2139,11 @@ void renderConvoySection(AppState& app) {
     ::ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
                          "写入功能：%s",
                          app.mpBlocks ? "联机中已禁用" : (app.checkConvoy ? "可用（单机）" : "可用（联运检测已关闭）"));
-    ::ImGui::Spacing();
-    ::ImGui::TextWrapped(
-        "提示：Convoy 里游戏自己也锁了一些开发功能，所以即使开了联运模式，goto / 自由相机也可能"
-        "没反应；这种情况请回到单机使用。");
 }
 
 void renderFlyModeSection(AppState& app);
 
 void renderConsoleTabImpl(AppState& app) {
-    ::ImGui::TextWrapped(
-        "把命令直接敲进游戏控制台，游戏里立刻生效（时间、警察、疲劳、收入倍率……）。"
-        "使用时会自动把游戏窗口切到前台，然后按控制台键、输入命令、回车。");
-    ::ImGui::Spacing();
     ::ImGui::TextUnformatted("控制台按键");
     ::ImGui::SameLine();
     const auto& options = consoleKeyOptions();
@@ -2243,7 +2180,7 @@ void renderConsoleTabImpl(AppState& app) {
     if (::ImGui::Button("发送到游戏", ImVec2(120, 0))) sendConsole(app, app.consoleCmd);
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("常用命令（点一下就发到游戏）：");
+    ::ImGui::TextUnformatted("常用命令");
     struct Preset {
         const char* label;
         const char* command;
@@ -2265,9 +2202,9 @@ void renderConsoleTabImpl(AppState& app) {
     }
     ::ImGui::Spacing();
     ::ImGui::TextColored(ImVec4(0.85f, 0.55f, 0.55f, 1.0f),
-                         "注意：发送命令会抢焦点，开车途中别用（先靠边停车或暂停）。");
+                         "发送会切换游戏窗口到前台，驾驶中请先停车。");
     ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
-                         "控制台需要 config.cfg 里 uset g_console \"1\" 与 uset g_developer \"1\"。");
+                         "需要 config.cfg：uset g_console \"1\" 与 uset g_developer \"1\"。");
 
     ::ImGui::Spacing();
     ::ImGui::Separator();
@@ -2279,14 +2216,6 @@ void renderConsoleTabImpl(AppState& app) {
 
 void renderFlyModeSection(AppState& app) {
     if (::ImGui::CollapsingHeader("飞行模式（自由相机）", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ::ImGui::TextWrapped(
-            "开发者自由相机：进驾驶界面后按一下开关键进入自由相机，用方向键组飞行，鼠标右键按住"
-            "转向。飞行速度由 g_flyspeed 控制，可以随时用控制台改（不用重启游戏）。");
-        ::ImGui::Spacing();
-        ::ImGui::TextWrapped(
-            "注意：原包里的「8 上升 9 下降」是旧版说明。本程序按你自己的 controls.sii 显示实际"
-            "按键，欧卡2 默认是 小键盘 8/5 = 前进/后退、4/6 = 左右、9/3 = 上/下。");
-        ::ImGui::Spacing();
         if (::ImGui::Button("检查 config.cfg", ImVec2(140, 0))) refreshFlyMode(app);
         ::ImGui::SameLine();
         if (::ImGui::Button("从 controls.sii 识别相机按键", ImVec2(220, 0))) detectCameraKeys(app);
@@ -2356,17 +2285,11 @@ void renderFlyModeSection(AppState& app) {
                 sendKeyTap('1', pid);
             }
         }
-        ::ImGui::Spacing();
-        ::ImGui::TextWrapped(
-            "说明：点「切换自由相机」后，用小键盘方向键把视口飞到目标地面上方（建议贴近地面1~2米），"
-            "然后点击「瞬移车辆到当前自由相机位置 (Ctrl+F9)」即可将车辆瞬间移动过去。");
     }
 }
 
 void renderSaveTabImpl(AppState& app) {
-    ::ImGui::TextWrapped(
-        "这里管理你的所有存档（本地 profiles + Steam 云）：一键备份、还原、解密导出。"
-        "加密(ScsC)存档只读取/备份；明文(SiiNunit)存档可以直接改现金和经验。");
+    ::ImGui::TextUnformatted("本地与 Steam 云存档；加密存档只读，明文存档可改现金 / 经验（需先退出游戏）。");
     ::ImGui::Spacing();
     if (::ImGui::Button("刷新存档列表", ImVec2(120, 0))) refreshSaves(app);
     ::ImGui::SameLine();
@@ -2420,7 +2343,7 @@ void renderSaveTabImpl(AppState& app) {
     ::ImGui::Spacing();
     ::ImGui::TextUnformatted("明文存档数值修改");
     ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "（写入前自动备份，只改数值所在的行）");
+    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "（写入前自动备份）");
     ::ImGui::TextUnformatted("现金");
     ::ImGui::SameLine();
     ::ImGui::SetNextItemWidth(150);
@@ -2436,7 +2359,7 @@ void renderSaveTabImpl(AppState& app) {
     ::ImGui::TextWrapped("%s", app.saveNote.c_str());
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("备份列表（选中后点下面的按钮还原）：");
+    ::ImGui::TextUnformatted("备份列表");
     ::ImGui::SameLine();
     if (::ImGui::Button("还原选中备份", ImVec2(120, 0))) restoreSelectedBackup(app);
     if (::ImGui::BeginTable("##backups", 4,
@@ -2472,50 +2395,18 @@ void renderSaveTabImpl(AppState& app) {
 
 void renderHelpTabImpl(AppState& app) {
     static const char* kHelp =
-        "【这个修改器能做什么】\n"
+        "【前提】先启动游戏（单机），再点顶部「附加游戏」；改内存需要管理员权限。\n"
         "\n"
-        "1. 实时改钱 / 经验（主功能）\n"
-        "   直接在游戏运行时改内存，改完立刻生效。游戏自动存档会把新数值写进存档，\n"
-        "   所以效果是持久的 —— 不需要改存档文件。\n"
+        "【改钱 / 经验】填游戏内数值 → 首次扫描 → 数值变化后收窄 → 写入 / 锁定。\n"
+        "【车辆】附加后直接勾选，无需填数值；换车、读档自动跟随当前车辆。\n"
+        "【扫描器】任意数值都可扫描；向多个候选地址写入前会要求确认。\n"
+        "【存档】备份 / 还原 / 解密导出；明文存档改数值需先退出游戏。\n"
         "\n"
-        "2. 数值扫描器\n"
-        "   类 Cheat Engine 的扫描：任何数值都能找（油量、里程、车速、损坏度……）。\n"
-        "   玩法：先输当前值 → 首次扫描 → 让数值变化 → 「再次扫描」逐步收窄 → 写入 / 锁定。\n"
-        "   尽量收窄到 1 个地址；向多个候选写入或锁定时会要求再次确认。\n"
+        "【加密存档为什么不能改】ScsC 头部含游戏自己的校验值，强写会损坏存档，\n"
+        "因此只做只读解密。要持久化金额请改内存，再让游戏自动存档。\n"
         "\n"
-        "3. 车辆（油量 / 无损 / 动力）\n"
-        "   进入驾驶界面后直接勾选「无限油量」或「车辆无损」。程序使用 1.61.1.1 固定入口\n"
-        "   沿动态指针跟随当前车辆，每 0.25 秒写回；不做数值扫描，也不要求先撞车或烧油。\n"
-        "   写入前会使用 SCS 遥测逐项校验，版本或结构不符时安全拒绝。\n"
-        "   「发动机动力」在同一页：选择 1.25× / 1.50× / 2.00× 直接改写当前发动机的峰值扭矩，\n"
-        "   勾选「转速上限 +10%」可同时提高极速；改回「原厂」、分离进程或退出程序都会写回原值。\n"
-        "   换车/换发动机/读档会先写回旧对象，A→B→A 来回切换不会叠加倍率。\n"
-        "   联机保护：严格阻止 TruckersMP（模块检测）；官方 Convoy 依据 game.log.txt 的 [MP]\n"
-        "   会话记录判定，启用前与运行中每 5 秒各复查一次。读不到日志时状态显示「无法确认」，\n"
-        "   此时 Convoy 可能检测不到 —— 这是已知限制，请自己确认在单机后再使用。\n"
-        "   「联运模式」面板可以查看会话与在线玩家；切成联运模式后，联机时只放开控制台/传送/\n"
-        "   自由相机这类不写内存的功能，写入功能在联机中始终禁用。\n"
-        "\n"
-        "4. 游戏内功能\n"
-        "   把命令直接敲进游戏控制台（g_set_time / g_police / g_fatigue / g_income_factor 等）。\n"
-        "\n"
-        "5. 存档工具\n"
-        "   列出所有存档（本地 + Steam 云），一键备份/还原、解密导出；明文存档可直接改数值。\n"
-        "   还原前必须退出游戏；程序会先备份当前状态，再执行覆盖。\n"
-        "\n"
-        "【为什么加密存档不能直接改】\n"
-        "   新版欧卡2 的 game.sii 是 ScsC 格式：头部有 32 字节游戏自己的校验值，算不出来，\n"
-        "   强写有损坏存档的风险，所以本工具只做「只读解密 + zlib 解压」。\n"
-        "   要持久化金钱/经验，请用「实时改钱」改内存，然后让游戏自动存档。\n"
-        "\n"
-        "【性能说明】\n"
-        "   一键车辆功能只读固定指针，不扫描内存。通用扫描器/实时改钱的首次扫描可能读取\n"
-        "   大量内存，内存紧张时不要使用；\n"
-        "   「再次扫描/收窄」只在候选地址上读，通常是几十毫秒。\n"
-        "\n"
-        "【安全提示】\n"
-        "   只在单机使用。TruckersMP 等联机模式下改内存可能违反规则、导致封号。\n"
-        "   本工具不修改游戏 exe，也不注入代码，只做内存读写 + 存档文件读写。";
+        "【安全】只在单机使用；TruckersMP 与官方联运中会拒绝写入。\n"
+        "　　　　本工具不修改游戏 exe，也不注入代码，只做内存与存档文件读写。";
     ::ImGui::TextWrapped("%s", kHelp);
     ::ImGui::Spacing();
     ::ImGui::Separator();
@@ -2526,12 +2417,8 @@ void renderHelpTabImpl(AppState& app) {
         app.hotkeysEnabled = hk;
         saveSettings(app);
     }
-    ::ImGui::BulletText("Ctrl + F1: 传送到导航终点 (goto nav_end)，到位置后手动按 Ctrl+F9 落车");
-    ::ImGui::BulletText("Ctrl + F2: 切换 无限油量");
-    ::ImGui::BulletText("Ctrl + F3: 切换 车辆无损");
-    ::ImGui::BulletText("Ctrl + F4: 切换 发动机动力 (原厂 <-> 2.0x)");
-    ::ImGui::BulletText("Ctrl + F5: 游戏时间调为白天 09:00 (g_set_time 9 0)");
-    ::ImGui::BulletText("Ctrl + Backspace: 撤销传送 (goto back)");
+    ::ImGui::BulletText("Ctrl+F1 传送导航终点 · Ctrl+F2 无限油量 · Ctrl+F3 车辆无损");
+    ::ImGui::BulletText("Ctrl+F4 发动机动力 · Ctrl+F5 时间 09:00 · Ctrl+Backspace 撤销传送");
     ::ImGui::Spacing();
     ::ImGui::Separator();
     ::ImGui::Spacing();
@@ -2540,7 +2427,7 @@ void renderHelpTabImpl(AppState& app) {
     ::ImGui::SetNextItemWidth(90);
     ::ImGui::DragFloat("##maxgb", &app.maxRegionGb, 0.1f, 0.0f, 64.0f, "%.1f GB");
     ::ImGui::SameLine();
-    ::ImGui::TextUnformatted("的内存区（0 = 不跳过，扫描会更慢）");
+    ::ImGui::TextUnformatted("的内存区（0 = 不跳过）");
     ::ImGui::SameLine();
     ::ImGui::TextUnformatted("   线程数");
     ::ImGui::SameLine();
@@ -2667,9 +2554,7 @@ void renderApp(AppState& app) {
     // 主标题与进程状态指示
     ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "EURO TRUCK SIMULATOR 2");
     ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "TRAINER PRO");
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.45f, 0.50f, 0.60f, 1.0f), "|  v2.1 UI Redesign");
+    ::ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "TRAINER");
 
     ::ImGui::SameLine(460.0f);
     if (attached) {
