@@ -1,0 +1,21 @@
+# 统一换行符：批处理必须是 CRLF，否则 cmd.exe 解析 goto/label 会出错
+* text=auto
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.cpp   text eol=crlf
+*.h     text eol=crlf
+*.md    text eol=crlf
+*.txt   text eol=crlf
+*.ini   text eol=crlf
+*.manifest text eol=crlf
+
+# 二进制与第三方资源不做换行转换
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.exp   binary
+*.scs   binary
+*.zip   binary
+*.sii   binary

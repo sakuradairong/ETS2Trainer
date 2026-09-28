@@ -1,0 +1,40 @@
+# ============================================================
+#  ETS2Trainer
+#  只提交源码与构建脚本：二进制产物、运行期日志/报告、个人数据、
+#  第三方二进制与游戏 mod 均不入库。
+# ============================================================
+
+# ---------- 构建产物 ----------
+cpp/build/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.exp
+*.res
+ETS2TrainerHook.*
+
+# ---------- 运行期产物与个人数据 ----------
+# 自检/实测报告里含本机路径、存档配置名、存档哈希等个人信息
+*_report.txt
+*.log
+settings.ini
+backups/
+parse_debug.log
+
+# ---------- 第三方二进制（不随仓库分发）----------
+# SCS 官方的 scs_extractor 工具与其压缩包
+tools/scs_extractor.exe
+tools/scs_extractor_1_55.zip
+tools/scs_extractor_1_55/
+# 游戏 mod（第三方素材，仅本地使用）
+mods/
+
+# ---------- 随工程附带的 Dear ImGui ----------
+# 只保留编译所需源码；文档/示例/杂项体积大且与构建无关
+cpp/vendor/imgui-1.92.9/docs/
+cpp/vendor/imgui-1.92.9/examples/
+cpp/vendor/imgui-1.92.9/misc/
+cpp/vendor/imgui-1.92.9/.github/
