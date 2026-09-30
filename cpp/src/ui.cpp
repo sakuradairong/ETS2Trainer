@@ -1,6 +1,7 @@
 // ui.cpp —— ImGui 界面实现
 #include "ui.h"
 
+#include "economy.h"
 #include "imgui.h"
 
 #include <shellapi.h>
@@ -152,6 +153,18 @@ void resetProcessState(AppState& app) {
     app.damageStatus = "未附加：车辆无损已停止。";
     app.antiRollStatus = "未附加：防侧翻已停止。";
     app.scanStatus = "未附加：扫描已失效。";
+    // 结构化定位结果绑定的地址随进程失效，必须一起清掉
+    app.locatedMoneyAddress = 0;
+    app.locatedMoneyBank = 0;
+    app.locatedMoneyValue = 0;
+    app.locatedMoneyDetail.clear();
+    app.locatedXpAddress = 0;
+    app.locatedEconomy = 0;
+    app.locatedXpValue = 0;
+    app.locatedXpDetail.clear();
+    app.locateStatus = "未定位。填好游戏里的当前金额后点「直接改钱」，程序会自动定位再写入，全程免锁定。";
+    app.autoWriteMoneyAfterLocate = false;
+    app.autoWriteXpAfterLocate = false;
     app.pendingMultiAction = 0;
     app.pendingMultiKind = -1;
     app.requestMultiConfirm = false;
@@ -1461,14 +1474,619 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
     ::ImGui::PopID();
 }
 
+// ==========================================================================
+// 金钱 / 经验：结构化定位（不依赖手动收窄）
+// ==========================================================================
+namespace {
+
+// 在候选地址里挑出「最像 bank 对象」的一个（分数最高且唯一）。
+struct ProbePick {
+    bool     found = false;
+    uint64_t address = 0;
+    uint64_t object = 0;
+    int64_t  value = 0;
+    int      score = 0;
+    int      tied = 0;      // 同分候选数量（>1 说明不够确定）
+    std::string detail;
+};
+
+ProbePick pickBestBank(const ProcessMemory& mem, const std::vector<uint64_t>& candidates,
+                       size_t cap) {
+    ProbePick best;
+    const size_t limit = candidates.size() < cap ? candidates.size() : cap;
+    for (size_t i = 0; i < limit; ++i) {
+        ProbeResult probe;
+        if (!probeBankObject(mem, candidates[i], &probe)) continue;
+        if (!best.found || probe.score > best.score) {
+            best.found = true;
+            best.address = probe.address;
+            best.object = probe.object;
+            best.value = probe.value;
+            best.score = probe.score;
+            best.tied = 1;
+            best.detail = probe.detail;
+        } else if (probe.score == best.score) {
+            ++best.tied;
+        }
+    }
+    return best;
+}
+
+ProbePick pickBestEconomy(const ProcessMemory& mem, const std::vector<uint64_t>& bankSlots,
+                          size_t cap) {
+    ProbePick best;
+    const size_t limit = bankSlots.size() < cap ? bankSlots.size() : cap;
+    for (size_t i = 0; i < limit; ++i) {
+        const uint64_t economy = economyFromBankPointer(bankSlots[i]);
+        if (!economy) continue;
+        ProbeResult probe;
+        if (!probeEconomyObject(mem, economy + economy_offsets::kEconomyExperiencePoints,
+                                &probe)) {
+            continue;
+        }
+        if (!best.found || probe.score > best.score) {
+            best.found = true;
+            best.address = probe.address;
+            best.object = probe.object;
+            best.value = probe.value;
+            best.score = probe.score;
+            best.tied = 1;
+            best.detail = probe.detail;
+        } else if (probe.score == best.score) {
+            ++best.tied;
+        }
+    }
+    return best;
+}
+
+}  // namespace
+
+void clearLocatedEconomy(AppState& app) {
+    // 清除定位结果时必须一并解除锁定，否则后台保持线程会继续写这两个地址
+    if (app.freezer) {
+        if (app.locatedMoneyAddress) app.freezer->remove(app.locatedMoneyAddress);
+        if (app.locatedXpAddress) app.freezer->remove(app.locatedXpAddress);
+    }
+    app.locatedMoneyAddress = 0;
+    app.locatedMoneyBank = 0;
+    app.locatedMoneyValue = 0;
+    app.locatedMoneyDetail.clear();
+    app.locatedXpAddress = 0;
+    app.locatedEconomy = 0;
+    app.locatedXpValue = 0;
+    app.locatedXpDetail.clear();
+    app.locateStatus = "已清除定位结果。";
+}
+
+void startLocateEconomy(AppState& app) {
+    if (app.busy.load()) {
+        app.locateStatus = "已有任务在进行，请等它结束。";
+        return;
+    }
+    if (!ensureAttached(app)) {
+        app.locateStatus = "还没有附加到游戏进程。";
+        return;
+    }
+    double moneyValue = 0.0;
+    if (!parseNumber(app.moneyCurrent, false, &moneyValue)) {
+        app.locateStatus = "请先在「游戏当前值」里填写游戏里显示的当前金钱。";
+        return;
+    }
+    double xpValue = 0.0;
+    const bool hasXp = parseNumber(app.xpCurrent, false, &xpValue);
+
+    joinWorker(app);
+    applyPending(app);
+    const int workers = app.workers;
+    const size_t regionCap = maxRegionBytes(app);
+    // 「直接改钱/直接改经验」的一键流程：把自动写入意图拍成快照带进工作线程。
+    // 捕获后立刻清掉界面侧标志，避免上一轮的意图残留到下一次手动定位。
+    const bool autoWriteMoney = app.autoWriteMoneyAfterLocate;
+    const bool autoWriteXp = app.autoWriteXpAfterLocate;
+    app.autoWriteMoneyAfterLocate = false;
+    app.autoWriteXpAfterLocate = false;
+    app.busy.store(true);
+    app.cancel.store(false);
+    app.progressDone.store(0);
+    app.progressTotal.store(2);
+    app.progressNote = "结构化定位：查找金额";
+    app.locateStatus = "定位中：在内存里寻找与当前金额一致的 bank 对象…";
+    logLine("开始结构化定位金钱/经验（基于 1.61.1.1 单位字段表）");
+
+    app.worker = std::thread([&app, moneyValue, xpValue, hasXp, workers, regionCap,
+                              autoWriteMoney, autoWriteXp]() {
+        std::string status;
+        ScanOptions opt;
+        opt.workers = workers;
+        opt.maxRegionSize = regionCap;
+        auto progressFn = [&app](uint64_t done, uint64_t total) {
+            app.progressDone.store(done);
+            app.progressTotal.store(total ? total : 1);
+        };
+        auto cancelFn = [&app]() { return app.cancel.load(); };
+
+        // 1) 按金额找 bank 对象
+        uint64_t moneyAddress = 0, moneyBank = 0, xpAddress = 0, economyObject = 0;
+        int64_t moneyFound = 0, xpFound = 0;
+        std::string moneyDetail, xpDetail;
+
+        ScanSession moneyScan(app.mem, VType::Int64, 8, 0.0);
+        const uint64_t moneyHits =
+            moneyScan.firstScan(moneyValue, opt, progressFn, cancelFn);
+        if (!app.cancel.load() && moneyHits > 0) {
+            const ProbePick pick = pickBestBank(app.mem, moneyScan.addresses(), 200000);
+            if (pick.found && pick.tied == 1) {
+                moneyAddress = pick.address;
+                moneyBank = pick.object;
+                moneyFound = pick.value;
+                moneyDetail = fmt("金额候选 %llu 个，唯一可信 bank 对象（校验 %d 分）",
+                                  (unsigned long long)moneyHits, pick.score);
+            } else if (pick.found) {
+                moneyAddress = pick.address;
+                moneyBank = pick.object;
+                moneyFound = pick.value;
+                moneyDetail = fmt("金额候选 %llu 个，校验同分 %d 个（已取第一个，建议核对）",
+                                  (unsigned long long)moneyHits, pick.tied);
+            } else {
+                moneyDetail = fmt("金额候选 %llu 个，但都没有通过 bank 结构校验",
+                                  (unsigned long long)moneyHits);
+            }
+        } else if (!app.cancel.load()) {
+            moneyDetail = "内存中没有找到与当前金额一致的数值（可在游戏里买卖一次让金额变化后重试）";
+        }
+
+        app.progressDone.store(1);
+        app.progressNote = "结构化定位：由 bank 指针反查经济对象";
+
+        // 2) 由「指向 bank 的指针」反查经济对象（经验地址随之确定）
+        if (moneyBank && !app.cancel.load()) {
+            ScanSession bankRefScan(app.mem, VType::Int64, 8, 0.0);
+            const uint64_t refHits = bankRefScan.firstScan((double)moneyBank, opt, progressFn,
+                                                           cancelFn);
+            if (!app.cancel.load() && refHits > 0) {
+                const ProbePick pick = pickBestEconomy(app.mem, bankRefScan.addresses(), 200000);
+                if (pick.found) {
+                    economyObject = pick.object;
+                    xpAddress = pick.address;
+                    xpFound = pick.value;
+                    xpDetail = fmt("由 %llu 处 bank 引用确认经济对象（校验 %d 分%s）",
+                                   (unsigned long long)refHits, pick.score,
+                                   pick.tied == 1 ? "" : "，存在同分候选");
+                } else {
+                    xpDetail = "找到 bank 引用，但经济对象结构校验未通过";
+                }
+            } else if (!app.cancel.load()) {
+                xpDetail = "没有找到指向 bank 的引用（经济对象可能尚未加载）";
+            }
+        }
+
+        // 3) 若仍没有经验地址，且用户填了经验值，则按经验值再定位一次
+        if (!xpAddress && hasXp && !app.cancel.load()) {
+            ScanSession xpScan(app.mem, VType::Int32, 4, 0.0);
+            const uint64_t xpHits = xpScan.firstScan(xpValue, opt, progressFn, cancelFn);
+            if (!app.cancel.load() && xpHits > 0) {
+                ProbePick best;
+                const size_t limit = xpScan.addresses().size() < 200000
+                                         ? xpScan.addresses().size() : 200000;
+                for (size_t i = 0; i < limit; ++i) {
+                    ProbeResult probe;
+                    const uint64_t candidate =
+                        xpScan.addresses()[i] + economy_offsets::kEconomyExperiencePoints;
+                    if (!probeEconomyObject(app.mem, candidate, &probe)) continue;
+                    if (!best.found || probe.score > best.score) {
+                        best.found = true;
+                        best.address = probe.address;
+                        best.object = probe.object;
+                        best.value = probe.value;
+                        best.score = probe.score;
+                        best.tied = 1;
+                        best.detail = probe.detail;
+                    } else if (probe.score == best.score) {
+                        ++best.tied;
+                    }
+                }
+                if (best.found) {
+                    economyObject = best.object;
+                    xpAddress = best.address;
+                    xpFound = best.value;
+                    xpDetail = fmt("按经验值定位：候选 %llu 个，校验 %d 分",
+                                   (unsigned long long)xpHits, best.score);
+                } else {
+                    xpDetail = fmt("经验值候选 %llu 个，但结构校验未通过", (unsigned long long)xpHits);
+                }
+            } else if (!app.cancel.load()) {
+                xpDetail = "内存中没有找到与当前经验一致的数值";
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            if (app.cancel.load()) {
+                app.pendingStatus = "结构化定位已取消。";
+            } else if (moneyAddress) {
+                app.pendingStatus = fmt("定位成功：金钱 0x%llX%s", (unsigned long long)moneyAddress,
+                                        xpAddress ? "，经验也已定位" : "（经验未定位）");
+            } else {
+                app.pendingStatus = "定位未成功：" + moneyDetail;
+            }
+            app.pendingLog = "结构化定位：金钱 " +
+                             (moneyAddress ? fmt("0x%llX", (unsigned long long)moneyAddress)
+                                           : std::string("未定位")) +
+                             "；经验 " +
+                             (xpAddress ? fmt("0x%llX", (unsigned long long)xpAddress)
+                                        : std::string("未定位"));
+            app.pendingProgressNote = app.cancel.load() ? "已取消" : "结构化定位完成";
+            app.pendingKind = (int)PanelKind::Money;
+            app.pendingReady = true;
+        }
+
+        // 结果写回界面状态（pending 通道只用于状态文案，结构化数据直接存）
+        if (!app.cancel.load()) {
+            app.locatedMoneyAddress = moneyAddress;
+            app.locatedMoneyBank = moneyBank;
+            app.locatedMoneyValue = moneyFound;
+            app.locatedMoneyDetail = moneyDetail;
+            app.locatedXpAddress = xpAddress;
+            app.locatedEconomy = economyObject;
+            app.locatedXpValue = xpFound;
+            app.locatedXpDetail = xpDetail;
+            app.locateStatus = moneyAddress
+                                   ? fmt("已定位：金钱 %s%s", formatInt(moneyFound).c_str(),
+                                         xpAddress ? fmt("，经验 %s", formatInt(xpFound).c_str())
+                                                   : "（经验未定位）")
+                                   : ("未定位：" + moneyDetail);
+        }
+
+        // 「直接改钱 / 直接改经验」一键流程：定位成功后立即执行免锁定的验证写入。
+        // ProcessMemory 读写线程安全；状态字段沿用本线程已有的写回方式。
+        if (!app.cancel.load() && autoWriteMoney && moneyAddress) {
+            double target = 0.0;
+            if (parseNumber(app.moneyTarget, false, &target)) {
+                std::string error;
+                if (writeBankMoneyVerified(app.mem, moneyAddress, moneyBank, (int64_t)target,
+                                           &error)) {
+                    app.locatedMoneyValue = (int64_t)target;
+                    app.locateStatus = fmt("已直接写入金钱 = %s（回读一致）。无需锁定：游戏读的就是"
+                                           "这个地址，自动存档会把它写进存档。",
+                                           formatInt((int64_t)target).c_str());
+                } else {
+                    app.locateStatus = "定位成功但直接写入失败：" + error;
+                }
+            } else {
+                app.locateStatus = "定位成功，但「要改成的金额」不是有效数字，未写入。";
+            }
+        }
+        if (!app.cancel.load() && autoWriteXp && xpAddress) {
+            double target = 0.0;
+            if (parseNumber(app.xpTarget, false, &target) && (double)(int32_t)target == target) {
+                std::string error;
+                if (writeEconomyExperienceVerified(app.mem, xpAddress, economyObject,
+                                                    (int32_t)target, &error)) {
+                    app.locatedXpValue = (int32_t)target;
+                    app.locateStatus = fmt("已直接写入经验 = %s（回读一致）。无需锁定：升级与技能点"
+                                           "会立刻结算，自动存档会把它写进存档。",
+                                           formatInt((int32_t)target).c_str());
+                } else {
+                    app.locateStatus = "定位成功但经验写入失败：" + error;
+                }
+            } else {
+                app.locateStatus = "定位成功，但「要改成的经验」不是有效的 32 位整数，未写入。";
+            }
+        }
+        logLine(app.locateStatus);
+        app.progressDone.store(app.progressTotal.load());
+        app.busy.store(false);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 「直接改钱 / 直接改经验」一键入口：已定位 → 立即写入；未定位 → 自动先定位，
+// 定位成功后由工作线程自动写入。全程免锁定。
+// （写入函数在文件后部定义，这里前置声明）
+void writeLocatedMoney(AppState& app, bool lock);
+void writeLocatedXp(AppState& app, bool lock);
+
+void directModifyMoney(AppState& app) {
+    if (app.busy.load()) {
+        app.locateStatus = "已有任务在进行，请等它结束。";
+        return;
+    }
+    double target = 0.0;
+    if (!parseNumber(app.moneyTarget, false, &target)) {
+        app.locateStatus = "请先在「要改成的金额」里填写目标金额。";
+        return;
+    }
+    if (app.locatedMoneyAddress) {
+        writeLocatedMoney(app, false);
+        return;
+    }
+    double current = 0.0;
+    if (!parseNumber(app.moneyCurrent, false, &current)) {
+        app.locateStatus = "第一次使用需要引导定位：把游戏里显示的当前金额填到「游戏当前值」，"
+                           "再点「直接改钱」（之后就不需要再填了）。";
+        return;
+    }
+    app.autoWriteMoneyAfterLocate = true;
+    app.locateStatus = "尚未定位：先自动定位（约 10~25 秒），成功后立即直接写入目标金额。";
+    startLocateEconomy(app);
+}
+
+void directModifyXp(AppState& app) {
+    if (app.busy.load()) {
+        app.locateStatus = "已有任务在进行，请等它结束。";
+        return;
+    }
+    double target = 0.0;
+    if (!parseNumber(app.xpTarget, false, &target) || (double)(int32_t)target != target) {
+        app.locateStatus = "请先在「要改成的经验」里填写 32 位整数范围内的目标经验。";
+        return;
+    }
+    if (app.locatedXpAddress) {
+        writeLocatedXp(app, false);
+        return;
+    }
+    double current = 0.0;
+    if (!parseNumber(app.moneyCurrent, false, &current)) {
+        app.locateStatus = "经验地址随金钱定位一并取得：把游戏里显示的当前金额填到「游戏当前值」，"
+                           "再点「直接改经验」。";
+        return;
+    }
+    app.autoWriteXpAfterLocate = true;
+    app.locateStatus = "尚未定位：先自动定位（约 10~25 秒），成功后立即直接写入目标经验。";
+    startLocateEconomy(app);
+}
+
+// 写入 / 锁定定位到的地址。
+// 直接写入走「结构校验 + 范围检查 + 回读比对」的验证路径（writeBankMoneyVerified），
+// 写的是游戏自己的权威存储：UI 显示、收支结算、自动存档都读这个字段，
+// 因此一次性写入即可持久，**不需要后台锁定**。
+void writeLocatedMoney(AppState& app, bool lock) {
+    if (!app.locatedMoneyAddress) {
+        app.locateStatus = "还没有定位结果：请填好当前金额后点「直接改钱」。";
+        return;
+    }
+    double value = 0.0;
+    if (!parseNumber(app.moneyTarget, false, &value)) {
+        app.locateStatus = "请在「要改成的金额」里填写目标金额。";
+        return;
+    }
+    const int64_t money = (int64_t)value;
+    if (lock) {
+        ProbeResult probe;
+        if (!probeBankObject(app.mem, app.locatedMoneyAddress, &probe) ||
+            probe.object != app.locatedMoneyBank) {
+            clearLocatedEconomy(app);
+            app.locateStatus = "定位地址已失效（可能换过存档或重载），请重新定位。";
+            return;
+        }
+        if (!app.freezer) {
+            app.locateStatus = "锁定器尚未就绪（请先附加游戏）。";
+            return;
+        }
+        app.freezer->addInt(app.locatedMoneyAddress, VType::Int64, money);
+        app.locateStatus = fmt("已锁定金钱 = %s（可选保险：防止游戏内收支改变金额；"
+                               "一般情况用「直接改钱」即可，无需锁定）",
+                               formatInt(money).c_str());
+    } else {
+        std::string error;
+        if (!writeBankMoneyVerified(app.mem, app.locatedMoneyAddress, app.locatedMoneyBank,
+                                    money, &error)) {
+            // 结构校验失败说明地址已失效（换存档/读档），清掉避免继续用
+            if (error.find("结构校验未通过") != std::string::npos) clearLocatedEconomy(app);
+            app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+            logLine(app.locateStatus);
+            return;
+        }
+        app.locatedMoneyValue = money;
+        app.locateStatus = fmt("已直接写入金钱 = %s（回读一致）。无需锁定：游戏读的就是这个"
+                               "地址，自动存档会把它写进存档。",
+                               formatInt(money).c_str());
+    }
+    logLine(app.locateStatus);
+}
+
+void writeLocatedXp(AppState& app, bool lock) {
+    if (!app.locatedXpAddress) {
+        app.locateStatus = "经验地址尚未定位（填好「游戏当前值」里的当前金额后点「直接改钱」，"
+                           "定位金钱时会一并定位经验）。";
+        return;
+    }
+    double value = 0.0;
+    if (!parseNumber(app.xpTarget, false, &value)) {
+        app.locateStatus = "请在「要改成的经验」里填写目标经验。";
+        return;
+    }
+    const int32_t xp = (int32_t)value;
+    if ((double)xp != value) {
+        app.locateStatus = "目标经验必须是 32 位整数范围内的整数。";
+        return;
+    }
+    if (lock) {
+        ProbeResult probe;
+        if (!probeEconomyObject(app.mem, app.locatedXpAddress, &probe) ||
+            probe.object != app.locatedEconomy) {
+            clearLocatedEconomy(app);
+            app.locateStatus = "经验地址已失效，请重新定位。";
+            return;
+        }
+        if (!app.freezer) {
+            app.locateStatus = "锁定器尚未就绪（请先附加游戏）。";
+            return;
+        }
+        app.freezer->addInt(app.locatedXpAddress, VType::Int32, xp);
+        app.locateStatus = fmt("已锁定经验 = %s（可选保险；一般情况用「直接改经验」即可，无需锁定）",
+                               formatInt(xp).c_str());
+    } else {
+        std::string error;
+        if (!writeEconomyExperienceVerified(app.mem, app.locatedXpAddress, app.locatedEconomy,
+                                            xp, &error)) {
+            if (error.find("结构校验未通过") != std::string::npos) clearLocatedEconomy(app);
+            app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+            logLine(app.locateStatus);
+            return;
+        }
+        app.locatedXpValue = xp;
+        app.locateStatus = fmt("已直接写入经验 = %s（回读一致）。无需锁定：升级与技能点会立刻结算，"
+                               "自动存档会把它写进存档。",
+                               formatInt(xp).c_str());
+    }
+    logLine(app.locateStatus);
+}
+
 void renderMoneyTab(AppState& app) {
-    renderValuePanel(app, PanelKind::Money, "现金（钱）",
-                     "填游戏里的现金 → 首次扫描；金额变化后填新值 → 变动后收窄。",
-                     &app.moneyType, app.moneyCurrent, app.moneyTarget, &app.moneyLock);
+    // ---------------- 主流程：直接修改（免锁定） ----------------
+    ::ImGui::BeginChild("##locate_economy", ImVec2(0, 0),
+                        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 直接修改（推荐 · 写完即生效，无需锁定）");
+    ::ImGui::Separator();
     ::ImGui::Spacing();
-    renderValuePanel(app, PanelKind::Xp, "经验值",
-                     "32 位整数；改动会连带升级并给技能点。",
-                     &app.xpType, app.xpCurrent, app.xpTarget, &app.xpLock);
+    ::ImGui::TextWrapped("程序定位游戏自己的权威存储（bank.money_account / economy.experience_points）"
+                         "后一次性写入。游戏界面、收支结算、自动存档读的都是这两个字段，"
+                         "所以写完不会被改回去，也不需要「锁定」。");
+    ::ImGui::Spacing();
+
+    // 第一次使用的引导输入：定位需要用当前金额做一次种子扫描
+    if (!app.locatedMoneyAddress) {
+        ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 当前金额（仅首次定位需要）");
+        ::ImGui::SameLine(220.0f);
+        ::ImGui::SetNextItemWidth(170);
+        ::ImGui::InputTextWithHint("##current", "游戏里显示的金额", app.moneyCurrent, 32,
+                                   ImGuiInputTextFlags_CharsDecimal);
+        ::ImGui::SameLine();
+        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "定位用它做种子，约 10~25 秒");
+    }
+
+    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
+                         app.locatedMoneyAddress ? "② 金额" : "② 金额（定位后可反复直接改）");
+    ::ImGui::SameLine(220.0f);
+    ::ImGui::SetNextItemWidth(170);
+    ::ImGui::InputTextWithHint("##target_money", "目标金额", app.moneyTarget, 32,
+                               ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::SameLine();
+    ::ImGui::BeginDisabled(app.busy.load());
+    if (::ImGui::Button(" 直接改钱 ", ImVec2(120, 28))) directModifyMoney(app);
+    ::ImGui::EndDisabled();
+
+    // 快速预设
+    ::ImGui::SameLine();
+    if (::ImGui::Button("+100万")) {
+        double cur = 0;
+        parseNumber(app.moneyTarget, false, &cur);
+        if (cur <= 0) parseNumber(app.moneyCurrent, false, &cur);
+        cur += 1000000.0;
+        char buf[32];
+        ::snprintf(buf, sizeof(buf), "%.0f", cur);
+        ::strncpy_s(app.moneyTarget, 32, buf, _TRUNCATE);
+    }
+    ::ImGui::SameLine();
+    if (::ImGui::Button("1,000 万")) ::strncpy_s(app.moneyTarget, 32, "10000000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("5,000 万")) ::strncpy_s(app.moneyTarget, 32, "50000000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("1 亿")) ::strncpy_s(app.moneyTarget, 32, "100000000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("9.99 亿")) ::strncpy_s(app.moneyTarget, 32, "999999999", _TRUNCATE);
+
+    ::ImGui::Spacing();
+    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
+                         app.locatedXpAddress ? "③ 经验" : "③ 经验（随金额一并定位）");
+    ::ImGui::SameLine(220.0f);
+    ::ImGui::SetNextItemWidth(170);
+    ::ImGui::InputTextWithHint("##target_xp", "目标经验", app.xpTarget, 32,
+                               ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::SameLine();
+    ::ImGui::BeginDisabled(app.busy.load());
+    if (::ImGui::Button(" 直接改经验 ", ImVec2(130, 28))) directModifyXp(app);
+    ::ImGui::EndDisabled();
+    ::ImGui::SameLine();
+    if (::ImGui::Button("5,000 (约10级)")) ::strncpy_s(app.xpTarget, 32, "5000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("50,000 (约35级)")) ::strncpy_s(app.xpTarget, 32, "50000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("150,000 (满级技能)")) ::strncpy_s(app.xpTarget, 32, "150000", _TRUNCATE);
+    ::ImGui::SameLine();
+    if (::ImGui::Button("1,000,000")) ::strncpy_s(app.xpTarget, 32, "1000000", _TRUNCATE);
+
+    ::ImGui::Spacing();
+    ::ImGui::Separator();
+    ::ImGui::Spacing();
+
+    const bool hasMoney = app.locatedMoneyAddress != 0;
+    const bool hasXp = app.locatedXpAddress != 0;
+    if (hasMoney) {
+        ::ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
+                             "金钱 0x%llX = %s", (unsigned long long)app.locatedMoneyAddress,
+                             formatInt(app.locatedMoneyValue).c_str());
+        if (!app.locatedMoneyDetail.empty()) {
+            ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "%s",
+                                 app.locatedMoneyDetail.c_str());
+        }
+    }
+    if (hasXp) {
+        ::ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
+                             "经验 0x%llX = %s", (unsigned long long)app.locatedXpAddress,
+                             formatInt(app.locatedXpValue).c_str());
+        if (!app.locatedXpDetail.empty()) {
+            ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "%s",
+                                 app.locatedXpDetail.c_str());
+        }
+    }
+    ::ImGui::TextColored(ImVec4(0.40f, 0.78f, 0.95f, 1.0f), "%s", app.locateStatus.c_str());
+
+    // 可选保险：锁定（一般不需要）。直接写权威地址后游戏不会改回去；
+    // 只有想「钉死」数值不受游戏内收支影响时才用。
+    if (ImGui::CollapsingHeader("可选：锁定保险（一般不需要）")) {
+        ::ImGui::BeginDisabled(app.busy.load() || !hasMoney);
+        if (::ImGui::Button(" 锁定金钱 ", ImVec2(110, 0))) writeLocatedMoney(app, true);
+        ::ImGui::EndDisabled();
+        ::ImGui::SameLine();
+        ::ImGui::BeginDisabled(app.busy.load() || !hasXp);
+        if (::ImGui::Button(" 锁定经验 ", ImVec2(110, 0))) writeLocatedXp(app, true);
+        ::ImGui::EndDisabled();
+        ::ImGui::SameLine();
+        if (::ImGui::Button(" 解除锁定 ", ImVec2(100, 0))) {
+            if (app.freezer) {
+                if (app.locatedMoneyAddress) app.freezer->remove(app.locatedMoneyAddress);
+                if (app.locatedXpAddress) app.freezer->remove(app.locatedXpAddress);
+            }
+            app.locateStatus = "已解除金钱/经验锁定（直接写入的数值不受影响）。";
+        }
+        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
+                             "锁定 = 每 0.25 秒把数值写回一次，用来抵消游戏内真实的收支变化。"
+                             "只是可选项，直接修改本身不需要它。");
+    }
+    ::ImGui::EndChild();
+
+    ::ImGui::Spacing();
+
+    // ---------------- 兼容保留：重新定位 / 清除 ----------------
+    if (ImGui::CollapsingHeader("维护：重新定位 / 清除（换存档或读档后用）")) {
+        ::ImGui::BeginDisabled(app.busy.load());
+        if (::ImGui::Button(" 仅重新定位（不写入） ", ImVec2(170, 26))) startLocateEconomy(app);
+        ::ImGui::SameLine();
+        if (::ImGui::Button(" 清除定位结果 ", ImVec2(140, 26))) clearLocatedEconomy(app);
+        ::ImGui::EndDisabled();
+        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
+                             "定位地址绑定当前进程：换存档、读档或重启游戏后，直接写入前会自动"
+                             "重新校验结构，失效时会提示重新定位。");
+    }
+
+    ::ImGui::Spacing();
+
+    // ---------------- 高级：手动扫描（兼容性排查用） ----------------
+    if (ImGui::CollapsingHeader("高级：手动扫描收窄（兼容性排查用，一般不需要）")) {
+        ::ImGui::TextWrapped("Cheat Engine 式全内存扫描：只在直接修改定位失败时用于排查。"
+                             "注意扫描命中可能包含镜像副本，写错副本会被游戏改回去（这正是"
+                             "老版本需要「锁定」的原因）。");
+        ::ImGui::Spacing();
+        renderValuePanel(app, PanelKind::Money, "现金（钱）",
+                         "填游戏里的现金 → 首次扫描；金额变化后填新值 → 变动后收窄。",
+                         &app.moneyType, app.moneyCurrent, app.moneyTarget, &app.moneyLock);
+        ::ImGui::Spacing();
+        renderValuePanel(app, PanelKind::Xp, "经验值",
+                         "32 位整数；改动会连带升级并给技能点。",
+                         &app.xpType, app.xpCurrent, app.xpTarget, &app.xpLock);
+    }
 }
 
 void renderVehicleTabImpl(AppState& app) {
@@ -2397,7 +3015,8 @@ void renderHelpTabImpl(AppState& app) {
     static const char* kHelp =
         "【前提】先启动游戏（单机），再点顶部「附加游戏」；改内存需要管理员权限。\n"
         "\n"
-        "【改钱 / 经验】填游戏内数值 → 首次扫描 → 数值变化后收窄 → 写入 / 锁定。\n"
+        "【改钱 / 经验】首次：把游戏里显示的金额填到「当前金额」→ 点「直接改钱」自动定位并写入。\n"
+        "　　　　　　　之后：直接填目标值再点一次即可。写的是游戏权威存储，无需锁定。\n"
         "【车辆】附加后直接勾选，无需填数值；换车、读档自动跟随当前车辆。\n"
         "【扫描器】任意数值都可扫描；向多个候选地址写入前会要求确认。\n"
         "【存档】备份 / 还原 / 解密导出；明文存档改数值需先退出游戏。\n"

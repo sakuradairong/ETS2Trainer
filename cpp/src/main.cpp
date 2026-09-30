@@ -1,5 +1,6 @@
 // main.cpp —— 程序入口：Direct3D 11 + Dear ImGui 宿主；支持 --selftest 无界面自检
 #include "common.h"
+#include "economy.h"
 #include "engine.h"
 #include "enginetest.h"
 #include "gameio.h"
@@ -1645,6 +1646,147 @@ int runSelfTest(const std::wstring& outPath) {
         parseConvoySession(closed, &afterClose);
         check("会话结束后不再上报玩家与联机状态",
               !afterClose.active && afterClose.players.empty());
+    }
+
+    // ---------- 13. 金钱 / 经验结构化定位校验（在自身进程里构造假对象）----------
+    note("");
+    note("=== 13. 金钱 / 经验结构化定位（单位字段表校验）===");
+    {
+        // 模拟 bank 对象：money_account s64@0x18、免赔额/共保比例/贷款额度等浮点字段
+        std::vector<uint8_t> bankBuf(0x100, 0);
+        const int64_t fakeMoney = 123456789;
+        const float coinsuranceFixed = 500.0f;
+        const float coinsuranceRatio = 0.2f;
+        const float loanLimit = 100000.0f;
+        const float overdraft = 0.0f;
+        const int64_t appEnabled = 1;
+        const int32_t overdraftTimer = 30;
+        ::memcpy(bankBuf.data() + economy_offsets::kBankMoneyAccount, &fakeMoney, sizeof(fakeMoney));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankCoinsuranceFixed, &coinsuranceFixed,
+                 sizeof(coinsuranceFixed));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankCoinsuranceRatio, &coinsuranceRatio,
+                 sizeof(coinsuranceRatio));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankLoanLimit, &loanLimit, sizeof(loanLimit));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankOverdraft, &overdraft, sizeof(overdraft));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankOverdraftTimer, &overdraftTimer,
+                 sizeof(overdraftTimer));
+        ::memcpy(bankBuf.data() + economy_offsets::kBankAppEnabled, &appEnabled,
+                 sizeof(appEnabled));
+        const uint64_t bankBase = (uint64_t)(uintptr_t)bankBuf.data();
+
+        // 模拟经济对象：bank 引用、游戏时间、存档版本、经验与 6 项技能点
+        std::vector<uint8_t> econBuf(0x800, 0);
+        const int32_t saveVersion = 50;
+        const int32_t fakeXp = 582499;
+        const int32_t skills[6] = {3, 5, 2, 1, 4, 2};
+        const int32_t gameTimeSecs = 123456;
+        ::memcpy(econBuf.data() + economy_offsets::kEconomyBankRef, &bankBase, sizeof(bankBase));
+        ::memcpy(econBuf.data() + economy_offsets::kEconomyGameTimeSecs, &gameTimeSecs,
+                 sizeof(gameTimeSecs));
+        ::memcpy(econBuf.data() + economy_offsets::kEconomySaveGameVersion, &saveVersion,
+                 sizeof(saveVersion));
+        ::memcpy(econBuf.data() + economy_offsets::kEconomyExperiencePoints, &fakeXp,
+                 sizeof(fakeXp));
+        for (int i = 0; i < economy_offsets::kEconomySkillCount; ++i) {
+            ::memcpy(econBuf.data() + economy_offsets::kEconomySkills + (size_t)i * 4, &skills[i],
+                     sizeof(int32_t));
+        }
+        const uint64_t econBase = (uint64_t)(uintptr_t)econBuf.data();
+
+        ProcessMemory selfMem;
+        std::string selfErr;
+        const bool selfOpen = selfMem.open(::GetCurrentProcessId(), "self-economy", &selfErr);
+
+        ProbeResult bankProbe;
+        const bool bankOk = selfOpen &&
+                            probeBankObject(selfMem, bankBase + economy_offsets::kBankMoneyAccount,
+                                            &bankProbe);
+        check("bank 对象校验（金额 + 浮点字段）", bankOk && bankProbe.object == bankBase &&
+                                                      bankProbe.score >= 4,
+              fmt("(得分 %d/%d，金额 %s)", bankProbe.score, bankProbe.maxScore,
+                  formatInt(bankProbe.value).c_str()));
+
+        ProbeResult econProbe;
+        const bool econOk =
+            selfOpen && probeEconomyObject(selfMem,
+                                           econBase + economy_offsets::kEconomyExperiencePoints,
+                                           &econProbe);
+        check("经济对象校验（经验 + 技能点）", econOk && econProbe.object == econBase &&
+                                                       econProbe.score >= 5,
+              fmt("(得分 %d/%d)", econProbe.score, econProbe.maxScore));
+
+        check("经济对象 → bank 引用一致",
+              selfOpen && economyReferencesBank(selfMem, econBase, bankBase));
+
+        // 反向：把「经验地址」故意指错（偏移 -4，落在存档版本字段上）应判定失败
+        ProbeResult wrongProbe;
+        const bool wrongOk = selfOpen && probeEconomyObject(
+                                            selfMem, econBase + economy_offsets::kEconomySaveGameVersion,
+                                            &wrongProbe);
+        check("偏移错误时拒绝（不会误判地址）", !wrongOk,
+              fmt("(误判得分 %d/%d)", wrongProbe.score, wrongProbe.maxScore));
+
+        // 指针槽 → 经济对象地址换算
+        check("由 bank 指针反推经济对象",
+              economyFromBankPointer(econBase + economy_offsets::kEconomyBankRef) == econBase);
+
+        // bank 结构被破坏（共保比例变成 9999）时得分应下降
+        float brokenRatio = 9999.0f;
+        ::memcpy(bankBuf.data() + economy_offsets::kBankCoinsuranceRatio, &brokenRatio,
+                 sizeof(brokenRatio));
+        ProbeResult brokenProbe;
+        const bool brokenOk =
+            selfOpen && probeBankObject(selfMem, bankBase + economy_offsets::kBankMoneyAccount,
+                                        &brokenProbe);
+        check("字段异常时得分下降", !brokenOk || brokenProbe.score < bankProbe.score,
+              fmt("(异常得分 %d，正常得分 %d)", brokenProbe.score, bankProbe.score));
+
+        // ---------- 直接写入（免锁定）路径：结构校验 + 范围检查 + 回读比对 ----------
+        // 先把 bank 恢复成合法结构，再走一次真实的直接写入
+        ::memcpy(bankBuf.data() + economy_offsets::kBankCoinsuranceRatio, &coinsuranceRatio,
+                 sizeof(coinsuranceRatio));
+        const int64_t newMoney = 999999999;
+        std::string writeError;
+        const bool moneyWriteOk =
+            selfOpen && writeBankMoneyVerified(selfMem,
+                                               bankBase + economy_offsets::kBankMoneyAccount,
+                                               bankBase, newMoney, &writeError);
+        int64_t moneyAfter = 0;
+        ::memcpy(&moneyAfter, bankBuf.data() + economy_offsets::kBankMoneyAccount,
+                 sizeof(moneyAfter));
+        check("直接写入金钱（校验 + 身份 + 回读一致）",
+              moneyWriteOk && moneyAfter == newMoney,
+              moneyWriteOk ? "(写入后内存值一致)" : ("(" + writeError + ")"));
+
+        const bool moneyRangeOk =
+            selfOpen && writeBankMoneyVerified(selfMem,
+                                               bankBase + economy_offsets::kBankMoneyAccount,
+                                               bankBase, 9999999999999999LL, &writeError);
+        check("金额越界时拒绝写入", !moneyRangeOk, ("(" + writeError + ")"));
+
+        const bool moneyWrongOk =
+            selfOpen && writeBankMoneyVerified(selfMem, econBase + 0x18, bankBase, newMoney,
+                                               &writeError);
+        check("非 bank 地址拒绝写入", !moneyWrongOk,
+              ("(" + (moneyWrongOk ? std::string("误通过") : writeError) + ")"));
+
+        const int32_t newXp = 1500000;
+        const bool xpWriteOk =
+            selfOpen && writeEconomyExperienceVerified(
+                            selfMem, econBase + economy_offsets::kEconomyExperiencePoints,
+                            econBase, newXp, &writeError);
+        int32_t xpAfter = 0;
+        ::memcpy(&xpAfter, econBuf.data() + economy_offsets::kEconomyExperiencePoints,
+                 sizeof(xpAfter));
+        check("直接写入经验（校验 + 身份 + 回读一致）",
+              xpWriteOk && xpAfter == newXp,
+              xpWriteOk ? "(写入后内存值一致)" : ("(" + writeError + ")"));
+
+        const bool xpRangeOk =
+            selfOpen && writeEconomyExperienceVerified(
+                            selfMem, econBase + economy_offsets::kEconomyExperiencePoints,
+                            econBase, 2100000000, &writeError);
+        check("经验越界时拒绝写入", !xpRangeOk, ("(" + writeError + ")"));
     }
 
     // ---------- 汇总 ----------

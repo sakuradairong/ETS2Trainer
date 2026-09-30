@@ -83,6 +83,21 @@ struct AppState {
     std::string antiRollStatus = "未启用。方案B：直接改写物理车辆重心/防倾阻尼，极速急转弯不翻车。";
     std::string scanStatus = "未扫描";
 
+    // ---------- 金钱 / 经验：结构化定位结果 ----------
+    uint64_t    locatedMoneyAddress = 0;   // bank 对象 + 0x18
+    uint64_t    locatedMoneyBank = 0;      // bank 对象
+    int64_t     locatedMoneyValue = 0;
+    std::string locatedMoneyDetail;
+    uint64_t    locatedXpAddress = 0;      // 经济对象 + 0x780
+    uint64_t    locatedEconomy = 0;        // 经济对象
+    int64_t     locatedXpValue = 0;
+    std::string locatedXpDetail;
+    std::string locateStatus = "未定位。填好游戏里的当前金额后点「直接改钱」，程序会自动定位再写入，全程免锁定。";
+    // 「直接改钱 / 直接改经验」一键流程：未定位时先启动定位，定位成功后由
+    // 工作线程自动执行写入（只在定位线程内读写，界面线程启动前设置）。
+    bool        autoWriteMoneyAfterLocate = false;
+    bool        autoWriteXpAfterLocate = false;
+
     // ---------- 后台任务 ----------
     std::thread           worker;
     std::atomic<bool>     busy{false};
@@ -172,6 +187,9 @@ void writePanelValues(AppState& app, PanelKind kind, bool confirmed = false);
 void togglePanelLock(AppState& app, PanelKind kind, bool lock, bool confirmed = false);
 void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled);
 void toggleAutoAntiRollLock(AppState& app, bool enabled, float factor);
+// 金钱 / 经验的「直接修改（免锁定）」实现位于 ui.cpp 匿名命名空间内：
+// directModifyMoney / directModifyXp / startLocateEconomy / clearLocatedEconomy，
+// 仅供 renderMoneyTab 内部使用。
 // option: 0=恢复原厂, 1=1.25×, 2=1.50×, 3=2.00×
 void applyEnginePower(AppState& app, int option, bool raiseLimit);
 
