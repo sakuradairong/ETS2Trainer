@@ -6,6 +6,8 @@
 #include "enginetest.h"
 
 #include "engine.h"
+#include "saves.h"
+#include "ui.h"
 
 #include <algorithm>
 #include <atomic>
@@ -56,6 +58,10 @@ public:
         if (size != sizeof(float)) return false;
         const auto it = floats_.find(address);
         if (it == floats_.end()) return false;
+        if (address == failTrigger_) {
+            failWrites_.insert(failRollbackAddress_);
+            return false;
+        }
         if (failWrites_.count(address)) return false;
         float value = 0.0f;
         ::memcpy(&value, src, sizeof(value));
@@ -108,6 +114,17 @@ public:
         corruptOnce_.insert(address);
     }
 
+    void failWriteAndRollback(uint64_t trigger, uint64_t rollbackAddress) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failTrigger_ = trigger;
+        failRollbackAddress_ = rollbackAddress;
+    }
+    void clearInjectedFailures() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        failTrigger_ = failRollbackAddress_ = 0;
+        failWrites_.clear();
+    }
+
     float get(uint64_t address) const {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto it = floats_.find(address);
@@ -138,6 +155,7 @@ private:
     std::set<uint64_t>            failWrites_;
     std::set<uint64_t>            corruptOnce_;
     uint64_t                      writes_ = 0;
+    uint64_t failTrigger_ = 0, failRollbackAddress_ = 0;
 };
 
 class FakeResolver final : public EngineTargetResolver {
@@ -729,6 +747,589 @@ std::vector<TunerTestItem> runEngineTunerTests() {
             ok ? "状态保留恢复失败详情且记录仍可导出" : "错误状态：" + rig.tuner.status());
     }
 
+    // ---------- 13. 状态修订号：后台换车自增、无变化不自增 ----------
+    {
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, kVolvo);
+        rig.memory->mapEngine(kEngineB, kScania);
+        rig.resolver->setObject(kEngineA);
+        std::string error;
+        bool ok = rig.tuner.apply(1.25f, false, &error);
+        std::string detail;
+        uint64_t revSteady = 0;
+        if (ok) {
+            const uint64_t rev0 = rig.tuner.stateRevision();
+            rig.tuner.maintenance(nullptr);   // 同对象保持：不应有需要持久化的变化
+            rig.tuner.maintenance(nullptr);
+            revSteady = rig.tuner.stateRevision();
+            if (revSteady != rev0) {
+                ok = false;
+                detail = "无变化的保持周期也自增修订号（会造成每秒落盘）";
+            }
+        }
+        if (ok) {
+            rig.resolver->setObject(kEngineB);   // 后台自动换车
+            ok = rig.tuner.maintenance(&error);
+            if (ok) {
+                const uint64_t revAfterSwitch = rig.tuner.stateRevision();
+                if (revAfterSwitch == revSteady) {
+                    ok = false;
+                    detail = "自动换车后修订号没有自增（UI 不会持久化 B 的记录）";
+                } else {
+                    detail = fmt("保持期 %llu → 换车后 %llu（UI 会触发一次落盘）",
+                                 (unsigned long long)revSteady,
+                                 (unsigned long long)revAfterSwitch);
+                }
+            } else {
+                detail = "换车 maintenance 失败: " + error;
+            }
+        }
+        add("状态修订号：换车自增、平稳保持不自增", ok, detail);
+    }
+
+    // ---------- 14. 应用 A → 自动切换 B → 强制退出 → 重导入：恢复 B 且不叠加 ----------
+    {
+        std::string persisted;
+        {
+            Rig first;
+            first.memory->mapEngine(kEngineA, kVolvo);
+            first.memory->mapEngine(kEngineB, kScania);
+            first.resolver->setObject(kEngineA);
+            std::string error;
+            bool ok = first.tuner.apply(1.25f, false, &error);
+            if (ok) {
+                first.resolver->setObject(kEngineB);   // 维护线程发现换车
+                ok = first.tuner.maintenance(&error);
+            }
+            if (ok) {
+                // UI 在修订号变化后调用 exportState —— 必须已描述 B 的记录
+                persisted = first.tuner.exportState();
+                ok = !persisted.empty();
+            }
+            // 析构会尝试恢复；第二个测试台用新的内存镜像模拟
+            // 「程序强退后游戏里仍留着 B 的放大值」。
+        }
+        Rig second;
+        FakeEngineValues amplifiedB = kScania;   // 2400 × 1.25 = 3000
+        amplifiedB.torque = 3000.0f;
+        amplifiedB.copyA = 2975.0f;
+        amplifiedB.copyB = 3000.0f;
+        second.memory->mapEngine(kEngineB, amplifiedB);
+        second.resolver->setObject(kEngineB);
+        second.tuner.importState(persisted);
+        std::string error;
+        bool ok = !persisted.empty() && second.tuner.apply(1.25f, false, &error);
+        std::string detail;
+        if (!ok) {
+            detail = "重导入后应用失败: " + error;
+        } else {
+            const EngineFieldValues values = second.memory->read(kEngineB);
+            if (!closeTo(values.torque, 3000.0f, 1.0f)) {
+                ok = false;
+                detail = fmt("倍率叠加：期望 3000（2400×1.25），实际 %.1f",
+                             (double)values.torque);
+            } else {
+                std::string releaseError;
+                second.tuner.release(&releaseError);
+                const EngineFieldValues back = second.memory->read(kEngineB);
+                if (!closeTo(back.torque, 2400.0f, 1.0f)) {
+                    ok = false;
+                    detail = fmt("无法恢复 B 的原厂值：期望 2400，实际 %.1f",
+                                 (double)back.torque);
+                } else {
+                    detail = "强退重导后仍以 2400 为基准：写入 3000、恢复 2400";
+                }
+            }
+        }
+        add("换车后持久化：强退重导恢复 B 且不叠加", ok, detail);
+    }
+
+    // ---------- 15. 设置持久化：往返一致 / 旧格式兼容 / 失败不清恢复记录 ----------
+    {
+        const std::wstring dir = applicationDir();
+        const std::wstring path = dir + L"\\settings_selftest.ini";
+        const std::wstring legacyPath = dir + L"\\settings_selftest_legacy.ini";
+        const std::wstring badPath = dir + L"\\__no_such_dir__\\settings.ini";
+        ::DeleteFileW(path.c_str());
+        ::DeleteFileW(legacyPath.c_str());
+
+        bool ok = true;
+        std::string detail;
+
+        // 1) 往返一致：序列化 -> 落盘 -> 读回
+        AppState app;
+        ::strncpy_s(app.moneyTarget, sizeof(app.moneyTarget), "424242", _TRUNCATE);
+        ::strncpy_s(app.xpTarget, sizeof(app.xpTarget), "7777", _TRUNCATE);
+        app.antiRollFactor = 2.0f;
+        app.workers = 6;
+        app.engineStateText = "1;3800.0000;3773.4000;3800.0000;2000.0000;2000.0000;"
+                              "4750.0000;4716.7500;4750.0000;2000.0000;2000.0000;1.250;0";
+        if (!saveSettingsTo(app, path)) {
+            ok = false;
+            detail = "原子保存失败: " + W2U(path);
+        }
+        AppState loaded;
+        loadSettingsFrom(loaded, path);
+        if (ok) {
+            ok = std::string(loaded.moneyTarget) == "424242" &&
+                 std::string(loaded.xpTarget) == "7777" && loaded.workers == 6 &&
+                 std::fabs(loaded.antiRollFactor - 2.0f) < 1e-4f &&
+                 loaded.engineStateText == app.engineStateText;
+            if (!ok) detail = "设置往返不一致";
+        }
+        if (ok) {
+            // 原子写不得留下临时文件
+            const bool noTemp =
+                ::GetFileAttributesW((path + L".tmp").c_str()) == INVALID_FILE_ATTRIBUTES;
+            if (!noTemp) {
+                ok = false;
+                detail = "原子保存遗留 .tmp 文件";
+            }
+        }
+
+        // 2) 旧格式兼容：只有部分键、CRLF 行尾的旧 settings.ini 仍能读取
+        if (ok) {
+            const std::string legacy =
+                "money_type=int64\r\nmoney_target=12345\r\n"
+                "engine_state=1;2400;0;0;2200;2200;3000;0;0;2200;2200;1.250;0\r\n";
+            if (!writeTextFileAtomic(legacyPath, legacy)) {
+                ok = false;
+                detail = "写入旧格式样例失败";
+            } else {
+                AppState legacyApp;
+                loadSettingsFrom(legacyApp, legacyPath);
+                ok = std::string(legacyApp.moneyTarget) == "12345" &&
+                     legacyApp.engineStateText.find("1;2400;") == 0;
+                if (!ok) detail = "旧格式 settings.ini 读取不兼容";
+            }
+        }
+
+        // 3) 持久化失败不得清除恢复记录（内存中的 engine_state / tuner 记录都保留）
+        if (ok) {
+            AppState failing;
+            failing.engineTuner = std::make_unique<EngineTuner>();
+            failing.engineTuner->setBackgroundThreadEnabled(false);
+            auto memory = std::make_unique<FakeMemory>();
+            auto resolver = std::make_unique<FakeResolver>();
+            FakeMemory* rawMemory = memory.get();
+            FakeResolver* rawResolver = resolver.get();
+            rawMemory->mapEngine(kEngineA, kVolvo);
+            rawResolver->setObject(kEngineA);
+            failing.engineTuner->attach(std::move(memory), std::move(resolver), nullptr);
+            std::string error;
+            const bool applied = failing.engineTuner->apply(1.25f, false, &error);
+            const std::string record = failing.engineTuner->exportState();
+            const bool saveFailed = !saveSettingsTo(failing, badPath);  // 目标目录不存在
+            const std::string recordAfter = failing.engineTuner->exportState();
+            ok = applied && saveFailed && !record.empty() && recordAfter == record;
+            if (!ok) {
+                detail = fmt("applied=%d saveFailed=%d 记录前=%d 后=%d", (int)applied,
+                             (int)saveFailed, (int)!record.empty(), (int)recordAfter.size());
+            } else {
+                detail = "往返一致、旧格式兼容、无 .tmp 残留、失败时恢复记录保留";
+            }
+        }
+
+        if (ok && detail.empty()) detail = "序列化往返 / 旧格式 / 原子写 / 失败保留 全部通过";
+        ::DeleteFileW(path.c_str());
+        ::DeleteFileW(legacyPath.c_str());
+        add("设置持久化：往返一致 + 旧格式兼容 + 失败不清记录", ok, detail);
+    }
+
+    // ---------- 16. 审查问题 3：尚未采纳的导入记录不得被导出为空 ----------
+    {
+        const std::string saved =
+            "1;3800.0000;3773.4000;3800.0000;2000.0000;2000.0000;"
+            "4750.0000;4716.7500;4750.0000;2000.0000;2000.0000;1.250;0";
+        EngineTuner tuner;
+        tuner.setBackgroundThreadEnabled(false);
+        tuner.importState(saved);
+        const std::string exported = tuner.exportState();
+        AppState app;
+        app.engineTuner = std::make_unique<EngineTuner>();
+        app.engineTuner->setBackgroundThreadEnabled(false);
+        app.engineTuner->importState(saved);
+        app.engineTuner.reset();  // 只用 engineStateText 序列化路径
+        app.engineStateText = exported;
+        const std::string serialized = settingsText(app);
+        // 关键：导入后立即导出/序列化，恢复凭据必须还在（旧实现导出为空 → 被自动保存抹掉）
+        const bool kept = !exported.empty() &&
+                          serialized.find("engine_state=\n") == std::string::npos &&
+                          serialized.find("engine_state=1;") != std::string::npos;
+        // 重新加载后凭据依然可用：应用同一个放大值时不得再乘一次倍率
+        EngineTuner reloaded;
+        reloaded.setBackgroundThreadEnabled(false);
+        reloaded.importState(exported);
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, [] {
+            FakeEngineValues amplified = kVolvo;
+            amplified.torque = 4750.0f;
+            amplified.copyA = 4716.75f;
+            amplified.copyB = 4750.0f;
+            return amplified;
+        }());
+        rig.resolver->setObject(kEngineA);
+        rig.tuner.importState(exported);
+        std::string error;
+        const bool applied = rig.tuner.apply(1.25f, false, &error);
+        const EngineFieldValues values = rig.memory->read(kEngineA);
+        const bool noStacking = applied && closeTo(values.torque, 4750.0f, 1.0f);
+        const bool reloadOk = reloaded.hasUnverifiedImportedRecord() &&
+                              !reloaded.exportState().empty();
+        bool ok = kept && noStacking && reloadOk;
+        std::string detail = ok ? "导入→导出/序列化→重载 凭据保留，且不叠加倍率"
+                                : fmt("kept=%d 导出字节=%d noStacking=%d 实际=%.1f", (int)kept,
+                                      (int)exported.size(), (int)noStacking,
+                                      (double)values.torque);
+        // 恢复成功（核对完成）后必须清空，不能留下过期凭据
+        std::string releaseError;
+        const bool released = rig.tuner.release(&releaseError);
+        const bool backToStock = closeTo(rig.memory->read(kEngineA).torque, 3800.0f, 1.0f);
+        if (ok && (!released || !backToStock || !rig.tuner.exportState().empty())) {
+            ok = false;
+            detail = fmt("核对/恢复后未清空过期凭据或未回原厂（released=%d torque=%.1f）",
+                         (int)released, (double)rig.memory->read(kEngineA).torque);
+        }
+        add("导入的恢复记录在核对前不会被导出为空", ok, detail);
+    }
+
+    // ---------- 17. 审查问题 3：首次应用失败→保存→重启→成功核对，不叠加倍率；不虚报恢复 ----------
+    {
+        const std::string saved =
+            "1;2400.0000;2380.0000;2400.0000;2200.0000;2200.0000;"
+            "3000.0000;2975.0000;3000.0000;2200.0000;2200.0000;1.250;0";
+        std::string exported;
+        {
+            EngineTuner tuner;
+            tuner.setBackgroundThreadEnabled(false);
+            tuner.importState(saved);
+            exported = tuner.exportState();
+            // 定位失败（无对象可绑定）：导出必须仍然保留凭据
+        }
+        Rig rig;  // 新一次运行：游戏里仍是 B 的放大值 3000
+        FakeEngineValues amplified = kScania;
+        amplified.torque = 3000.0f;
+        amplified.copyA = 2975.0f;
+        amplified.copyB = 3000.0f;
+        rig.memory->mapEngine(kEngineB, amplified);
+        rig.resolver->setObject(kEngineB);
+        rig.tuner.importState(exported);
+        // 尚未核对时「恢复原厂」不得虚报成功
+        std::string honestError;
+        const bool falseSuccess = rig.tuner.release(&honestError);
+        const bool honest = !falseSuccess && !honestError.empty() &&
+                            rig.tuner.hasUnverifiedImportedRecord() &&
+                            !rig.tuner.exportState().empty();
+        std::string error;
+        const bool applied = rig.tuner.apply(1.25f, false, &error);
+        const EngineFieldValues values = rig.memory->read(kEngineB);
+        const bool noStacking = applied && closeTo(values.torque, 3000.0f, 1.0f);
+        std::string releaseError;
+        rig.tuner.release(&releaseError);
+        const bool restored = closeTo(rig.memory->read(kEngineB).torque, 2400.0f, 1.0f);
+        const bool cleared = rig.tuner.exportState().empty() &&
+                             !rig.tuner.hasUnverifiedImportedRecord();
+        const bool ok = honest && noStacking && restored && cleared;
+        add("导入记录：失败后保留 / 不虚报恢复 / 成功核对后不叠加", ok,
+            ok ? "尚未核对时不报成功，核对后 2400 基准、恢复后凭据清空"
+               : fmt("honest=%d noStacking=%d(实际 %.1f) restored=%d cleared=%d", (int)honest,
+                     (int)noStacking, (double)values.torque, (int)restored, (int)cleared));
+    }
+
+    // ---------- 18. 审查问题 8：经验目标值范围校验（先判范围再转换） ----------
+    {
+        int32_t value = 0;
+        std::string error;
+        bool ok = true;
+        std::string detail;
+        // 合法边界
+        if (!parseXpTarget("0", &value, &error) || value != 0) {
+            ok = false;
+            detail = "0 被拒绝";
+        }
+        // 业务上限内
+        if (ok && (!parseXpTarget("2000000000", &value, &error) || value != 2000000000)) {
+            ok = false;
+            detail = "业务上限 2e9 被拒绝";
+        }
+        // int32 上界本身超出业务上限：必须以「业务上限」为由拒绝（绝不做越界转换）
+        if (ok) {
+            value = -12345;
+            if (parseXpTarget("2147483647", &value, &error) || value != -12345) {
+                ok = false;
+                detail = "INT32_MAX 未被业务上限拒绝（或写出了输出值）";
+            } else if (error.find("上限") == std::string::npos) {
+                ok = false;
+                detail = "INT32_MAX 的拒绝原因不是业务上限：" + error;
+            }
+        }
+        // 必须拒绝：负数、业务上限外、int32 边界外、超大整数、非整数
+        const char* rejected[] = {"-1",          "2000000001", "2147483648",
+                                  "4294967296",  "999999999999999999999999",
+                                  "1e30",        "12.5",       ""};
+        for (const char* text : rejected) {
+            if (!ok) break;
+            if (parseXpTarget(text, &value, &error)) {
+                ok = false;
+                detail = std::string("越界值被接受：") + text;
+            }
+        }
+        // 金钱同样先判范围
+        int64_t money = 0;
+        if (ok && (!parseMoneyTarget("1000000000", &money, &error) || money != 1000000000LL)) {
+            ok = false;
+            detail = "合法金额被拒绝";
+        }
+        if (ok && parseMoneyTarget("99999999999999999999", &money, &error)) {
+            ok = false;
+            detail = "超大金额被接受";
+        }
+        if (ok && parseMoneyTarget("not-a-number", &money, &error)) {
+            ok = false;
+            detail = "非数字金额被接受";
+        }
+        add("经验/金钱目标值：先判范围再转换（含边界与越界）", ok,
+            ok ? "0/INT32_MAX/2e9 接受；负数、越界、非整数、超大值全部拒绝"
+               : detail);
+    }
+
+    // ---------- 19. 审查复审 1：多条凭据（2 条/3 条）解析、往返与"对象记录+未采纳凭据"共存 ----------
+    {
+        // 凭据格式：flags;base5;written5;scale;raise。copyA/copyB 必须与真实放大副本一致，
+        // 否则不会被采纳（这正是叠加保护按「写入值三元组」匹配的原因）。
+        auto record = [](float baseTorque, float baseCopyA, float baseCopyB, float rpmLimit,
+                         float writtenTorque, float writtenCopyA, float writtenCopyB,
+                         const char* lead) {
+            return fmt("%s;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;"
+                       "%.4f;1.250;0",
+                       lead, baseTorque, baseCopyA, baseCopyB, rpmLimit, rpmLimit, writtenTorque,
+                       writtenCopyA, writtenCopyB, rpmLimit, rpmLimit);
+        };
+        // 3800 N·m 发动机（rpm 上限 2000）：copyA 3773.4 → 4716.75
+        const std::string credBig =
+            record(3800.0f, 3773.4f, 3800.0f, 2000.0f, 4750.0f, 4716.75f, 4750.0f, ";P");
+        // 2400 N·m 发动机（rpm 上限 2200）：copyA 2380 → 2975
+        const std::string credSmall =
+            record(2400.0f, 2380.0f, 2400.0f, 2200.0f, 3000.0f, 2975.0f, 3000.0f, "1");
+        // 1500 N·m 发动机（仅用于 3 条解析/往返）
+        const std::string credTiny =
+            record(1500.0f, 1480.0f, 1500.0f, 1800.0f, 1875.0f, 1850.0f, 1875.0f, ";P");
+        const std::string two = credSmall + credBig;
+        const std::string three = two + credTiny;
+
+        EngineTuner tunerA;
+        tunerA.setBackgroundThreadEnabled(false);
+        tunerA.importState(two);
+        const std::string exportedTwo = tunerA.exportState();
+        const int markersTwo = (int)std::count(exportedTwo.begin(), exportedTwo.end(), 'P');
+        const bool twoOk = exportedTwo.find("3800") != std::string::npos && markersTwo == 1;
+
+        EngineTuner tunerB;
+        tunerB.setBackgroundThreadEnabled(false);
+        tunerB.importState(three);
+        const std::string exportedThree = tunerB.exportState();
+        const int markersThree = (int)std::count(exportedThree.begin(), exportedThree.end(), 'P');
+        // 往返稳定：导出→再导入→再导出，条数不变
+        EngineTuner tunerC;
+        tunerC.setBackgroundThreadEnabled(false);
+        tunerC.importState(exportedThree);
+        const std::string roundTrip = tunerC.exportState();
+        const int markersRoundTrip = (int)std::count(roundTrip.begin(), roundTrip.end(), 'P');
+        const bool threeOk = markersThree == 2 && markersRoundTrip == 2 &&
+                             exportedThree.find("1500") != std::string::npos &&
+                             roundTrip.find("3800") != std::string::npos;
+
+        // 两辆车各按自己的真实基准恢复（2400 与 3800 两条凭据各自生效）
+        Rig rig;
+        FakeEngineValues amplifiedA = kVolvo;      // 3800×1.25 = 4750
+        amplifiedA.torque = 4750.0f;
+        amplifiedA.copyA = 4716.75f;
+        amplifiedA.copyB = 4750.0f;
+        FakeEngineValues amplifiedB = kScania;     // 2400×1.25 = 3000
+        amplifiedB.torque = 3000.0f;
+        amplifiedB.copyA = 2975.0f;
+        amplifiedB.copyB = 3000.0f;
+        rig.memory->mapEngine(kEngineA, amplifiedA);
+        rig.memory->mapEngine(kEngineB, amplifiedB);
+        rig.tuner.importState(two);
+        rig.resolver->setObject(kEngineA);
+        std::string error;
+        const bool appliedA = rig.tuner.apply(1.25f, false, &error);
+        const bool noStackA = closeTo(rig.memory->read(kEngineA).torque, 4750.0f, 1.0f);
+        rig.resolver->setObject(kEngineB);
+        const bool switched = rig.tuner.maintenance(&error) &&
+                              rig.tuner.apply(1.25f, false, &error);
+        const bool noStackB = closeTo(rig.memory->read(kEngineB).torque, 3000.0f, 1.0f);
+        std::string releaseError;
+        rig.tuner.release(&releaseError);
+        const bool backB = closeTo(rig.memory->read(kEngineB).torque, 2400.0f, 1.0f);
+        const bool backA = closeTo(rig.memory->read(kEngineA).torque, 3800.0f, 1.0f);
+        const bool bothOk = appliedA && noStackA && switched && noStackB && backB && backA;
+
+        add("发动机多条凭据：2/3 条解析与往返 + 两车各自恢复真实基准",
+            twoOk && threeOk && bothOk,
+            fmt("2 条=%d(标记 %d) 3 条=%d(标记 %d/往返 %d) 两车恢复=%d（appliedA=%d switch=%d "
+                "noStackA=%d noStackB=%d backA=%d backB=%d；A=%.1f B=%.1f err=%s）",
+                (int)twoOk, markersTwo, (int)threeOk, markersThree, markersRoundTrip,
+                (int)bothOk, (int)appliedA, (int)switched, (int)noStackA, (int)noStackB,
+                (int)backA, (int)backB, (double)rig.memory->read(kEngineA).torque,
+                (double)rig.memory->read(kEngineB).torque, releaseError.c_str()));
+    }
+
+    // ---------- 20. 审查复审 1：已修改对象记录 与 未采纳凭据 共存时导出不丢任一 ----------
+    {
+        Rig rig;
+        FakeEngineValues amplified = kVolvo;
+        amplified.torque = 4750.0f;
+        amplified.copyA = 4716.75f;
+        amplified.copyB = 4750.0f;
+        rig.memory->mapEngine(kEngineA, amplified);
+        rig.memory->mapEngine(kEngineB, kScania);
+        rig.resolver->setObject(kEngineA);
+        std::string error;
+        const bool applied = rig.tuner.apply(1.25f, false, &error);
+        // 再导入一条「另一台发动机」的未采纳凭据（原厂 2400 → 写 3000）
+        rig.tuner.importState("1;2400.0000;2380.0000;2400.0000;2200.0000;2200.0000;"
+                              "3000.0000;2975.0000;3000.0000;2200.0000;2200.0000;1.250;0");
+        const std::string exported = rig.tuner.exportState();
+        const bool hasObjectRecord = exported.find("4750") != std::string::npos;
+        const bool hasPending = exported.find(";P;") != std::string::npos &&
+                                exported.find("2400") != std::string::npos;
+        add("发动机凭据共存：对象记录与未采纳凭据同时导出", applied && hasObjectRecord &&
+                                                                 hasPending,
+            fmt("导出字节=%d 对象记录=%d 未采纳凭据=%d", (int)exported.size(),
+                (int)hasObjectRecord, (int)hasPending));
+    }
+
+    {
+        const std::string primary =
+            "1;2400.0000;2380.0000;2400.0000;2200.0000;2200.0000;"
+            "4200.0000;4165.0000;4200.0000;2420.0000;2420.0000;1.750;1";
+        const std::string extra =
+            ";P;3800.0000;3776.0000;3800.0000;2000.0000;2000.0000;"
+            "4750.0000;4720.0000;4750.0000;2000.0000;2000.0000;1.250;0";
+        bool ok = true;
+        for (const std::string& state : {primary, primary + extra}) {
+            std::string next = state;
+            for (int round = 0; round < 3; ++round) {
+                EngineTuner tuner;
+                tuner.setBackgroundThreadEnabled(false);
+                tuner.importState(next);
+                next = tuner.exportState();
+                ok = ok && next == state && closeTo(tuner.scale(), 1.0f, 0.0001f) &&
+                     !tuner.raiseLimit(); // 导入凭据不会擅自启用动力/转速策略。
+            }
+        }
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, kVolvo);
+        rig.resolver->setObject(kEngineA);
+        std::string error;
+        const bool applied = rig.tuner.apply(1.25f, false, &error);
+        rig.tuner.importState(primary);
+        const std::string mixed = rig.tuner.exportState();
+        const std::string pending = ";P;" + primary.substr(2);
+        ok = ok && applied && mixed.find("4750") != std::string::npos &&
+             mixed.find(pending) != std::string::npos && closeTo(rig.tuner.scale(), 1.25f, 0.0001f) &&
+             !rig.tuner.raiseLimit();
+        add("发动机凭据：主/追加/共存记录保留各自倍率与转速标志", ok,
+            ok ? "1.750/raise=1 与 1.250/raise=0 往返三轮保持，且不改变当前策略" : error);
+    }
+    // 完整事务失败后逐字段保留恢复凭据，包含首次与已有放大值的后续事务。
+    for (bool previouslyApplied : {false, true}) {
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, kVolvo);
+        rig.resolver->setObject(kEngineA);
+        std::string error;
+        bool ok = !previouslyApplied || rig.tuner.apply(1.25f, false, &error);
+        rig.memory->failWriteAndRollback(kEngineA + engine_runtime::kRpmLimit,
+                                        kEngineA + engine_runtime::kTorque);
+        const bool failed = !rig.tuner.apply(previouslyApplied ? 1.5f : 1.25f, false, &error);
+        const float residual = rig.memory->read(kEngineA).torque;
+        const EngineFieldValues residualValues = rig.memory->read(kEngineA);
+        const std::string saved = rig.tuner.exportState();
+        EngineFieldValues baseline;
+        ok = ok && failed && saved.find(";U") != std::string::npos &&
+             rig.tuner.baselineOf(kEngineA, &baseline) && closeTo(baseline.torque, 3800.0f);
+        EngineTuner reloaded;
+        reloaded.setBackgroundThreadEnabled(false);
+        reloaded.importState(saved);
+        ok = ok && reloaded.exportState() == saved;
+        rig.memory->clearInjectedFailures();
+        const bool retried = rig.tuner.apply(1.25f, false, &error);
+        ok = ok && retried && closeTo(rig.memory->read(kEngineA).torque, 4750.0f) &&
+             rig.tuner.baselineOf(kEngineA, &baseline) && closeTo(baseline.torque, 3800.0f) &&
+             rig.tuner.exportState().find(";U") == std::string::npos;
+        const bool released = rig.tuner.release(&error);
+        ok = ok && released && closeTo(rig.memory->read(kEngineA).torque, 3800.0f) &&
+             rig.tuner.exportState().empty();
+        add(previouslyApplied ? "发动机后续事务：回滚失败保留原厂基准，重试不叠加"
+                              : "发动机首次事务：回滚失败导出凭据，重试不把残留当原厂",
+            ok, fmt("残留=%.1f 保存字节=%d 重试=%d 原厂=%.1f %s", residual, (int)saved.size(),
+                    (int)retried, baseline.torque, error.c_str()));
+
+        Rig restart;
+        FakeEngineValues mixed = kVolvo;
+        mixed.torque = residual;
+        mixed.copyA = residualValues.copyA;
+        mixed.copyB = residualValues.copyB;
+        mixed.rpmLimit = residualValues.rpmLimit;
+        mixed.rpmLimitNeutral = residualValues.rpmLimitNeutral;
+        restart.memory->mapEngine(kEngineA, mixed);
+        restart.resolver->setObject(kEngineA);
+        restart.tuner.importState(saved);
+        const bool restarted = restart.tuner.apply(1.25f, false, &error);
+        add("发动机部分事务：导出重载后先恢复，再按真实原厂倍率写入",
+            restarted && closeTo(restart.memory->read(kEngineA).torque, 4750.0f) &&
+            restart.tuner.baselineOf(kEngineA, &baseline) && closeTo(baseline.torque, 3800.0f), error);
+
+        mixed.torque = 9100.0f;
+        restart.tuner.release(&error);
+        restart.memory->mapEngine(kEngineA, mixed);
+        restart.tuner.importState(saved);
+        const auto writes = restart.memory->writes();
+        const bool refused = !restart.tuner.apply(1.25f, false, &error);
+        add("发动机部分事务：重载凭据不符时保留记录，不覆盖外部内容",
+            refused && restart.memory->writes() == writes &&
+            closeTo(restart.memory->read(kEngineA).torque, 9100.0f) &&
+            restart.tuner.exportState().find(";U") != std::string::npos, error);
+    }
+    {
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, kVolvo);
+        rig.resolver->setObject(kEngineA);
+        rig.memory->failWriteAndRollback(kEngineA + engine_runtime::kRpmLimit,
+                                        kEngineA + engine_runtime::kTorque);
+        std::string error;
+        const bool failed = !rig.tuner.apply(1.25f, false, &error);
+        const auto saved = rig.tuner.exportState();
+        rig.memory->setUsable(false);
+        const bool unreadableKept = !rig.tuner.release(&error) && rig.tuner.exportState() == saved;
+        rig.memory->setUsable(true);
+        rig.memory->clearInjectedFailures();
+        const bool released = rig.tuner.release(&error);
+        add("发动机首次部分事务：关闭也会找到无 activeObject 的恢复任务",
+            failed && unreadableKept && released && closeTo(rig.memory->read(kEngineA).torque, 3800.0f) &&
+            rig.tuner.exportState().empty(), error);
+    }
+    {
+        Rig rig;
+        rig.memory->mapEngine(kEngineA, kVolvo);
+        rig.resolver->setObject(kEngineA);
+        rig.memory->failWriteAndRollback(kEngineA + engine_runtime::kTorqueCurveTail,
+                                        kEngineA + engine_runtime::kRpmLimitNeutral);
+        std::string error;
+        const bool failed = !rig.tuner.apply(1.25f, true, &error);
+        const auto residual = rig.memory->read(kEngineA);
+        const auto saved = rig.tuner.exportState();
+        const bool knownResidual = closeTo(residual.torque, 3800.0f) &&
+            closeTo(residual.rpmLimit, 2000.0f) && closeTo(residual.rpmLimitNeutral, 2200.0f);
+        rig.memory->clearInjectedFailures();
+        const bool released = rig.tuner.release(&error);
+        add("发动机逐字段回滚：仅空挡 RPM 残留也保留并恢复真实基准",
+            failed && knownResidual && saved.find(";U") != std::string::npos && released &&
+            closeTo(rig.memory->read(kEngineA).rpmLimitNeutral, 2000.0f) &&
+            rig.tuner.exportState().empty(), error);
+    }
     return items;
 }
 

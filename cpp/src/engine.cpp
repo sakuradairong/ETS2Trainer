@@ -484,6 +484,7 @@ void EngineTuner::attach(std::unique_ptr<EngineMemory> memory,
 void EngineTuner::detach() {
     // 仅供进程句柄已不可用的情形：不写入，但保留尚未恢复的基准供持久化。
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool hadRecords = !objects_.empty() || activeObject_ != 0;
     active_ = false;
     activeObject_ = 0;
     for (auto it = objects_.begin(); it != objects_.end();) {
@@ -494,6 +495,7 @@ void EngineTuner::detach() {
     memoryOwner_.reset();
     resolver_.reset();
     guard_ = nullptr;
+    if (hadRecords) bumpRevisionLocked();  // 待恢复记录集合可能已变化
     setStatusLocked(objects_.empty() ? "已分离：动力调节已关闭"
                                      : "已分离：原值未确认恢复，恢复记录仍保留");
 }
@@ -533,6 +535,7 @@ void EngineTuner::restoreAndDetach() {
     memoryOwner_.reset();
     resolver_.reset();
     guard_ = nullptr;
+    bumpRevisionLocked();  // 恢复成败 / 待恢复记录集合发生变化
     setStatusLocked(keepRecord ? "原值未恢复，已保留恢复记录：" + detail
                                : "已停止动力调节" + (detail.empty() ? "" : "：" + detail));
 }
@@ -549,11 +552,22 @@ bool EngineTuner::apply(float scale, bool raiseLimit, std::string* error) {
     }
     if (tunerClose(scale, 1.0f, 0.0001f) && !raiseLimit) {
         // 等价于“恢复原值”
+        const bool hadActive = activeObject_ != 0;
         const bool ok = restoreActiveLocked(true, error);
         active_ = false;
         scale_ = 1.0f;
         raiseLimit_ = false;
+        if (hadActive) bumpRevisionLocked();  // 恢复状态变化
         if (ok) setStatusLocked(summaryLocked());
+        if (!hadActive && !remoteCreds_.empty()) {
+            // 没有任何对象可恢复，却还存在未核对的导入记录 → 不得虚报成功
+            if (error) {
+                *error = fmt("上次运行的恢复记录尚未核对（共 %d 条），已保留",
+                             (int)remoteCreds_.size());
+            }
+            setStatusLocked("动力调节已关闭；上次运行的恢复记录尚未核对，已保留");
+            return false;
+        }
         return ok;
     }
     scale_ = scale;
@@ -587,11 +601,27 @@ bool EngineTuner::release(std::string* error) {
     scale_ = 1.0f;
     raiseLimit_ = false;
     if (!activeObject_) {
+        for (const auto& [address, state] : objects_) {
+            if (state.hasWritten) { activeObject_ = address; break; }
+        }
+    }
+    if (!activeObject_) {
+        if (!remoteCreds_.empty()) {
+            // 还没有核对/恢复过任何对象：不能虚报「已恢复原厂」，记录必须保留，
+            // 否则下一次启动会把上次的放大值当成原厂值再乘倍率。
+            if (error) {
+                *error = fmt("上次运行的恢复记录尚未核对（共 %d 条，未对任何对象写入或核对），已保留",
+                             (int)remoteCreds_.size());
+            }
+            setStatusLocked("动力调节已关闭；上次运行的恢复记录尚未核对，已保留（不会把放大值当原厂值）");
+            return false;
+        }
         if (error) error->clear();
         setStatusLocked("动力调节已关闭");
         return true;
     }
     const bool ok = restoreActiveLocked(true, error);
+    bumpRevisionLocked();  // 恢复成功或失败：待恢复记录状态变化
     setStatusLocked(ok ? "已恢复原厂动力" : ("已关闭动力调节（" + (error ? *error : std::string()) + "）"));
     return ok;
 }
@@ -641,9 +671,11 @@ bool EngineTuner::applyLocked(float scale, bool raiseLimit, std::string* error) 
             guardStopped_ = true;
             std::string detail;
             RestoreOutcome outcome = RestoreOutcome::Ok;
+            const bool hadActive = activeObject_ != 0;
             if (activeObject_) outcome = restoreObjectLocked(activeObject_, &detail);
             active_ = false;
             activeObject_ = 0;
+            if (hadActive) bumpRevisionLocked();  // 活动对象被移除 / 恢复状态变化
             if (outcome == RestoreOutcome::Failed) {
                 setStatusLocked("联机保护已停止动力调节；原值未能恢复，恢复记录已保留：" + detail);
             } else if (outcome == RestoreOutcome::NotOurs) {
@@ -675,6 +707,16 @@ bool EngineTuner::applyLocked(float scale, bool raiseLimit, std::string* error) 
         }
     }
 
+    // 活动对象为 0 的首次失败也会留下恢复任务；换对象不能绕开它。
+    for (const auto& [address, state] : objects_) {
+        if (!state.recoveryPending) continue;
+        std::string detail;
+        if (restoreObjectLocked(address, &detail) != RestoreOutcome::Ok) {
+            if (error) *error = "部分事务恢复未确认，暂停写入：" + detail;
+            return false;
+        }
+    }
+
     // 3) 换发动机对象（换车 / 换发动机 / 读档）：先尽力写回旧对象
     if (activeObject_ != 0 && target != activeObject_) {
         std::string detail;
@@ -685,6 +727,8 @@ bool EngineTuner::applyLocked(float scale, bool raiseLimit, std::string* error) 
         }
         if (outcome == RestoreOutcome::NotOurs) {
             objects_.erase(activeObject_);
+            invalidatedRecord_ = true;  // 对象已明确失效：记录被丢弃
+            bumpRevisionLocked();  // 待恢复记录集合变化
         }
         activeObject_ = 0;
     }
@@ -695,7 +739,23 @@ bool EngineTuner::applyLocked(float scale, bool raiseLimit, std::string* error) 
         if (error) *error = "读取发动机数据失败（对象可能已失效）";
         return false;
     }
+    // 未确认的部分事务必须先安全恢复；不能把混合残留当作新的原厂基准。
+    for (const RemoteCredential& credential : remoteCreds_) {
+        if (credential.recoveryPending && !tunerSameTriple(current, credential.written) &&
+            !tunerSameTriple(current, credential.base)) {
+            if (error) *error = "上次部分事务尚未核对，当前内容不符；保留凭据并暂停写入";
+            return false;
+        }
+    }
     ObjectState& state = baselineFor(target, current);
+    if (state.recoveryPending) {
+        std::string detail;
+        if (restoreObjectLocked(target, &detail) != RestoreOutcome::Ok ||
+            !readEngineValues(*memory_, target, &current)) {
+            if (error) *error = "部分事务恢复未确认，暂停写入：" + detail;
+            return false;
+        }
+    }
 
     // 5) 计算目标值并做安全范围检查
     EngineFieldValues values;
@@ -706,6 +766,10 @@ bool EngineTuner::applyLocked(float scale, bool raiseLimit, std::string* error) 
 
     state.written = values;
     state.hasWritten = true;
+    state.recoveryPending = false;
+    state.writtenScale = scale;
+    state.writtenRaiseLimit = raiseLimit;
+    if (activeObject_ != target) bumpRevisionLocked();  // 活动对象变化（含首次启用）
     activeObject_ = target;
     if (error) error->clear();
     return true;
@@ -731,25 +795,30 @@ EngineTuner::RestoreOutcome EngineTuner::restoreObjectLocked(uint64_t address,
     EngineFieldValues current;
     if (!readEngineValues(*memory_, address, &current)) {
         if (detail) *detail = "发动机对象已失效（无法读取）";
-        return RestoreOutcome::NotOurs;
+        return state.recoveryPending ? RestoreOutcome::Failed : RestoreOutcome::NotOurs;
     }
     if (tunerSameTriple(current, state.base)) {
         state.hasWritten = false;
+        state.recoveryPending = false;
         state.written = state.base;
+        bumpRevisionLocked();  // 恢复成功：待恢复记录状态变化
         if (detail) detail->clear();
         return RestoreOutcome::Ok;
     }
     if (!tunerSameTriple(current, state.written)) {
         if (detail) *detail = "对象数值与本程序记录不符（地址可能已被复用）";
-        return RestoreOutcome::NotOurs;
+        invalidatedRecord_ = true;  // 对象已明确失效：记录不再适用（界面如实提示）
+        return state.recoveryPending ? RestoreOutcome::Failed : RestoreOutcome::NotOurs;
     }
     std::string writeError;
     if (!writeValuesLocked(address, state, state.base, &writeError)) {
         if (detail) *detail = writeError;
-        return RestoreOutcome::Failed;
+        return RestoreOutcome::Failed;  // 记录原样保留（不删除恢复记录）
     }
     state.written = state.base;
     state.hasWritten = false;
+    state.recoveryPending = false;
+    bumpRevisionLocked();  // 恢复成功：待恢复记录状态变化
     if (detail) detail->clear();
     return RestoreOutcome::Ok;
 }
@@ -769,6 +838,8 @@ bool EngineTuner::restoreActiveLocked(bool strict, std::string* error) {
     }
     if (outcome == RestoreOutcome::NotOurs) {
         objects_.erase(object);
+        invalidatedRecord_ = true;  // 对象已明确失效：记录被丢弃（不谎称已恢复）
+        bumpRevisionLocked();  // 待恢复记录集合变化
         if (error) *error = "未能写回原值：" + detail;
         return !strict;
     }
@@ -826,12 +897,13 @@ bool EngineTuner::computeValuesLocked(const ObjectState& state, float scale, boo
     return true;
 }
 
-bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
+bool EngineTuner::writeValuesLocked(uint64_t address, ObjectState& state,
                                     const EngineFieldValues& values, std::string* error) {
     struct Field {
         uint64_t address;
         float    value;     // 目标值
         float    original;  // 回滚值
+        float*   acknowledged = nullptr; // 本字段最近一次成功发出写入的值。
     };
     std::vector<Field> fields;
     fields.push_back({address + engine_runtime::kTorque, values.torque, state.base.torque});
@@ -847,6 +919,22 @@ bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
             {address + engine_runtime::kTorqueCurveTail + 4, values.copyB, state.base.copyB});
     }
 
+    EngineFieldValues before;
+    if (!readEngineValues(*memory_, address, &before)) {
+        if (error) *error = "事务开始前读取发动机字段失败，未写入";
+        return false;
+    }
+    EngineFieldValues expected = before;
+    for (Field& field : fields) {
+        const uint64_t offset = field.address - address;
+        if (offset == engine_runtime::kTorque) field.acknowledged = &expected.torque;
+        else if (offset == engine_runtime::kRpmLimit) field.acknowledged = &expected.rpmLimit;
+        else if (offset == engine_runtime::kRpmLimitNeutral) field.acknowledged = &expected.rpmLimitNeutral;
+        else if (offset == engine_runtime::kTorqueCurveTail) field.acknowledged = &expected.copyA;
+        else field.acknowledged = &expected.copyB;
+        field.original = *field.acknowledged; // 精确回滚到本轮之前，而非猜测全部已经原厂。
+    }
+
     for (const Field& field : fields) {
         if (!std::isfinite(field.value)) {
             if (error) *error = "写入值不是有限数，已拒绝写入";
@@ -858,6 +946,7 @@ bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
         int failures = 0;
         for (size_t i = 0; i < count && i < fields.size(); ++i) {
             if (!tunerWriteFloat(*memory_, fields[i].address, fields[i].original)) ++failures;
+            else *fields[i].acknowledged = fields[i].original;
         }
         std::string text;
         for (size_t i = 0; i < count && i < fields.size(); ++i) {
@@ -869,6 +958,13 @@ bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
         }
         if (failures > 0) {
             text = fmt("，回滚未完全成功（%d 项）", failures);
+            // 不把未知读回值当作我们的值。只持久化逐字段成功 API 写入形成的图像。
+            state.written = expected;
+            state.hasWritten = true;
+            state.recoveryPending = true;
+            state.writtenScale = scale_;
+            state.writtenRaiseLimit = raiseLimit_;
+            bumpRevisionLocked();
         }
         if (detail) *detail = text;
     };
@@ -876,7 +972,7 @@ bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
     for (size_t i = 0; i < fields.size(); ++i) {
         if (!tunerWriteFloat(*memory_, fields[i].address, fields[i].value)) {
             std::string rollbackNote;
-            rollback(i, &rollbackNote);
+            rollback(i + 1, &rollbackNote); // API 失败也可能留下部分字节；该字段同样核对回滚。
             if (error) {
                 *error = fmt("写入字段 +0x%llX 失败%s",
                              (unsigned long long)(fields[i].address - address),
@@ -884,6 +980,7 @@ bool EngineTuner::writeValuesLocked(uint64_t address, const ObjectState& state,
             }
             return false;
         }
+        *fields[i].acknowledged = fields[i].value;
     }
 
     for (const Field& field : fields) {
@@ -913,30 +1010,49 @@ EngineTuner::ObjectState& EngineTuner::baselineFor(uint64_t address,
         state.base = current;
         // 跨进程重启的叠加保护：如果当前值正好是上次运行我们写入的值，
         // 就把当时记录的原厂基准当作基准，绝不把放大值当原厂值。
-        if (remoteRecordValid_ && tunerSameTriple(current, remoteWritten_)) {
-            state.base = remoteBase_;
+        // 逐条比对尚未采纳的导入记录：只采纳一次，采纳后立即移除并同步旧字段。
+        for (size_t index = 0; index < remoteCreds_.size(); ++index) {
+            const bool matchesBase = remoteCreds_[index].recoveryPending &&
+                                     tunerSameTriple(current, remoteCreds_[index].base);
+            if (!matchesBase && !tunerSameTriple(current, remoteCreds_[index].written)) continue;
+            state.base = remoteCreds_[index].base;
+            if (remoteCreds_[index].recoveryPending && !matchesBase) {
+                state.written = remoteCreds_[index].written;
+                state.hasWritten = true;
+                state.recoveryPending = true;
+                state.writtenScale = remoteCreds_[index].scale;
+                state.writtenRaiseLimit = remoteCreds_[index].raiseLimit;
+            }
             // v1 持久化格式不含这两个只读身份字段，不能用默认 0 取代实时值。
             state.base.rpmIdle = current.rpmIdle;
             state.base.resistance = current.resistance;
-            // 恢复记录仅可采纳一次，避免误套到另一台巧合同扭矩的新发动机。
-            remoteRecordValid_ = false;
+            remoteCreds_.erase(remoteCreds_.begin() + (std::ptrdiff_t)index);
+            syncRemotePrimaryLocked();
+            bumpRevisionLocked();  // 导入记录被采纳：恢复凭据状态变化
+            break;
         }
         state.useCopyA = tunerSameMagnitude(state.base.copyA, state.base.torque);
         state.useCopyB = tunerSameMagnitude(state.base.copyB, state.base.torque);
+        invalidatedRecord_ = false;  // 已建立新的有效记录
+        bumpRevisionLocked();  // 新对象保存了原厂基准
         return objects_.emplace(address, state).first->second;
     }
     ObjectState& state = it->second;
+    if (state.recoveryPending) return state;
     if (state.hasWritten) {
         if (tunerSameTriple(current, state.written)) return state;  // 仍是我们写入的值
         if (tunerSameTriple(current, state.base)) {                 // 游戏已把它改回原厂
             state.hasWritten = false;
             state.written = state.base;
+            bumpRevisionLocked();  // 恢复状态变化（游戏侧已回原厂）
             return state;
         }
         state.base = current;  // 其它数值 → 视为新的原厂值
         state.hasWritten = false;
+        bumpRevisionLocked();  // 基准值更新
     } else if (!tunerSameTriple(current, state.base)) {
         state.base = current;  // 同一地址被新的发动机对象复用
+        bumpRevisionLocked();  // 基准值更新
     }
     state.written = state.base;
     state.useCopyA = tunerSameMagnitude(state.base.copyA, state.base.torque);
@@ -995,6 +1111,12 @@ uint64_t EngineTuner::activeObject() const {
     return activeObject_;
 }
 
+uint64_t EngineTuner::stateRevision() const {
+    // 无锁读取（原子）：界面线程每帧轮询。修订号在 mutex_ 内、状态变更落定前自增，
+    // 因此读到新修订号后再加锁调用 exportState() 必然拿到新状态。
+    return stateRevision_.load(std::memory_order_acquire);
+}
+
 std::string EngineTuner::status() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return status_;
@@ -1010,61 +1132,135 @@ bool EngineTuner::baselineOf(uint64_t object, EngineFieldValues* out) const {
 
 std::string EngineTuner::exportState() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    // 优先导出当前激活对象；若已停止但存在「还原失败而保留」的对象（restoreAndDetach
-    // 的 keepRecord 路径），同样必须导出，否则跨重启的恢复凭据会丢。
+    // 状态机（导出优先序）：
+    //   1) 已修改且尚未确认恢复的对象记录（objects_ 中 hasWritten）→ 主记录
+    //   2) 尚未核对的导入记录（remoteCreds_）→ 同样的主记录格式（绝不导出为空，
+    //      否则自动保存会把上次运行的恢复凭据覆盖掉）
+    //   3) 两者都有 → 主记录 = 对象记录，其余未采纳的导入记录以 ";P;..." 追加
+    //      （旧版本读到时只会取前 11 个数字，天然向后兼容）
+    //   4) 已确认恢复（无对象记录、无导入记录）→ 空串，避免留下过期凭据
+    std::string primary;
     const auto it = activeObject_ ? objects_.find(activeObject_) : objects_.end();
-    if (it == objects_.end() || !it->second.hasWritten) {
+    const ObjectState* chosen = nullptr;
+    if (it != objects_.end() && it->second.hasWritten) {
+        chosen = &it->second;
+    } else {
         for (const auto& [address, state] : objects_) {
             if (state.hasWritten) {
-                return fmt("1;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.3f;%d",
-                           state.base.torque, state.base.copyA, state.base.copyB,
-                           state.base.rpmLimit, state.base.rpmLimitNeutral,
-                           state.written.torque, state.written.copyA, state.written.copyB,
-                           state.written.rpmLimit, state.written.rpmLimitNeutral,
-                           (double)scale_, raiseLimit_ ? 1 : 0);
+                chosen = &state;
+                break;
             }
         }
-        return std::string();
     }
-    const ObjectState& state = it->second;
-    return fmt("1;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.3f;%d", state.base.torque,
-               state.base.copyA, state.base.copyB, state.base.rpmLimit,
-               state.base.rpmLimitNeutral, state.written.torque, state.written.copyA,
-               state.written.copyB, state.written.rpmLimit, state.written.rpmLimitNeutral,
-               (double)scale_, raiseLimit_ ? 1 : 0);
+    auto formatRecord = [](const EngineFieldValues& base, const EngineFieldValues& written,
+                           float recordScale, bool recordRaiseLimit) {
+        return fmt("1;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.3f;%d",
+                   base.torque, base.copyA, base.copyB, base.rpmLimit, base.rpmLimitNeutral,
+                   written.torque, written.copyA, written.copyB, written.rpmLimit,
+                   written.rpmLimitNeutral, (double)recordScale, recordRaiseLimit ? 1 : 0);
+    };
+    size_t credentialStart = 0;
+    if (chosen) {
+        primary = formatRecord(chosen->base, chosen->written, chosen->writtenScale,
+                               chosen->writtenRaiseLimit);
+        if (chosen->recoveryPending) primary += ";U";
+    } else if (!remoteCreds_.empty()) {
+        const RemoteCredential& credential = remoteCreds_[0];
+        primary = formatRecord(credential.base, credential.written, credential.scale,
+                               credential.raiseLimit);
+        if (credential.recoveryPending) primary += ";U";
+        credentialStart = 1;
+    }
+    for (size_t i = credentialStart; i < remoteCreds_.size(); ++i) {
+        const RemoteCredential& credential = remoteCreds_[i];
+        primary += fmt(";P;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.4f;%.3f;%d",
+                       credential.base.torque, credential.base.copyA, credential.base.copyB,
+                       credential.base.rpmLimit, credential.base.rpmLimitNeutral,
+                       credential.written.torque, credential.written.copyA,
+                       credential.written.copyB, credential.written.rpmLimit,
+                       credential.written.rpmLimitNeutral, (double)credential.scale,
+                       credential.raiseLimit ? 1 : 0);
+        if (credential.recoveryPending) primary += ";U";
+    }
+    return primary;
 }
 
 void EngineTuner::importState(const std::string& text) {
     std::lock_guard<std::mutex> lock(mutex_);
+    remoteCreds_.clear();
+    remoteRecordValid_ = false;
+    remoteRecordActive_ = false;
+    // 格式（向后兼容）：
+    //   主记录   "1;<base5>;<written5>;<scale>;<raise>"
+    //   追加记录 ";P;<base5>;<written5>;<scale>;<raise>"（零到多条，尚未核对的导入）
+    // 旧版本读到追加段只会取前若干个数字，不会误解；新版本读旧格式也完全一致。
+    // 分段规则：
+    //   * "P" 是**任何解析状态下都识别**的分段标记（旧实现只在首个 token 前识别，
+    //     导致第二条及之后的凭据被并入第一条并丢失）；
+    //   * "1" 只在一段的起始位置充当标志位，避免把数据里的 1（例如 raise=1）当标志。
+    std::vector<RemoteCredential> parsed;
     std::vector<float> numbers;
-    size_t pos = 0;
     bool hasFlag = false;
+    bool atSegmentStart = true;
+    bool recoveryPending = false;
+    auto flush = [&]() {
+        if (numbers.size() >= 11) {
+            RemoteCredential credential;
+            credential.base.torque = numbers[0];
+            credential.base.copyA = numbers[1];
+            credential.base.copyB = numbers[2];
+            credential.base.rpmLimit = numbers[3];
+            credential.base.rpmLimitNeutral = numbers[4];
+            credential.written.torque = numbers[5];
+            credential.written.copyA = numbers[6];
+            credential.written.copyB = numbers[7];
+            credential.written.rpmLimit = numbers[8];
+            credential.written.rpmLimitNeutral = numbers[9];
+            credential.scale = numbers[10];
+            credential.raiseLimit = numbers.size() > 11 && numbers[11] != 0.0f;
+            credential.recoveryPending = recoveryPending;
+            parsed.push_back(credential);
+        }
+        numbers.clear();
+        atSegmentStart = true;
+        recoveryPending = false;
+    };
+    size_t pos = 0;
     while (pos <= text.size()) {
-        size_t sep = text.find(';', pos);
-        std::string token =
+        const size_t sep = text.find(';', pos);
+        const std::string token =
             text.substr(pos, (sep == std::string::npos) ? std::string::npos : sep - pos);
         if (!token.empty()) {
-            if (token == "1") hasFlag = true;
-            else numbers.push_back((float)::atof(token.c_str()));
+            if (token == "P") {
+                // 分段标记：无论当前在什么位置都要结束上一段并开启新段
+                flush();
+            } else if (token == "U") {
+                recoveryPending = true; // 可选尾标记：部分事务须先恢复，不能作为新基准。
+            } else if (atSegmentStart && token == "1" && numbers.empty()) {
+                hasFlag = true;
+                atSegmentStart = false;
+            } else if (atSegmentStart) {
+                // 段首直接是数字（无标志位）：按数字继续解析该段
+                atSegmentStart = false;
+                numbers.push_back((float)::atof(token.c_str()));
+            } else {
+                numbers.push_back((float)::atof(token.c_str()));
+            }
         }
         if (sep == std::string::npos) break;
         pos = sep + 1;
     }
-    if (!hasFlag || numbers.size() < 11) {
-        remoteRecordValid_ = false;
-        return;
+    flush();
+    if (!hasFlag || parsed.empty()) {
+        return;  // 没有可用的恢复记录：保持空（不虚报、不留下过期凭据）
     }
-    remoteBase_.torque = numbers[0];
-    remoteBase_.copyA = numbers[1];
-    remoteBase_.copyB = numbers[2];
-    remoteBase_.rpmLimit = numbers[3];
-    remoteBase_.rpmLimitNeutral = numbers[4];
-    remoteWritten_.torque = numbers[5];
-    remoteWritten_.copyA = numbers[6];
-    remoteWritten_.copyB = numbers[7];
-    remoteWritten_.rpmLimit = numbers[8];
-    remoteWritten_.rpmLimitNeutral = numbers[9];
+    remoteCreds_ = std::move(parsed);
+    // 第一条作为主凭据（与旧版语义一致：用来抵消上一次运行的放大值）
+    remoteBase_ = remoteCreds_[0].base;
+    remoteWritten_ = remoteCreds_[0].written;
     remoteRecordValid_ = true;
+    remoteRecordActive_ = true;
+    bumpRevisionLocked();  // 导入了待核对的上次运行记录（UI 会立即持久化，不再丢失）
 }
 
 void EngineTuner::setBackgroundThreadEnabled(bool enabled) {
@@ -1108,6 +1304,36 @@ void EngineTuner::run() {
 }
 
 void EngineTuner::setStatusLocked(const std::string& text) { status_ = text; }
+
+void EngineTuner::syncRemotePrimaryLocked() {
+    // 维护「主凭据」视图（remoteBase_/remoteWritten_/remoteRecordValid_），
+    // 供既有的 status/日志逻辑使用；真正的持久化以 remoteCreds_ 全表为准。
+    remoteRecordValid_ = !remoteCreds_.empty();
+    if (remoteCreds_.empty()) {
+        remoteBase_ = EngineFieldValues{};
+        remoteWritten_ = EngineFieldValues{};
+        remoteRecordActive_ = false;
+        return;
+    }
+    remoteBase_ = remoteCreds_[0].base;
+    remoteWritten_ = remoteCreds_[0].written;
+    remoteRecordActive_ = true;
+}
+
+bool EngineTuner::hasUnverifiedImportedRecord() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return !remoteCreds_.empty();
+}
+
+bool EngineTuner::hasInvalidatedRecord() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return invalidatedRecord_;
+}
+
+void EngineTuner::bumpRevisionLocked() {
+    stateRevision_.store(stateRevision_.load(std::memory_order_relaxed) + 1,
+                         std::memory_order_release);
+}
 
 bool probeAccessories(const ProcessMemory& memory,
                       const std::vector<std::pair<std::string, uint64_t>>& roots,

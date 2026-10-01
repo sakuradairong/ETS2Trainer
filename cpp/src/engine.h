@@ -214,9 +214,22 @@ public:
     uint64_t activeObject() const;
     std::string status() const;
 
+    // 状态修订号（线程安全，可在界面线程轮询）：下列变化会自增——
+    //   活动发动机对象变化 / 新对象保存了原厂基准 / 基准值更新 /
+    //   恢复成功或失败状态变化（记录清除或保留）/ 待恢复记录集合变化。
+    // 界面线程比较修订号，发现变化即调用 exportState() 并原子保存设置，
+    // 保证维护线程自动换车后立即持久化（强退出也不会丢 B 的恢复凭据）。
+    // 注意：无实质变化的周期性 maintenance() 不会自增，不会造成每秒落盘。
+    uint64_t stateRevision() const;
+
     // 跨进程重启的叠加保护：把「上次写入值 / 当时基准值」持久化到设置文件。
     std::string exportState() const;
     void importState(const std::string& text);
+    // 是否存在「已导入但尚未核对」的恢复记录（用于界面如实提示、避免虚报恢复成功）。
+    bool hasUnverifiedImportedRecord() const;
+    // 是否发生过「恢复记录被判定为对象已失效而丢弃」（对象数值与本程序记录完全不符）。
+    // 界面据此如实显示「对象已明确失效」，而不是谎称已确认恢复。
+    bool hasInvalidatedRecord() const;
 
     // 测试用：关闭后台线程，改为手动调用 maintenance()。
     void setBackgroundThreadEnabled(bool enabled);
@@ -231,6 +244,9 @@ private:
         EngineFieldValues base;     // 原厂基准
         EngineFieldValues written;  // 程序最后写入值
         bool hasWritten = false;
+        bool recoveryPending = false; // 部分事务/回滚未确认，禁止把残留当新基准。
+        float writtenScale = 1.0f;
+        bool writtenRaiseLimit = false;
         bool useCopyA = false;
         bool useCopyB = false;
     };
@@ -243,15 +259,27 @@ private:
     bool restoreActiveLocked(bool strict, std::string* error);
     bool computeValuesLocked(const ObjectState& state, float scale, bool raiseLimit,
                              EngineFieldValues* out, std::string* error) const;
-    bool writeValuesLocked(uint64_t address, const ObjectState& state,
+    bool writeValuesLocked(uint64_t address, ObjectState& state,
                            const EngineFieldValues& values, std::string* error);
     ObjectState& baselineFor(uint64_t address, const EngineFieldValues& current);
     bool identityMatches(const ObjectState& state) const;
     std::string summaryLocked() const;
+    void bumpRevisionLocked();  // 需要持久化的状态变化（mutex_ 持有中调用）
+    // 尚未采纳的导入记录（跨进程恢复凭据）。只有当前对象数值正好等于某条记录的
+    // 「上次写入值」时才会被采纳（消费），否则原样保留并继续导出。
+    struct RemoteCredential {
+        EngineFieldValues base;
+        EngineFieldValues written;
+        float             scale = 1.0f;
+        bool              raiseLimit = false;
+        bool              recoveryPending = false;
+    };
+    void syncRemotePrimaryLocked();  // 同步旧字段（remoteBase_/remoteWritten_/valid）供既有逻辑使用
     void run();
     void setStatusLocked(const std::string& text);
 
     mutable std::mutex mutex_;
+    std::atomic<uint64_t> stateRevision_{0};  // 界面线程轮询用（见 stateRevision()）
     EngineMemory* memory_ = nullptr;  // 由 memoryOwner_ 持有，detach 时清空
     std::unique_ptr<EngineMemory> memoryOwner_;
     std::unique_ptr<EngineTargetResolver> resolver_;
@@ -259,12 +287,17 @@ private:
 
     bool active_ = false;
     bool guardStopped_ = false;  // 只在 mutex_ 下访问，标记最近一次写入被守卫拦截
+    // 恢复记录被判定为「对象已明确失效」而丢弃（对象数值与本程序记录完全不符）
+    bool invalidatedRecord_ = false;
     float scale_ = 1.0f;
     bool raiseLimit_ = false;
     uint64_t activeObject_ = 0;
     std::map<uint64_t, ObjectState> objects_;
 
-    // 上次运行留下的记录（防止跨进程重启后把放大值当原厂值）
+    // 上次运行留下的记录（防止跨进程重启后把放大值当原厂值）。
+    // 未采纳的记录可能有多条（例如上次运行改过 A，本次又导入 B 的记录），
+    // 全部保留并导出，避免自动保存把恢复凭据覆盖成空。
+    std::vector<RemoteCredential> remoteCreds_;
     bool remoteRecordValid_ = false;
     bool remoteRecordActive_ = false;
     EngineFieldValues remoteWritten_;

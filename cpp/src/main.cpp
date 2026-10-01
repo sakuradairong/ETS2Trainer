@@ -1,6 +1,7 @@
 // main.cpp —— 程序入口：Direct3D 11 + Dear ImGui 宿主；支持 --selftest 无界面自检
 #include "common.h"
 #include "economy.h"
+#include "economytest.h"
 #include "engine.h"
 #include "enginetest.h"
 #include "gameio.h"
@@ -8,6 +9,7 @@
 #include "saves.h"
 #include "telemetry.h"
 #include "ui.h"
+#include "vehicletest.h"
 
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -1310,6 +1312,41 @@ int runSelfTest(const std::wstring& outPath) {
     bool opened = mem.open(::GetCurrentProcessId(), "self", &err);
     check("打开自身进程", opened, err);
     if (opened) {
+        check("活进程存活检测（等待句柄具有 SYNCHRONIZE 权限）", mem.alive());
+        std::string reuseError;
+        check("UI 连续启用复用附加会话，不重置其他功能", validateAttachedSessionReuse(&reuseError), reuseError);
+        {
+            wchar_t exePath[MAX_PATH * 2]{};
+            ::GetModuleFileNameW(nullptr, exePath, MAX_PATH * 2);
+            const std::wstring eventName = L"Local\\ETS2TrainerLifecycle_" +
+                std::to_wstring(::GetCurrentProcessId()) + L"_" + std::to_wstring(::GetTickCount64());
+            HANDLE event = ::CreateEventW(nullptr, TRUE, FALSE, eventName.c_str());
+            std::wstring childCommand = L"\"" + std::wstring(exePath) +
+                L"\" --lifecycle-helper=" + eventName;
+            std::vector<wchar_t> mutableCommand(childCommand.begin(), childCommand.end());
+            mutableCommand.push_back(0);
+            STARTUPINFOW startup{};
+            startup.cb = sizeof(startup);
+            PROCESS_INFORMATION child{};
+            const bool created = event && ::CreateProcessW(nullptr, mutableCommand.data(), nullptr,
+                nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &child);
+            bool lifecycleOk = false;
+            if (created) {
+                ProcessMemory childMemory;
+                std::string childError;
+                const bool aliveBefore = childMemory.open(child.dwProcessId, "exit259-target", &childError) &&
+                                         childMemory.alive();
+                ::SetEvent(event);
+                const bool exited = ::WaitForSingleObject(child.hProcess, 5000) == WAIT_OBJECT_0;
+                DWORD exitCode = 0;
+                lifecycleOk = aliveBefore && exited && ::GetExitCodeProcess(child.hProcess, &exitCode) &&
+                              exitCode == 259 && !childMemory.alive();
+                ::CloseHandle(child.hProcess);
+                ::CloseHandle(child.hThread);
+            }
+            if (event) ::CloseHandle(event);
+            check("进程生命周期：活靶子→退出码 259，退出后仍正确判为死亡", lifecycleOk);
+        }
         std::vector<Region> regions = mem.regions(64ull * 1024 * 1024);
         uint64_t total = 0;
         for (const auto& r : regions) total += r.size;
@@ -1540,6 +1577,13 @@ int runSelfTest(const std::wstring& outPath) {
     note("");
     note("=== 9. 发动机动力调节（内存镜像状态机测试）===");
     for (const auto& item : runEngineTunerTests()) {
+        check(item.name, item.ok, item.detail);
+    }
+
+    // ---------- 9b. 防侧翻备份管理（离线，不依赖游戏）----------
+    note("");
+    note("=== 9b. 防侧翻备份（与车辆对象绑定，逐项验证清除）===");
+    for (const auto& item : runVehicleAntiRollTests()) {
         check(item.name, item.ok, item.detail);
     }
 
@@ -1789,6 +1833,13 @@ int runSelfTest(const std::wstring& outPath) {
         check("经验越界时拒绝写入", !xpRangeOk, ("(" + writeError + ")"));
     }
 
+    // ---------- 13b. 经济定位候选筛选（零/唯一/同分歧义 + 地址换算）----------
+    note("");
+    note("=== 13b. 经济定位候选筛选（歧义必须失败关闭）===");
+    for (const auto& item : runEconomyLocateTests()) {
+        check(item.name, item.ok, item.detail);
+    }
+
     // ---------- 汇总 ----------
     std::string summary = fmt("自检结果：通过 %d 项，失败 %d 项", g_pass, g_fail);
     g_report.push_back("");
@@ -1821,6 +1872,15 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
 
     // 命令行：支持 --selftest 与 --selftest=<报告文件路径>
     std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
+    const std::wstring lifecycleFlag = L"--lifecycle-helper=";
+    if (cmdLine.find(lifecycleFlag) == 0) {
+        const std::wstring eventName = cmdLine.substr(lifecycleFlag.size());
+        HANDLE event = ::OpenEventW(SYNCHRONIZE, FALSE, eventName.c_str());
+        if (!event) return 10;
+        const DWORD waited = ::WaitForSingleObject(event, 10000);
+        ::CloseHandle(event);
+        return waited == WAIT_OBJECT_0 ? 259 : 11;
+    }
     if (cmdLine.find(L"--target-helper=") != std::wstring::npos) {
         size_t pos = cmdLine.find(L"--target-helper=") + 16;
         std::wstring path = cmdLine.substr(pos);

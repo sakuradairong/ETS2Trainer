@@ -4,6 +4,7 @@
 #include "common.h"
 
 #include <cmath>
+#include <set>
 
 namespace ets2 {
 
@@ -214,6 +215,117 @@ bool economyReferencesBank(const ProcessMemory& memory, uint64_t economyObject,
 uint64_t economyFromBankPointer(uint64_t bankPointerSlot) {
     if (bankPointerSlot < economy_offsets::kEconomyBankRef) return 0;
     return bankPointerSlot - economy_offsets::kEconomyBankRef;
+}
+
+// ---------------------------------------------------------------------------
+// 候选筛选：共享的打分循环。安全规则见 economy.h ——
+//   同分歧义一律 unique=false；候选未完整检查（截断）同样禁止 unique。
+// ---------------------------------------------------------------------------
+namespace {
+
+// 把一个通过结构校验的候选并入打分结果（按对象基址去重，避免同一对象的
+// 多个镜像命中被误判成歧义；真正的歧义必须是多个不同对象同分）。
+void mergeCandidate(CandidatePick* pick, std::set<uint64_t>* seenObjects,
+                    const ProbeResult& probe) {
+    if (!seenObjects->insert(probe.object).second) return;  // 同一对象的重复命中
+    ++pick->probedCount;
+    if (!pick->probed || probe.score > pick->score) {
+        pick->probed = true;
+        pick->score = probe.score;
+        pick->fieldAddress = probe.address;
+        pick->object = probe.object;
+        pick->value = probe.value;
+        pick->tied = 1;
+    } else if (probe.score == pick->score) {
+        ++pick->tied;  // 多个不同对象同分 → 歧义
+    }
+}
+
+// 记录「本轮检查了多少候选 / 一共多少候选」。候选数超过上限时标记 truncated：
+// 未检查的候选可能同分甚至更高分，因此无论得分如何都不允许返回 unique。
+void noteCoverage(CandidatePick* pick, size_t total, size_t examined) {
+    pick->total = total;
+    pick->examined = examined;
+    pick->truncated = total > examined;
+}
+
+void finalizePick(CandidatePick* pick) {
+    pick->unique = pick->probed && pick->tied == 1 && !pick->truncated;
+    if (pick->truncated) {
+        // 截断时不给出任何可写地址，避免调用方误用「最高分那个」。
+        pick->fieldAddress = 0;
+        pick->object = 0;
+        pick->value = 0;
+    }
+}
+
+}  // namespace
+
+CandidatePick pickBestBankCandidate(const ProcessMemory& memory,
+                                    const std::vector<uint64_t>& moneyAddresses, size_t cap) {
+    CandidatePick pick;
+    std::set<uint64_t> seenObjects;
+    const size_t limit = moneyAddresses.size() < cap ? moneyAddresses.size() : cap;
+    for (size_t i = 0; i < limit; ++i) {
+        ProbeResult probe;
+        if (!probeBankObject(memory, moneyAddresses[i], &probe)) continue;
+        mergeCandidate(&pick, &seenObjects, probe);
+    }
+    noteCoverage(&pick, moneyAddresses.size(), limit);
+    finalizePick(&pick);
+    return pick;
+}
+
+CandidatePick pickBestEconomyFromBankRefs(const ProcessMemory& memory,
+                                          const std::vector<uint64_t>& bankPointerSlots,
+                                          uint64_t requiredBank, size_t cap) {
+    CandidatePick pick;
+    std::set<uint64_t> seenObjects;
+    const size_t limit = bankPointerSlots.size() < cap ? bankPointerSlots.size() : cap;
+    for (size_t i = 0; i < limit; ++i) {
+        const uint64_t slot = bankPointerSlots[i];
+        // 槽位内容必须真的是指向 bank 的指针；指定 requiredBank 时必须完全一致
+        int64_t slotValue = 0;
+        if (!readI64(memory, slot, &slotValue)) continue;
+        if (requiredBank && (uint64_t)slotValue != requiredBank) continue;
+        const uint64_t economy = economyFromBankPointer(slot);
+        if (!economy) continue;
+        // 经验地址 = 经济对象 + 0x780（由槽位反推，这里只加一次偏移）
+        ProbeResult probe;
+        if (!probeEconomyObject(memory, economy + economy_offsets::kEconomyExperiencePoints,
+                                &probe)) {
+            continue;
+        }
+        // 对象关系校验：经济对象 +0x18 必须引用指定 bank
+        if (requiredBank && !economyReferencesBank(memory, economy, requiredBank)) continue;
+        mergeCandidate(&pick, &seenObjects, probe);
+    }
+    noteCoverage(&pick, bankPointerSlots.size(), limit);
+    finalizePick(&pick);
+    return pick;
+}
+
+CandidatePick pickBestEconomyFromXpFields(const ProcessMemory& memory,
+                                          const std::vector<uint64_t>& xpFieldAddresses,
+                                          uint64_t requiredBank, size_t cap) {
+    CandidatePick pick;
+    std::set<uint64_t> seenObjects;
+    const size_t limit = xpFieldAddresses.size() < cap ? xpFieldAddresses.size() : cap;
+    for (size_t i = 0; i < limit; ++i) {
+        // 扫描得到的地址本身就是 economy + 0x780 的经验字段地址：
+        // 直接传给 probeEconomyObject，由它减一次偏移得到对象基址。
+        // 在这里再加减任何偏移都会让对象基址错位（历史缺陷）。
+        const uint64_t xpField = xpFieldAddresses[i];
+        ProbeResult probe;
+        if (!probeEconomyObject(memory, xpField, &probe)) continue;
+        if (requiredBank && !economyReferencesBank(memory, probe.object, requiredBank)) {
+            continue;  // 引用了别的 bank：不是这份存档状态的经济对象
+        }
+        mergeCandidate(&pick, &seenObjects, probe);
+    }
+    noteCoverage(&pick, xpFieldAddresses.size(), limit);
+    finalizePick(&pick);
+    return pick;
 }
 
 // 直接写入的安全范围（与 probeBankObject 的量级校验一致）

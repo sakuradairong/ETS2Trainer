@@ -99,7 +99,7 @@ ProcessMemory::~ProcessMemory() { close(); }
 bool ProcessMemory::open(DWORD pid, const std::string& name, std::string* error) {
     close();
     const DWORD kRights = PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_READ |
-                          PROCESS_VM_WRITE;
+                          PROCESS_VM_WRITE | SYNCHRONIZE;
     HANDLE h = ::OpenProcess(kRights, FALSE, pid);
     if (!h) {
         DWORD err = ::GetLastError();
@@ -664,19 +664,41 @@ std::vector<std::tuple<uint64_t, VType, double>> Freezer::entries() const {
     return out;
 }
 
+void Freezer::setWriteGuard(WriteGuard guard) {
+    std::lock_guard<std::mutex> lock(guardMutex_);
+    guard_ = std::move(guard);
+}
+
+std::string Freezer::blockedReason() const {
+    std::lock_guard<std::mutex> lock(guardMutex_);
+    return blockedReason_;
+}
+
 void Freezer::run() {
     while (!stop_.load()) {
+        // 每次写入前复查写入闸门（进入联机后必须停止持续写入）
+        std::string reason;
+        {
+            std::lock_guard<std::mutex> lock(guardMutex_);
+            if (guard_) reason = guard_();
+            blockedReason_ = reason.empty() ? std::string("未启用") : reason;
+        }
         std::vector<std::pair<uint64_t, std::pair<VType, double>>> items;
         {
             std::lock_guard<std::mutex> lock(m_);
             items.reserve(items_.size());
             for (const auto& kv : items_) items.push_back(kv);
         }
-        for (const auto& it : items) {
-            if (mem_ && mem_->writeDouble(it.first, it.second.first, it.second.second)) {
-                writes_.fetch_add(1);
-            } else {
-                fails_.fetch_add(1);
+        if (!reason.empty()) {
+            // 被闸门拦下：一次都不写，只累计拦截次数（条目保留，界面可继续提示）
+            if (!items.empty()) blocked_.fetch_add(1);
+        } else {
+            for (const auto& it : items) {
+                if (mem_ && mem_->writeDouble(it.first, it.second.first, it.second.second)) {
+                    writes_.fetch_add(1);
+                } else {
+                    fails_.fetch_add(1);
+                }
             }
         }
         for (int i = 0; i < interval_ / 20 && !stop_.load(); ++i) {

@@ -18,7 +18,43 @@
 
 namespace ets2 {
 
+bool validateAttachedSessionReuse(std::string* error);
+
 enum class PanelKind { Money, Xp, Fuel, Damage, Scanner };
+
+// 经济定位（startLocateEconomy）后台线程的结果。工作线程只填这个结构
+// （持 resultMutex），界面线程消费后统一落地到 AppState —— 消除对
+// located* 字符串/数值与 moneyTarget/xpTarget 输入缓冲区的数据竞争。
+struct PendingEconomyResult {
+    bool        ready = false;
+    bool        cancelled = false;
+    // 金钱（bank 对象）
+    bool        moneyLocated = false;
+    bool        moneyAmbiguous = false;   // 多个同分候选：必须失败关闭
+    bool        moneyTruncated = false;   // 候选超出检查上限：未完整检查，必须失败关闭
+    uint64_t    moneyAddress = 0;         // bank + 0x18
+    uint64_t    moneyBank = 0;            // bank 对象基址
+    int64_t     moneyValue = 0;
+    std::string moneyDetail;
+    // 经验（经济对象）
+    bool        xpLocated = false;
+    bool        xpAmbiguous = false;
+    bool        xpTruncated = false;
+    uint64_t    xpAddress = 0;            // economy + 0x780
+    uint64_t    economyObject = 0;
+    int64_t     xpValue = 0;
+    std::string xpDetail;
+    // 「直接改钱 / 直接改经验」的自动写入结果（目标值是启动线程前复制的快照）
+    bool        autoWriteMoney = false;
+    bool        moneyWriteOk = false;
+    int64_t     moneyWritten = 0;
+    std::string moneyWriteError;
+    bool        autoWriteXp = false;
+    bool        xpWriteOk = false;
+    int32_t     xpWritten = 0;
+    std::string xpWriteError;
+    std::string log;                      // 单行日志
+};
 
 struct AppState {
     // ---------- 进程 ----------
@@ -104,7 +140,7 @@ struct AppState {
     std::atomic<bool>     cancel{false};
     std::atomic<uint64_t> progressDone{0};
     std::atomic<uint64_t> progressTotal{1};
-    std::string           progressNote;
+    std::string           progressNote;   // 仅界面线程写
     // 工作线程 -> 界面线程 的通信（避免多线程读写 std::string 冲突）
     std::mutex            resultMutex;
     std::string           pendingStatus;
@@ -112,6 +148,11 @@ struct AppState {
     std::string           pendingProgressNote;
     int                   pendingKind = 0;
     bool                  pendingReady = false;
+
+    // 经济定位线程的结构化结果：工作线程只在 resultMutex 下填充，
+    // 由界面线程 consumePendingEconomy() 统一消费并更新 AppState。
+    // 工作线程绝不直接改 located* / locateStatus / moneyDetail 等界面字段。
+    PendingEconomyResult  pendingEconomy;
 
     // ---------- 需要用户确认的高风险操作 ----------
     // 0=无, 1=向多个候选地址写入, 2=锁定多个候选地址
@@ -168,6 +209,13 @@ struct AppState {
     int   workers = 4;
     bool  hotkeysEnabled = true;
 
+    // ---------- 发动机状态持久化（问题：后台换车后 UI 不落盘）----------
+    // EngineTuner::stateRevision() 每逢「需要持久化」的变化自增；
+    // 界面线程发现与本值不同步就 exportState + 原子保存 settings.ini。
+    // 保存失败时保留旧值以便节流重试，绝不因此清除恢复记录。
+    uint64_t lastEngineStateRevision = 0;
+    uint64_t lastEngineSaveTick = 0;
+
     // ---------- 界面 ----------
     int   activeTab = 0;
     bool  requestExit = false;
@@ -176,12 +224,18 @@ struct AppState {
 void renderApp(AppState& app);
 void initFonts(AppState& app);
 void loadSettings(AppState& app);
-void saveSettings(const AppState& app);
+// 原子保存（settings.ini.tmp + 替换）：成功返回 true。失败时文件保持旧内容，
+// 恢复记录不受影响，调用方可据此重试。
+bool saveSettings(const AppState& app);
+// 序列化 / 原子写入 / 指定路径读取 —— 供测试与迁移使用（格式与 settings.ini 完全一致）。
+std::string settingsText(const AppState& app);
+bool        writeTextFileAtomic(const std::wstring& path, const std::string& text);
+bool        saveSettingsTo(const AppState& app, const std::wstring& path);
+void        loadSettingsFrom(AppState& app, const std::wstring& path);
 
 // 供 UI 调用的动作（都在后台线程里跑，不阻塞界面）
 void attachGame(AppState& app);
-void detachGame(AppState& app);
-void startFirstScan(AppState& app, PanelKind kind);
+void detachGame(AppState& app);void startFirstScan(AppState& app, PanelKind kind);
 void startNextScan(AppState& app, PanelKind kind, ScanMode mode);
 void writePanelValues(AppState& app, PanelKind kind, bool confirmed = false);
 void togglePanelLock(AppState& app, PanelKind kind, bool lock, bool confirmed = false);
@@ -195,6 +249,39 @@ void applyEnginePower(AppState& app, int option, bool raiseLimit);
 
 // 无界面自检：确保每个功能面板绑定到自己的输入与锁定状态。
 bool validatePanelBindings(std::string* error);
+
+// ---------------------------------------------------------------------------
+// 写入闸门（联机保护）：所有真正写入游戏内存的入口都必须先过它。
+// 返回空串=允许；否则是拒绝原因。默认实现使用真实联机检测与策略语义；
+// 测试可注入覆盖实现（不注入时行为不变）。
+// ---------------------------------------------------------------------------
+std::string writeGateReason(AppState& app);
+// 工作线程可安全调用：只读策略快照（不触碰 AppState），不强制刷新检测缓存。
+std::string writeGateReasonFromPolicy();
+// 界面线程在状态变化后刷新闸门策略快照（pid / 联运策略）
+void updateWriteGatePolicy(const AppState& app);
+using WriteGateOverride = std::function<std::string()>;
+void setWriteGateOverride(WriteGateOverride override_fn);
+
+// 统一守卫封装：先过写入闸门，再过结构校验/范围/回读验证。UI 直接写入与
+// 定位后自动写入共用这条路径（因此「按钮禁用」之外，真正写入处也会被拦截）。
+bool writeBankMoneyGuarded(AppState& app, uint64_t moneyAddress, uint64_t expectedBank,
+                           int64_t value, std::string* error);
+bool writeXpGuarded(AppState& app, uint64_t xpAddress, uint64_t expectedEconomy, int32_t value,
+                    std::string* error);
+
+// 金钱/经验直接修改入口（供界面与离线测试共用）。
+void directModifyMoney(AppState& app);
+void directModifyXp(AppState& app);
+void writeLocatedMoney(AppState& app, bool lock);
+void writeLocatedXp(AppState& app, bool lock);
+void clearLocatedEconomy(AppState& app);
+
+// 经验目标值校验：先检查有限值、整数性、int32 可表示范围与业务上限，再转换。
+// 失败时返回 false 并给出原因（绝不做越界转换后再比较）。
+bool parseXpTarget(const char* text, int32_t* out, std::string* error);
+// 金钱目标值校验（范围与 economy 写入端的安全范围一致）。
+bool parseMoneyTarget(const char* text, int64_t* out, std::string* error);
 
 void sendConsole(AppState& app, const std::string& command);
 void handleGlobalHotkeys(AppState& app);

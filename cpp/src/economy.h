@@ -25,8 +25,10 @@
 
 #include "memory.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ets2 {
 
@@ -76,6 +78,48 @@ bool economyReferencesBank(const ProcessMemory& memory, uint64_t economyObject,
 
 // 从「指针指向 bank 对象」的候选地址反推经济对象地址（字段偏移 kEconomyBankRef）。
 uint64_t economyFromBankPointer(uint64_t bankPointerSlot);
+
+// ---------------------------------------------------------------------------
+// 候选筛选（结构化定位的唯一入口）。
+//
+// 安全规则：
+//   1) 只有「最高分候选唯一」（tied == 1）才允许认为定位成功；同分候选（tied > 1）
+//      时 unique == false，调用方必须失败关闭，绝不取第一个候选继续自动写入。
+//   2) 候选数量超过检查上限时（truncated == true）**不允许**返回可写的唯一结果：
+//      未检查到的候选可能同分甚至更高分，此时必须由用户缩小范围或继续筛选。
+//   银行对象与经济对象同规。
+// ---------------------------------------------------------------------------
+struct CandidatePick {
+    bool     probed = false;     // 至少一个候选通过结构校验
+    bool     unique = false;     // 最高分候选唯一且候选已全部检查（== 可以安全使用）
+    bool     truncated = false;  // 候选数量超过 cap，未完整检查（unique 强制为 false）
+    size_t   examined = 0;       // 实际检查的候选槽位数
+    size_t   total = 0;          // 扫描到的候选槽位总数
+    int      tied = 0;           // 最高分候选数量（含首个；>1 表示歧义）
+    int      probedCount = 0;    // 通过结构校验的（去重后）候选对象数
+    uint64_t fieldAddress = 0;   // 被选中的字段地址（金钱地址 / 经验地址）
+    uint64_t object = 0;         // 字段所属对象（bank 对象 / 经济对象）
+    int64_t  value = 0;          // 读到的字段值
+    int      score = 0;          // 最高分
+};
+
+// 在金额候选地址中挑选唯一可信的 bank 对象（对每个候选做完整结构校验，
+// 按「对象基址」去重后比较分数；同分歧义时 unique == false）。
+CandidatePick pickBestBankCandidate(const ProcessMemory& memory,
+                                    const std::vector<uint64_t>& moneyAddresses, size_t cap);
+
+// 由「内容为 bank 指针的槽位地址」反推经济对象并校验。
+// requiredBank 非零时：槽位内容必须等于 requiredBank，且经济对象 +0x18 的
+// bank 引用必须一致，否则该候选直接排除（不参与打分，避免假歧义/假命中）。
+CandidatePick pickBestEconomyFromBankRefs(const ProcessMemory& memory,
+                                          const std::vector<uint64_t>& bankPointerSlots,
+                                          uint64_t requiredBank, size_t cap);
+
+// 由「经验字段地址」（扫描命中的地址本身就是 economy + 0x780，不得再加减偏移）
+// 挑选唯一可信的经济对象。requiredBank 非零时必须验证经济对象确实引用该银行对象。
+CandidatePick pickBestEconomyFromXpFields(const ProcessMemory& memory,
+                                          const std::vector<uint64_t>& xpFieldAddresses,
+                                          uint64_t requiredBank, size_t cap);
 
 // ---------------------------------------------------------------------------
 // 直接写入（免锁定）。

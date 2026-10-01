@@ -172,7 +172,8 @@ void resetProcessState(AppState& app) {
       app.pendingReady = false;
       app.pendingLog.clear();
       app.pendingStatus.clear();
-      app.pendingProgressNote.clear(); }
+      app.pendingProgressNote.clear();
+      app.pendingEconomy = PendingEconomyResult{}; }
 }
 
 // ---------- 数值类型下拉框 ----------
@@ -274,6 +275,32 @@ bool ensureAttached(AppState& app) {
 // ==========================================================================
 // 进程附加 / 分离
 // ==========================================================================
+bool validateAttachedSessionReuse(std::string* error) {
+    AppState app;
+    if (!app.mem.open(::GetCurrentProcessId(), "attached-session-test", error)) return false;
+    // 失败时直接返回，绝不让离线测试落入查找/附加真实游戏的分支。
+    if (!app.mem.alive()) {
+        if (error) *error = "活进程被误判为退出；连续启用会重新附加并重置功能";
+        return false;
+    }
+    app.pid = ::GetCurrentProcessId();
+    app.autoFuelLock = app.autoDamageLock = app.autoAntiRollLock = true;
+    app.moneyLock = app.xpLock = true;
+    app.enginePowerOption = 3;
+    app.engineRaiseLimit = true;
+    app.locatedMoneyAddress = 123;
+    for (int i = 0; i < 10; ++i) {
+        if (!ensureAttached(app) || !app.autoFuelLock || !app.autoDamageLock ||
+            !app.autoAntiRollLock || !app.moneyLock || !app.xpLock ||
+            app.enginePowerOption != 3 || !app.engineRaiseLimit ||
+            app.locatedMoneyAddress != 123 || app.mem.pid() != ::GetCurrentProcessId()) {
+            if (error) *error = "复用当前附加会话时已有功能/定位状态被重置";
+            return false;
+        }
+    }
+    return true;
+}
+
 void attachGame(AppState& app) {
     app.cancel.store(true);
     joinWorker(app);
@@ -310,8 +337,13 @@ void attachGame(AppState& app) {
     app.exeName = exe;
     app.attached = true;
     if (!app.freezer) app.freezer = std::make_unique<Freezer>();
+    // 锁定（可选保险）同样要过联机闸门：进入联机后不得继续每 250ms 写入
+    app.freezer->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     app.freezer->start(&app.mem, 250);
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
+    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
+    // 不捕获 AppState：worker 线程只读线程安全的策略快照。
+    app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     app.procStatus = fmt("已附加：%s (PID %u)", W2U(exe).c_str(), pid);
     app.mpHits = detectMultiplayer(pid);
     MultiplayerStatus mp = checkMultiplayer(pid, true);
@@ -362,7 +394,11 @@ void initFonts(AppState& app) {
 }
 
 void loadSettings(AppState& app) {
-    std::ifstream in{std::filesystem::path(applicationDir() + L"\\settings.ini")};
+    loadSettingsFrom(app, applicationDir() + L"\\settings.ini");
+}
+
+void loadSettingsFrom(AppState& app, const std::wstring& path) {
+    std::ifstream in{std::filesystem::path(path)};
     if (!in) return;
     std::string line;
     while (std::getline(in, line)) {
@@ -429,37 +465,212 @@ void loadSettings(AppState& app) {
     setConvoyCheckEnabled(app.checkConvoy);
 }
 
-void saveSettings(const AppState& app) {
-    std::ofstream out{std::filesystem::path(applicationDir() + L"\\settings.ini"),
-                      std::ios::trunc};
-    if (!out) return;
-    out << "money_type=" << vtypeName(app.moneyType) << "\n";
-    out << "xp_type=" << vtypeName(app.xpType) << "\n";
-    out << "fuel_type=" << vtypeName(app.fuelType) << "\n";
-    out << "damage_type=" << vtypeName(app.damageType) << "\n";
-    out << "money_target=" << app.moneyTarget << "\n";
-    out << "xp_target=" << app.xpTarget << "\n";
-    out << "fuel_target=" << app.fuelTarget << "\n";
-    out << "fuel_tol=" << app.fuelTol << "\n";
-    out << "damage_target=" << app.damageTarget << "\n";
-    out << "damage_tol=" << app.damageTol << "\n";
-    out << "console_key=" << app.consoleKey << "\n";
-    out << "max_region_gb=" << app.maxRegionGb << "\n";
-    out << "workers=" << app.workers << "\n";
+std::string settingsText(const AppState& app) {
+    std::string text;
+    text += "money_type=" + std::string(vtypeName(app.moneyType)) + "\n";
+    text += "xp_type=" + std::string(vtypeName(app.xpType)) + "\n";
+    text += "fuel_type=" + std::string(vtypeName(app.fuelType)) + "\n";
+    text += "damage_type=" + std::string(vtypeName(app.damageType)) + "\n";
+    text += "money_target=" + std::string(app.moneyTarget) + "\n";
+    text += "xp_target=" + std::string(app.xpTarget) + "\n";
+    text += "fuel_target=" + std::string(app.fuelTarget) + "\n";
+    text += "fuel_tol=" + std::string(app.fuelTol) + "\n";
+    text += "damage_target=" + std::string(app.damageTarget) + "\n";
+    text += "damage_tol=" + std::string(app.damageTol) + "\n";
+    text += fmt("console_key=%d\n", app.consoleKey);
+    text += fmt("max_region_gb=%g\n", (double)app.maxRegionGb);
+    text += fmt("workers=%d\n", app.workers);
     const std::string engineState =
         app.engineTuner ? app.engineTuner->exportState() : app.engineStateText;
-    out << "engine_state=" << engineState << "\n";
-    out << "fly_speed=" << app.flySpeed << "\n";
-    out << "anti_roll_factor=" << app.antiRollFactor << "\n";
-    out << "mp_policy=" << app.mpPolicy << "\n";
-    out << "check_convoy=" << (app.checkConvoy ? 1 : 0) << "\n";
-    out << "hotkeys_enabled=" << (app.hotkeysEnabled ? 1 : 0) << "\n";
+    text += "engine_state=" + engineState + "\n";
+    text += "fly_speed=" + std::string(app.flySpeed) + "\n";
+    text += fmt("anti_roll_factor=%g\n", (double)app.antiRollFactor);
+    text += fmt("mp_policy=%d\n", app.mpPolicy);
+    text += fmt("check_convoy=%d\n", app.checkConvoy ? 1 : 0);
+    text += fmt("hotkeys_enabled=%d\n", app.hotkeysEnabled ? 1 : 0);
     std::string spots;
     for (const auto& spot : app.teleportSpots) {
-        if (!spots.empty()) spots += ",";  // ',' 不在传送目标白名单内，不会被坐标里的 ';' 破坏
+        // ',' 不在传送目标白名单内，不会被坐标里的 ';' 破坏
+        if (!spots.empty()) spots += ",";
         spots += spot.first + "|" + spot.second;
     }
-    out << "teleport_spots=" << spots << "\n";
+    text += "teleport_spots=" + spots + "\n";
+    return text;
+}
+
+bool writeTextFileAtomic(const std::wstring& path, const std::string& text) {
+    // 原子写入：先写同目录临时文件再替换，避免中途崩溃/断电留下半截文件。
+    const std::wstring tempPath = path + L".tmp";
+    {
+        std::ofstream out{std::filesystem::path(tempPath), std::ios::trunc | std::ios::binary};
+        if (!out) return false;
+        out.write(text.data(), (std::streamsize)text.size());
+        out.flush();
+        if (!out.good()) {
+            ::DeleteFileW(tempPath.c_str());
+            return false;
+        }
+    }
+    if (!::MoveFileExW(tempPath.c_str(), path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        ::DeleteFileW(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool saveSettingsTo(const AppState& app, const std::wstring& path) {
+    // 内容格式与旧版完全一致（键名/顺序不变），可直接覆盖旧文件，无需迁移。
+    return writeTextFileAtomic(path, settingsText(app));
+}
+
+bool saveSettings(const AppState& app) {
+    return saveSettingsTo(app, applicationDir() + L"\\settings.ini");
+}
+
+// ==========================================================================
+// 写入闸门 + 目标值校验（所有真正写入游戏内存的入口共用）
+// ==========================================================================
+namespace {
+
+// 测试注入的闸门覆盖实现（默认空：走真实联机检测）
+std::mutex       g_writeGateOverrideMutex;
+WriteGateOverride g_writeGateOverride;
+
+// 闸门策略快照：只由界面线程写入，工作线程只读原子量 —— 保证 worker 侧的
+// 守卫回调不再触碰 AppState 的普通字段（消除跨线程读写竞争）。
+struct WriteGatePolicy {
+    std::atomic<DWORD> pid{0};
+    std::atomic<int>   mpPolicy{1};
+};
+WriteGatePolicy g_writeGatePolicy;
+
+// 经验业务上限（与 economy.cpp 的写入安全范围一致）
+constexpr int32_t kXpBusinessMax = 2000000000;
+// 金额安全范围（允许负值＝欠款）
+constexpr int64_t kMoneyLimit = 1000000000000LL;
+
+}  // namespace
+
+void setWriteGateOverride(WriteGateOverride override_fn) {
+    std::lock_guard<std::mutex> lock(g_writeGateOverrideMutex);
+    g_writeGateOverride = std::move(override_fn);
+}
+
+void updateWriteGatePolicy(const AppState& app) {
+    // 仅界面线程调用：把守卫需要的策略数据放进原子快照
+    g_writeGatePolicy.pid.store(app.pid);
+    g_writeGatePolicy.mpPolicy.store(app.mpPolicy);
+}
+
+namespace {
+
+std::string writeGateReasonInternal(bool forceRefresh) {
+    {
+        WriteGateOverride override_fn;
+        {
+            std::lock_guard<std::mutex> lock(g_writeGateOverrideMutex);
+            override_fn = g_writeGateOverride;
+        }
+        if (override_fn) return override_fn();  // 锁外调用，避免持锁执行外部代码
+    }
+    DWORD pid = g_writeGatePolicy.pid.load();
+    if (!pid) {
+        std::wstring exe;
+        if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+            // 没有游戏进程：此处不拦（写入本身会以"尚未附加"失败），避免给出误导性的联机拒绝
+            return std::string();
+        }
+    }
+    const MultiplayerStatus status = checkMultiplayer(pid, forceRefresh);
+    // 写入类功能的既有语义：TruckersMP 一律拒绝；无法确认（Unknown，含模块枚举失败与
+    // 读不到 game.log.txt）一律拒绝；Convoy（检测开启时）一律拒绝 —— 与联运模式策略
+    // 无关（"不写内存的功能"才受 mpPolicy 影响）。
+    if (status.blocksWrite()) return status.detail;
+    return std::string();
+}
+
+}  // namespace
+
+std::string writeGateReasonFromPolicy() {
+    // 任意线程可调用（含 worker 线程）：只读原子快照 + 既有全局开关
+    return writeGateReasonInternal(/*forceRefresh=*/false);
+}
+
+std::string writeGateReason(AppState& app) {
+    // 界面线程的用户操作路径：先同步快照，再强制刷新一次检测结果
+    updateWriteGatePolicy(app);
+    return writeGateReasonInternal(/*forceRefresh=*/true);
+}
+
+bool parseXpTarget(const char* text, int32_t* out, std::string* error) {
+    double value = 0.0;
+    if (!parseNumber(text, false, &value)) {
+        if (error) *error = "「要改成的经验」不是有效数字";
+        return false;
+    }
+    // 先做范围判断，再转换：越界转换是未定义行为，绝不允许
+    if (value < (double)INT32_MIN || value > (double)INT32_MAX) {
+        if (error) *error = fmt("目标经验超出 32 位整数范围（%lld ~ %lld）", (long long)INT32_MIN,
+                                (long long)INT32_MAX);
+        return false;
+    }
+    const int32_t converted = (int32_t)value;
+    if ((double)converted != value) {
+        if (error) *error = "目标经验必须是整数";
+        return false;
+    }
+    if (converted < 0) {
+        if (error) *error = "目标经验不能是负数";
+        return false;
+    }
+    if (converted > kXpBusinessMax) {
+        if (error) {
+            *error = fmt("目标经验超出安全上限（0 ~ %lld）", (long long)kXpBusinessMax);
+        }
+        return false;
+    }
+    if (out) *out = converted;
+    if (error) error->clear();
+    return true;
+}
+
+bool parseMoneyTarget(const char* text, int64_t* out, std::string* error) {
+    double value = 0.0;
+    if (!parseNumber(text, false, &value)) {
+        if (error) *error = "「要改成的金额」不是有效数字";
+        return false;
+    }
+    if (value < -(double)kMoneyLimit || value > (double)kMoneyLimit) {
+        if (error) {
+            *error = fmt("目标金额超出安全范围（-%lld ~ %lld）", (long long)kMoneyLimit,
+                         (long long)kMoneyLimit);
+        }
+        return false;
+    }
+    if (out) *out = (int64_t)value;
+    if (error) error->clear();
+    return true;
+}
+
+bool writeBankMoneyGuarded(AppState& app, uint64_t moneyAddress, uint64_t expectedBank,
+                           int64_t value, std::string* error) {
+    const std::string gate = writeGateReason(app);  // 写入前一刻复核联机状态
+    if (!gate.empty()) {
+        if (error) *error = "联机保护：" + gate;
+        return false;
+    }
+    return writeBankMoneyVerified(app.mem, moneyAddress, expectedBank, value, error);
+}
+
+bool writeXpGuarded(AppState& app, uint64_t xpAddress, uint64_t expectedEconomy, int32_t value,
+                    std::string* error) {
+    const std::string gate = writeGateReason(app);
+    if (!gate.empty()) {
+        if (error) *error = "联机保护：" + gate;
+        return false;
+    }
+    return writeEconomyExperienceVerified(app.mem, xpAddress, expectedEconomy, value, error);
 }
 
 // ==========================================================================
@@ -815,6 +1026,9 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
     bool other = fuel ? (app.autoDamageLock || app.autoAntiRollLock)
                       : (app.autoFuelLock || app.autoAntiRollLock);
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
+    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
+    // 不捕获 AppState：worker 线程只读线程安全的策略快照。
+    app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     std::string error;
     // 已有另一项锁定时沿用同一条固定指针链；每轮仍会读取当前车辆并做遥测校验。
     if (!other) {
@@ -872,6 +1086,9 @@ void toggleAutoAntiRollLock(AppState& app, bool enabled, float factor) {
     }
     const bool other = app.autoFuelLock || app.autoDamageLock;
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
+    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
+    // 不捕获 AppState：worker 线程只读线程安全的策略快照。
+    app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     std::string error;
     if (!other) {
         if (!app.vehicleLocker->bind(&app.mem, app.pid, &error)) {
@@ -903,10 +1120,12 @@ EngineTuner& ensureEngineTuner(AppState& app) {
 
 // 运行期间每 5 秒复查一次联机状态；命中即让保持线程恢复原值并停止。
 EngineTuner::Guard engineGuardFor(DWORD pid) {
-    return [pid](std::string* reason) {
-        MultiplayerStatus status = checkMultiplayer(pid);
-        if (status.blocksWrite()) {
-            if (reason) *reason = status.detail;
+    (void)pid;
+    // 与油量/无损/防侧翻/经济写入共用同一套写入闸门（线程安全快照）
+    return [](std::string* reason) {
+        const std::string blocked = writeGateReasonFromPolicy();
+        if (!blocked.empty()) {
+            if (reason) *reason = blocked;
             return false;
         }
         return true;
@@ -1479,68 +1698,99 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
 // ==========================================================================
 namespace {
 
-// 在候选地址里挑出「最像 bank 对象」的一个（分数最高且唯一）。
-struct ProbePick {
-    bool     found = false;
-    uint64_t address = 0;
-    uint64_t object = 0;
-    int64_t  value = 0;
-    int      score = 0;
-    int      tied = 0;      // 同分候选数量（>1 说明不够确定）
-    std::string detail;
-};
+// 结构校验时最多考察的候选数量（与旧版一致的上限）
+constexpr size_t kEconomyProbeCap = 200000;
 
-ProbePick pickBestBank(const ProcessMemory& mem, const std::vector<uint64_t>& candidates,
-                       size_t cap) {
-    ProbePick best;
-    const size_t limit = candidates.size() < cap ? candidates.size() : cap;
-    for (size_t i = 0; i < limit; ++i) {
-        ProbeResult probe;
-        if (!probeBankObject(mem, candidates[i], &probe)) continue;
-        if (!best.found || probe.score > best.score) {
-            best.found = true;
-            best.address = probe.address;
-            best.object = probe.object;
-            best.value = probe.value;
-            best.score = probe.score;
-            best.tied = 1;
-            best.detail = probe.detail;
-        } else if (probe.score == best.score) {
-            ++best.tied;
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 工作线程结果 -> 界面状态。只在界面线程调用；锁内仅做拷贝/清空，不阻塞渲染。
+// ---------------------------------------------------------------------------
+namespace {
+
+void consumePendingEconomy(AppState& app) {
+    PendingEconomyResult result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if (!app.pendingEconomy.ready) return;
+        result = std::move(app.pendingEconomy);
+        app.pendingEconomy = PendingEconomyResult{};
+    }
+    if (!result.log.empty()) logLine(result.log);
+    if (result.cancelled) {
+        app.locateStatus = "结构化定位已取消。";
+        return;
+    }
+    // 结构化数据统一在这里落地（工作线程不再直接写 located* / locateStatus）
+    app.locatedMoneyAddress = result.moneyLocated ? result.moneyAddress : 0;
+    app.locatedMoneyBank = result.moneyLocated ? result.moneyBank : 0;
+    app.locatedMoneyValue = result.moneyLocated ? result.moneyValue : 0;
+    app.locatedMoneyDetail = result.moneyLocated ? result.moneyDetail : std::string();
+    app.locatedXpAddress = result.xpLocated ? result.xpAddress : 0;
+    app.locatedEconomy = result.xpLocated ? result.economyObject : 0;
+    app.locatedXpValue = result.xpLocated ? result.xpValue : 0;
+    app.locatedXpDetail = result.xpLocated ? result.xpDetail : std::string();
+
+    // 组装状态文案
+    std::string status;
+    if (result.moneyTruncated) {
+        status = "定位失败（已安全关闭）：" + result.moneyDetail + "。";
+    } else if (result.moneyAmbiguous) {
+        status = "定位失败（已安全关闭）：" + result.moneyDetail +
+                 "。存在多个同分 bank 候选，无法唯一确定，已拒绝自动写入；"
+                 "请让金额变化后重新定位，或用「高级：手动扫描」人工筛选。";
+    } else if (result.moneyLocated) {
+        status = fmt("已定位：金钱 %s", formatInt(result.moneyValue).c_str());
+        if (result.xpTruncated) {
+            status += fmt("（经验候选过多未完整检查：%s）", result.xpDetail.c_str());
+        } else if (result.xpAmbiguous) {
+            status += fmt("（经验定位存在歧义：%s，已拒绝自动写入经验）",
+                          result.xpDetail.c_str());
+        } else if (result.xpLocated) {
+            status += fmt("，经验 %s", formatInt(result.xpValue).c_str());
+        } else {
+            status += "（经验未定位）";
+        }
+    } else {
+        status = "未定位：" + result.moneyDetail;
+        if (result.xpTruncated) status += "；经验：" + result.xpDetail;
+    }
+
+    if (result.autoWriteMoney) {
+        if (result.moneyWriteOk) {
+            app.locatedMoneyValue = result.moneyWritten;
+            status += fmt("。已直接写入金钱 = %s（回读一致），无需锁定。",
+                          formatInt(result.moneyWritten).c_str());
+        } else {
+            status += "。金钱未写入：" +
+                      (result.moneyWriteError.empty()
+                           ? std::string("目标金额无效")
+                           : result.moneyWriteError);
         }
     }
-    return best;
-}
-
-ProbePick pickBestEconomy(const ProcessMemory& mem, const std::vector<uint64_t>& bankSlots,
-                          size_t cap) {
-    ProbePick best;
-    const size_t limit = bankSlots.size() < cap ? bankSlots.size() : cap;
-    for (size_t i = 0; i < limit; ++i) {
-        const uint64_t economy = economyFromBankPointer(bankSlots[i]);
-        if (!economy) continue;
-        ProbeResult probe;
-        if (!probeEconomyObject(mem, economy + economy_offsets::kEconomyExperiencePoints,
-                                &probe)) {
-            continue;
-        }
-        if (!best.found || probe.score > best.score) {
-            best.found = true;
-            best.address = probe.address;
-            best.object = probe.object;
-            best.value = probe.value;
-            best.score = probe.score;
-            best.tied = 1;
-            best.detail = probe.detail;
-        } else if (probe.score == best.score) {
-            ++best.tied;
+    if (result.autoWriteXp) {
+        if (result.xpWriteOk) {
+            app.locatedXpValue = result.xpWritten;
+            status += fmt("。已直接写入经验 = %s（回读一致），无需锁定。",
+                          formatInt(result.xpWritten).c_str());
+        } else {
+            status += "。经验未写入：" +
+                      (result.xpWriteError.empty()
+                           ? std::string("目标经验必须是 32 位整数")
+                           : result.xpWriteError);
         }
     }
-    return best;
+    app.locateStatus = std::move(status);
+    logLine(app.locateStatus);
 }
 
 }  // namespace
 
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// 经济定位 / 直接写入（供界面与离线测试共用；声明见 ui.h）
+// ---------------------------------------------------------------------------
 void clearLocatedEconomy(AppState& app) {
     // 清除定位结果时必须一并解除锁定，否则后台保持线程会继续写这两个地址
     if (app.freezer) {
@@ -1577,6 +1827,7 @@ void startLocateEconomy(AppState& app) {
 
     joinWorker(app);
     applyPending(app);
+    consumePendingEconomy(app);  // 先消费上一轮未显示的结果，防止覆盖
     const int workers = app.workers;
     const size_t regionCap = maxRegionBytes(app);
     // 「直接改钱/直接改经验」的一键流程：把自动写入意图拍成快照带进工作线程。
@@ -1585,6 +1836,17 @@ void startLocateEconomy(AppState& app) {
     const bool autoWriteXp = app.autoWriteXpAfterLocate;
     app.autoWriteMoneyAfterLocate = false;
     app.autoWriteXpAfterLocate = false;
+    // 输入快照：工作线程绝不读取界面可编辑的字符缓冲区（moneyTarget/xpTarget 等），
+    // 全部输入参数在启动线程前于界面线程复制成值；越界/非法值在此就判定并带进线程，
+    // 绝不在工作线程里做越界转换。
+    int64_t moneyTargetValue = 0;
+    std::string moneyTargetError;
+    const bool moneyTargetValid = parseMoneyTarget(app.moneyTarget, &moneyTargetValue,
+                                                   &moneyTargetError);
+    int32_t xpTargetValue = 0;
+    std::string xpTargetError;
+    const bool xpTargetValid = parseXpTarget(app.xpTarget, &xpTargetValue, &xpTargetError);
+    // 写入闸门快照在真正写入前重新评估（见 worker 内的 gateAtWrite）
     app.busy.store(true);
     app.cancel.store(false);
     app.progressDone.store(0);
@@ -1594,8 +1856,11 @@ void startLocateEconomy(AppState& app) {
     logLine("开始结构化定位金钱/经验（基于 1.61.1.1 单位字段表）");
 
     app.worker = std::thread([&app, moneyValue, xpValue, hasXp, workers, regionCap,
-                              autoWriteMoney, autoWriteXp]() {
-        std::string status;
+                              autoWriteMoney, autoWriteXp, moneyTargetValue, moneyTargetValid,
+                              moneyTargetError, xpTargetValue, xpTargetValid,
+                              xpTargetError]() {
+        // 线程安全约定：本线程只触碰 app 的原子量（progressDone/progressTotal/cancel/
+        // busy）与 resultMutex 保护的 pending 通道；对游戏内存只做定位线程内的读写。
         ScanOptions opt;
         opt.workers = workers;
         opt.maxRegionSize = regionCap;
@@ -1605,175 +1870,185 @@ void startLocateEconomy(AppState& app) {
         };
         auto cancelFn = [&app]() { return app.cancel.load(); };
 
-        // 1) 按金额找 bank 对象
-        uint64_t moneyAddress = 0, moneyBank = 0, xpAddress = 0, economyObject = 0;
-        int64_t moneyFound = 0, xpFound = 0;
-        std::string moneyDetail, xpDetail;
+        PendingEconomyResult result;
 
+        // 1) 按金额找 bank 对象（最高分候选唯一且候选完整才可用；歧义/截断一律失败关闭）
         ScanSession moneyScan(app.mem, VType::Int64, 8, 0.0);
         const uint64_t moneyHits =
             moneyScan.firstScan(moneyValue, opt, progressFn, cancelFn);
         if (!app.cancel.load() && moneyHits > 0) {
-            const ProbePick pick = pickBestBank(app.mem, moneyScan.addresses(), 200000);
-            if (pick.found && pick.tied == 1) {
-                moneyAddress = pick.address;
-                moneyBank = pick.object;
-                moneyFound = pick.value;
-                moneyDetail = fmt("金额候选 %llu 个，唯一可信 bank 对象（校验 %d 分）",
-                                  (unsigned long long)moneyHits, pick.score);
-            } else if (pick.found) {
-                moneyAddress = pick.address;
-                moneyBank = pick.object;
-                moneyFound = pick.value;
-                moneyDetail = fmt("金额候选 %llu 个，校验同分 %d 个（已取第一个，建议核对）",
-                                  (unsigned long long)moneyHits, pick.tied);
+            const CandidatePick pick =
+                pickBestBankCandidate(app.mem, moneyScan.addresses(), kEconomyProbeCap);
+            if (pick.truncated) {
+                result.moneyTruncated = true;
+                result.moneyDetail =
+                    fmt("金额候选 %llu 个，超过本次可检查上限 %llu 个（只检查了前 %llu 个）："
+                        "无法保证不存在同分或更高分的 bank 对象，已拒绝写入；"
+                        "请缩小扫描范围（降低「跳过超大内存区」阈值）或继续收窄候选后重试",
+                        (unsigned long long)moneyHits, (unsigned long long)kEconomyProbeCap,
+                        (unsigned long long)pick.examined);
+            } else if (pick.unique) {
+                result.moneyLocated = true;
+                result.moneyAddress = pick.fieldAddress;
+                result.moneyBank = pick.object;
+                result.moneyValue = pick.value;
+                result.moneyDetail = fmt("金额候选 %llu 个，唯一可信 bank 对象（校验 %d 分）",
+                                         (unsigned long long)moneyHits, pick.score);
+            } else if (pick.probed) {
+                result.moneyAmbiguous = true;
+                result.moneyDetail =
+                    fmt("金额候选 %llu 个，结构校验通过且同分最高分候选 %d 个",
+                        (unsigned long long)moneyHits, pick.tied);
             } else {
-                moneyDetail = fmt("金额候选 %llu 个，但都没有通过 bank 结构校验",
-                                  (unsigned long long)moneyHits);
+                result.moneyDetail = fmt("金额候选 %llu 个，但都没有通过 bank 结构校验",
+                                         (unsigned long long)moneyHits);
             }
         } else if (!app.cancel.load()) {
-            moneyDetail = "内存中没有找到与当前金额一致的数值（可在游戏里买卖一次让金额变化后重试）";
+            result.moneyDetail = "内存中没有找到与当前金额一致的数值（可在游戏里买卖一次让金额变化后重试）";
         }
 
         app.progressDone.store(1);
-        app.progressNote = "结构化定位：由 bank 指针反查经济对象";
+        // 阶段性进度说明走 pending 通道（旧实现直接写 app.progressNote，属数据竞争）
+        postResult(app, PanelKind::Money, std::string(), std::string(),
+                   "结构化定位：由 bank 指针反查经济对象");
 
-        // 2) 由「指向 bank 的指针」反查经济对象（经验地址随之确定）
-        if (moneyBank && !app.cancel.load()) {
+        // 2) 由「指向 bank 的指针」反查经济对象（经验地址随之确定）。
+        //    候选必须真的引用已定位的 bank，且唯一同分才可用。
+        if (result.moneyLocated && !app.cancel.load()) {
             ScanSession bankRefScan(app.mem, VType::Int64, 8, 0.0);
-            const uint64_t refHits = bankRefScan.firstScan((double)moneyBank, opt, progressFn,
-                                                           cancelFn);
+            const uint64_t refHits =
+                bankRefScan.firstScan((double)result.moneyBank, opt, progressFn, cancelFn);
             if (!app.cancel.load() && refHits > 0) {
-                const ProbePick pick = pickBestEconomy(app.mem, bankRefScan.addresses(), 200000);
-                if (pick.found) {
-                    economyObject = pick.object;
-                    xpAddress = pick.address;
-                    xpFound = pick.value;
-                    xpDetail = fmt("由 %llu 处 bank 引用确认经济对象（校验 %d 分%s）",
-                                   (unsigned long long)refHits, pick.score,
-                                   pick.tied == 1 ? "" : "，存在同分候选");
+                const CandidatePick pick = pickBestEconomyFromBankRefs(
+                    app.mem, bankRefScan.addresses(), result.moneyBank, kEconomyProbeCap);
+                if (pick.truncated) {
+                    result.xpTruncated = true;
+                    result.xpDetail =
+                        fmt("bank 引用 %llu 处，超过本次可检查上限 %llu 个（只检查了前 %llu 个）："
+                            "无法保证不存在同分或更高分的经济对象，已拒绝写入经验",
+                            (unsigned long long)refHits, (unsigned long long)kEconomyProbeCap,
+                            (unsigned long long)pick.examined);
+                } else if (pick.unique) {
+                    result.xpLocated = true;
+                    result.xpAddress = pick.fieldAddress;
+                    result.economyObject = pick.object;
+                    result.xpValue = pick.value;
+                    result.xpDetail =
+                        fmt("由 %llu 处 bank 引用确认经济对象（校验 %d 分，引用一致）",
+                            (unsigned long long)refHits, pick.score);
+                } else if (pick.probed) {
+                    result.xpAmbiguous = true;
+                    result.xpDetail =
+                        fmt("bank 引用 %llu 处，同分经济对象候选 %d 个",
+                            (unsigned long long)refHits, pick.tied);
                 } else {
-                    xpDetail = "找到 bank 引用，但经济对象结构校验未通过";
+                    result.xpDetail = "找到 bank 引用，但经济对象结构校验未通过";
                 }
             } else if (!app.cancel.load()) {
-                xpDetail = "没有找到指向 bank 的引用（经济对象可能尚未加载）";
+                result.xpDetail = "没有找到指向 bank 的引用（经济对象可能尚未加载）";
             }
         }
 
-        // 3) 若仍没有经验地址，且用户填了经验值，则按经验值再定位一次
-        if (!xpAddress && hasXp && !app.cancel.load()) {
+        // 3) 若仍没有经验地址，且用户填了经验值，则按经验值再定位一次。
+        //    xpScan.addresses()[i] 本身就是经验字段地址（economy + 0x780），
+        //    直接传给 probe —— 这里不能再加 kEconomyExperiencePoints（历史缺陷：
+        //    会让对象基址错位）。已定位银行对象时还必须验证经济对象引用它。
+        if (!result.xpLocated && hasXp && !app.cancel.load()) {
             ScanSession xpScan(app.mem, VType::Int32, 4, 0.0);
             const uint64_t xpHits = xpScan.firstScan(xpValue, opt, progressFn, cancelFn);
             if (!app.cancel.load() && xpHits > 0) {
-                ProbePick best;
-                const size_t limit = xpScan.addresses().size() < 200000
-                                         ? xpScan.addresses().size() : 200000;
-                for (size_t i = 0; i < limit; ++i) {
-                    ProbeResult probe;
-                    const uint64_t candidate =
-                        xpScan.addresses()[i] + economy_offsets::kEconomyExperiencePoints;
-                    if (!probeEconomyObject(app.mem, candidate, &probe)) continue;
-                    if (!best.found || probe.score > best.score) {
-                        best.found = true;
-                        best.address = probe.address;
-                        best.object = probe.object;
-                        best.value = probe.value;
-                        best.score = probe.score;
-                        best.tied = 1;
-                        best.detail = probe.detail;
-                    } else if (probe.score == best.score) {
-                        ++best.tied;
-                    }
-                }
-                if (best.found) {
-                    economyObject = best.object;
-                    xpAddress = best.address;
-                    xpFound = best.value;
-                    xpDetail = fmt("按经验值定位：候选 %llu 个，校验 %d 分",
-                                   (unsigned long long)xpHits, best.score);
+                const uint64_t requiredBank = result.moneyLocated ? result.moneyBank : 0;
+                const CandidatePick pick = pickBestEconomyFromXpFields(
+                    app.mem, xpScan.addresses(), requiredBank, kEconomyProbeCap);
+                if (pick.truncated) {
+                    result.xpTruncated = true;
+                    result.xpDetail =
+                        fmt("经验值候选 %llu 个，超过本次可检查上限 %llu 个（只检查了前 %llu 个）："
+                            "无法保证不存在同分或更高分的经济对象，已拒绝写入经验",
+                            (unsigned long long)xpHits, (unsigned long long)kEconomyProbeCap,
+                            (unsigned long long)pick.examined);
+                } else if (pick.unique) {
+                    result.xpLocated = true;
+                    result.xpAddress = pick.fieldAddress;
+                    result.economyObject = pick.object;
+                    result.xpValue = pick.value;
+                    result.xpDetail =
+                        fmt("按经验值定位：候选 %llu 个，唯一可信经济对象（校验 %d 分%s）",
+                            (unsigned long long)xpHits, pick.score,
+                            requiredBank ? "，已确认引用已定位的 bank 对象" : "");
+                } else if (pick.probed) {
+                    result.xpAmbiguous = true;
+                    result.xpDetail =
+                        fmt("按经验值定位：候选 %llu 个，同分经济对象候选 %d 个",
+                            (unsigned long long)xpHits, pick.tied);
                 } else {
-                    xpDetail = fmt("经验值候选 %llu 个，但结构校验未通过", (unsigned long long)xpHits);
+                    result.xpDetail =
+                        fmt("经验值候选 %llu 个，但结构校验未通过%s",
+                            (unsigned long long)xpHits,
+                            requiredBank ? "（或未引用已定位的 bank 对象）" : "");
                 }
             } else if (!app.cancel.load()) {
-                xpDetail = "内存中没有找到与当前经验一致的数值";
+                result.xpDetail = "内存中没有找到与当前经验一致的数值";
             }
         }
 
+        // 4) 「直接改钱 / 直接改经验」：用启动前复制的目标值快照做验证写入。
+        // 4) 「直接改钱 / 直接改经验」：用启动前复制的目标值快照做验证写入。
+        //    扫描可能持续数十秒，因此在这里（真正写入前一刻）重新评估写入闸门。
+        const std::string gateAtWrite = app.cancel.load() ? std::string() : writeGateReason(app);
+        if (!app.cancel.load() && autoWriteMoney && result.moneyLocated) {
+            result.autoWriteMoney = true;
+            // 扫描可能持续数十秒：真正写入前用最新状态复核写入闸门
+            if (!gateAtWrite.empty()) {
+                result.moneyWriteError = "联机保护：" + gateAtWrite + "（未写入）";
+            } else if (moneyTargetValid) {
+                std::string error;
+                if (writeBankMoneyGuarded(app, result.moneyAddress, result.moneyBank,
+                                          (int64_t)moneyTargetValue, &error)) {
+                    result.moneyWriteOk = true;
+                    result.moneyWritten = (int64_t)moneyTargetValue;
+                } else {
+                    result.moneyWriteError = error;
+                }
+            } else {
+                result.moneyWriteError = moneyTargetError.empty()
+                                             ? std::string("「要改成的金额」不是有效数字")
+                                             : moneyTargetError;
+            }
+        }
+        if (!app.cancel.load() && autoWriteXp && result.xpLocated) {
+            result.autoWriteXp = true;
+            if (!gateAtWrite.empty()) {
+                result.xpWriteError = "联机保护：" + gateAtWrite + "（未写入）";
+            } else if (xpTargetValid) {
+                std::string error;
+                if (writeXpGuarded(app, result.xpAddress, result.economyObject,
+                                   (int32_t)xpTargetValue, &error)) {
+                    result.xpWriteOk = true;
+                    result.xpWritten = (int32_t)xpTargetValue;
+                } else {
+                    result.xpWriteError = error;
+                }
+            } else {
+                result.xpWriteError = xpTargetError.empty()
+                                          ? std::string("「要改成的经验」不是有效的 32 位整数")
+                                          : xpTargetError;
+            }
+        }
+
+        result.cancelled = app.cancel.load();
+        result.log = "结构化定位：金钱 " +
+                     (result.moneyLocated
+                          ? fmt("0x%llX", (unsigned long long)result.moneyAddress)
+                          : std::string("未定位")) +
+                     "；经验 " +
+                     (result.xpLocated ? fmt("0x%llX", (unsigned long long)result.xpAddress)
+                                       : std::string("未定位"));
         {
             std::lock_guard<std::mutex> lock(app.resultMutex);
-            if (app.cancel.load()) {
-                app.pendingStatus = "结构化定位已取消。";
-            } else if (moneyAddress) {
-                app.pendingStatus = fmt("定位成功：金钱 0x%llX%s", (unsigned long long)moneyAddress,
-                                        xpAddress ? "，经验也已定位" : "（经验未定位）");
-            } else {
-                app.pendingStatus = "定位未成功：" + moneyDetail;
-            }
-            app.pendingLog = "结构化定位：金钱 " +
-                             (moneyAddress ? fmt("0x%llX", (unsigned long long)moneyAddress)
-                                           : std::string("未定位")) +
-                             "；经验 " +
-                             (xpAddress ? fmt("0x%llX", (unsigned long long)xpAddress)
-                                        : std::string("未定位"));
-            app.pendingProgressNote = app.cancel.load() ? "已取消" : "结构化定位完成";
-            app.pendingKind = (int)PanelKind::Money;
-            app.pendingReady = true;
+            result.ready = true;
+            app.pendingEconomy = std::move(result);
         }
-
-        // 结果写回界面状态（pending 通道只用于状态文案，结构化数据直接存）
-        if (!app.cancel.load()) {
-            app.locatedMoneyAddress = moneyAddress;
-            app.locatedMoneyBank = moneyBank;
-            app.locatedMoneyValue = moneyFound;
-            app.locatedMoneyDetail = moneyDetail;
-            app.locatedXpAddress = xpAddress;
-            app.locatedEconomy = economyObject;
-            app.locatedXpValue = xpFound;
-            app.locatedXpDetail = xpDetail;
-            app.locateStatus = moneyAddress
-                                   ? fmt("已定位：金钱 %s%s", formatInt(moneyFound).c_str(),
-                                         xpAddress ? fmt("，经验 %s", formatInt(xpFound).c_str())
-                                                   : "（经验未定位）")
-                                   : ("未定位：" + moneyDetail);
-        }
-
-        // 「直接改钱 / 直接改经验」一键流程：定位成功后立即执行免锁定的验证写入。
-        // ProcessMemory 读写线程安全；状态字段沿用本线程已有的写回方式。
-        if (!app.cancel.load() && autoWriteMoney && moneyAddress) {
-            double target = 0.0;
-            if (parseNumber(app.moneyTarget, false, &target)) {
-                std::string error;
-                if (writeBankMoneyVerified(app.mem, moneyAddress, moneyBank, (int64_t)target,
-                                           &error)) {
-                    app.locatedMoneyValue = (int64_t)target;
-                    app.locateStatus = fmt("已直接写入金钱 = %s（回读一致）。无需锁定：游戏读的就是"
-                                           "这个地址，自动存档会把它写进存档。",
-                                           formatInt((int64_t)target).c_str());
-                } else {
-                    app.locateStatus = "定位成功但直接写入失败：" + error;
-                }
-            } else {
-                app.locateStatus = "定位成功，但「要改成的金额」不是有效数字，未写入。";
-            }
-        }
-        if (!app.cancel.load() && autoWriteXp && xpAddress) {
-            double target = 0.0;
-            if (parseNumber(app.xpTarget, false, &target) && (double)(int32_t)target == target) {
-                std::string error;
-                if (writeEconomyExperienceVerified(app.mem, xpAddress, economyObject,
-                                                    (int32_t)target, &error)) {
-                    app.locatedXpValue = (int32_t)target;
-                    app.locateStatus = fmt("已直接写入经验 = %s（回读一致）。无需锁定：升级与技能点"
-                                           "会立刻结算，自动存档会把它写进存档。",
-                                           formatInt((int32_t)target).c_str());
-                } else {
-                    app.locateStatus = "定位成功但经验写入失败：" + error;
-                }
-            } else {
-                app.locateStatus = "定位成功，但「要改成的经验」不是有效的 32 位整数，未写入。";
-            }
-        }
-        logLine(app.locateStatus);
         app.progressDone.store(app.progressTotal.load());
         app.busy.store(false);
     });
@@ -1781,19 +2056,24 @@ void startLocateEconomy(AppState& app) {
 
 // ---------------------------------------------------------------------------
 // 「直接改钱 / 直接改经验」一键入口：已定位 → 立即写入；未定位 → 自动先定位，
-// 定位成功后由工作线程自动写入。全程免锁定。
-// （写入函数在文件后部定义，这里前置声明）
-void writeLocatedMoney(AppState& app, bool lock);
-void writeLocatedXp(AppState& app, bool lock);
+// 定位成功后由工作线程自动写入。全程免锁定。（声明见 ui.h）
+// ---------------------------------------------------------------------------
 
 void directModifyMoney(AppState& app) {
     if (app.busy.load()) {
         app.locateStatus = "已有任务在进行，请等它结束。";
         return;
     }
-    double target = 0.0;
-    if (!parseNumber(app.moneyTarget, false, &target)) {
-        app.locateStatus = "请先在「要改成的金额」里填写目标金额。";
+    int64_t target = 0;
+    std::string targetError;
+    if (!parseMoneyTarget(app.moneyTarget, &target, &targetError)) {
+        app.locateStatus = "请先在「要改成的金额」里填写有效金额：" + targetError;
+        return;
+    }
+    const std::string gate = writeGateReason(app);
+    if (!gate.empty()) {
+        app.locateStatus = "已拒绝写入：" + gate;
+        logLine(app.locateStatus);
         return;
     }
     if (app.locatedMoneyAddress) {
@@ -1816,9 +2096,16 @@ void directModifyXp(AppState& app) {
         app.locateStatus = "已有任务在进行，请等它结束。";
         return;
     }
-    double target = 0.0;
-    if (!parseNumber(app.xpTarget, false, &target) || (double)(int32_t)target != target) {
-        app.locateStatus = "请先在「要改成的经验」里填写 32 位整数范围内的目标经验。";
+    int32_t target = 0;
+    std::string targetError;
+    if (!parseXpTarget(app.xpTarget, &target, &targetError)) {
+        app.locateStatus = "请先在「要改成的经验」里填写有效经验：" + targetError;
+        return;
+    }
+    const std::string gate = writeGateReason(app);
+    if (!gate.empty()) {
+        app.locateStatus = "已拒绝写入：" + gate;
+        logLine(app.locateStatus);
         return;
     }
     if (app.locatedXpAddress) {
@@ -1845,22 +2132,31 @@ void writeLocatedMoney(AppState& app, bool lock) {
         app.locateStatus = "还没有定位结果：请填好当前金额后点「直接改钱」。";
         return;
     }
-    double value = 0.0;
-    if (!parseNumber(app.moneyTarget, false, &value)) {
-        app.locateStatus = "请在「要改成的金额」里填写目标金额。";
+    int64_t money = 0;
+    std::string targetError;
+    if (!parseMoneyTarget(app.moneyTarget, &money, &targetError)) {
+        // 目标数值越界/非法：不得清除定位结果，也不能写入
+        app.locateStatus = "未写入：" + targetError + "（定位结果保留，可修改后重试）。";
+        logLine(app.locateStatus);
         return;
     }
-    const int64_t money = (int64_t)value;
+    // 真正执行写入前复核写入闸门（扫描/等待期间可能进入联机）
     if (lock) {
         ProbeResult probe;
         if (!probeBankObject(app.mem, app.locatedMoneyAddress, &probe) ||
             probe.object != app.locatedMoneyBank) {
             clearLocatedEconomy(app);
-            app.locateStatus = "定位地址已失效（可能换过存档或重载），请重新定位。";
+            app.locateStatus = "定位地址已失效（可能换过存档或重载），已清除定位结果，请重新定位。";
             return;
         }
         if (!app.freezer) {
             app.locateStatus = "锁定器尚未就绪（请先附加游戏）。";
+            return;
+        }
+        const std::string gate = writeGateReason(app);
+        if (!gate.empty()) {
+            app.locateStatus = "已拒绝写入：" + gate + "（定位结果保留）";
+            logLine(app.locateStatus);
             return;
         }
         app.freezer->addInt(app.locatedMoneyAddress, VType::Int64, money);
@@ -1869,11 +2165,17 @@ void writeLocatedMoney(AppState& app, bool lock) {
                                formatInt(money).c_str());
     } else {
         std::string error;
-        if (!writeBankMoneyVerified(app.mem, app.locatedMoneyAddress, app.locatedMoneyBank,
-                                    money, &error)) {
-            // 结构校验失败说明地址已失效（换存档/读档），清掉避免继续用
-            if (error.find("结构校验未通过") != std::string::npos) clearLocatedEconomy(app);
-            app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+        if (!writeBankMoneyGuarded(app, app.locatedMoneyAddress, app.locatedMoneyBank, money,
+                                   &error)) {
+            if (error.find("联机保护") != std::string::npos) {
+                // 闸门拦截：不是地址失效，定位结果必须保留
+                app.locateStatus = "已拒绝写入：" + error + "（定位结果保留）";
+            } else if (error.find("结构校验未通过") != std::string::npos) {
+                clearLocatedEconomy(app);
+                app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+            } else {
+                app.locateStatus = "直接写入失败：" + error + "（定位结果保留，可重试）";
+            }
             logLine(app.locateStatus);
             return;
         }
@@ -1891,26 +2193,30 @@ void writeLocatedXp(AppState& app, bool lock) {
                            "定位金钱时会一并定位经验）。";
         return;
     }
-    double value = 0.0;
-    if (!parseNumber(app.xpTarget, false, &value)) {
-        app.locateStatus = "请在「要改成的经验」里填写目标经验。";
+    int32_t xp = 0;
+    std::string targetError;
+    if (!parseXpTarget(app.xpTarget, &xp, &targetError)) {
+        // 越界/非整数绝不先转换：定位结果保留
+        app.locateStatus = "未写入：" + targetError + "（定位结果保留，可修改后重试）。";
+        logLine(app.locateStatus);
         return;
     }
-    const int32_t xp = (int32_t)value;
-    if ((double)xp != value) {
-        app.locateStatus = "目标经验必须是 32 位整数范围内的整数。";
-        return;
-    }
+    const std::string gate = writeGateReason(app);
     if (lock) {
         ProbeResult probe;
         if (!probeEconomyObject(app.mem, app.locatedXpAddress, &probe) ||
             probe.object != app.locatedEconomy) {
             clearLocatedEconomy(app);
-            app.locateStatus = "经验地址已失效，请重新定位。";
+            app.locateStatus = "经验地址已失效，已清除定位结果，请重新定位。";
             return;
         }
         if (!app.freezer) {
             app.locateStatus = "锁定器尚未就绪（请先附加游戏）。";
+            return;
+        }
+        if (!gate.empty()) {
+            app.locateStatus = "已拒绝写入：" + gate + "（定位结果保留）";
+            logLine(app.locateStatus);
             return;
         }
         app.freezer->addInt(app.locatedXpAddress, VType::Int32, xp);
@@ -1918,10 +2224,15 @@ void writeLocatedXp(AppState& app, bool lock) {
                                formatInt(xp).c_str());
     } else {
         std::string error;
-        if (!writeEconomyExperienceVerified(app.mem, app.locatedXpAddress, app.locatedEconomy,
-                                            xp, &error)) {
-            if (error.find("结构校验未通过") != std::string::npos) clearLocatedEconomy(app);
-            app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+        if (!writeXpGuarded(app, app.locatedXpAddress, app.locatedEconomy, xp, &error)) {
+            if (error.find("联机保护") != std::string::npos) {
+                app.locateStatus = "已拒绝写入：" + error + "（定位结果保留）";
+            } else if (error.find("结构校验未通过") != std::string::npos) {
+                clearLocatedEconomy(app);
+                app.locateStatus = "直接写入失败：" + error + "（定位结果已清除，请重新定位）";
+            } else {
+                app.locateStatus = "直接写入失败：" + error + "（定位结果保留，可重试）";
+            }
             logLine(app.locateStatus);
             return;
         }
@@ -1945,13 +2256,17 @@ void renderMoneyTab(AppState& app) {
                          "所以写完不会被改回去，也不需要「锁定」。");
     ::ImGui::Spacing();
 
-    // 第一次使用的引导输入：定位需要用当前金额做一次种子扫描
+    // 第一次使用的引导输入：定位需要用当前金额做一次种子扫描。
+    // 定位期间禁用输入：工作线程只使用启动前复制的快照，界面缓冲区不能同时被编辑。
+    const bool inputsLocked = app.busy.load();
     if (!app.locatedMoneyAddress) {
         ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 当前金额（仅首次定位需要）");
         ::ImGui::SameLine(220.0f);
         ::ImGui::SetNextItemWidth(170);
+        ::ImGui::BeginDisabled(inputsLocked);
         ::ImGui::InputTextWithHint("##current", "游戏里显示的金额", app.moneyCurrent, 32,
                                    ImGuiInputTextFlags_CharsDecimal);
+        ::ImGui::EndDisabled();
         ::ImGui::SameLine();
         ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "定位用它做种子，约 10~25 秒");
     }
@@ -1960,15 +2275,18 @@ void renderMoneyTab(AppState& app) {
                          app.locatedMoneyAddress ? "② 金额" : "② 金额（定位后可反复直接改）");
     ::ImGui::SameLine(220.0f);
     ::ImGui::SetNextItemWidth(170);
+    ::ImGui::BeginDisabled(inputsLocked);
     ::ImGui::InputTextWithHint("##target_money", "目标金额", app.moneyTarget, 32,
                                ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::EndDisabled();
     ::ImGui::SameLine();
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 直接改钱 ", ImVec2(120, 28))) directModifyMoney(app);
     ::ImGui::EndDisabled();
 
-    // 快速预设
+    // 快速预设（同样会改输入缓冲区，定位期间一并禁用）
     ::ImGui::SameLine();
+    ::ImGui::BeginDisabled(inputsLocked);
     if (::ImGui::Button("+100万")) {
         double cur = 0;
         parseNumber(app.moneyTarget, false, &cur);
@@ -1986,19 +2304,23 @@ void renderMoneyTab(AppState& app) {
     if (::ImGui::Button("1 亿")) ::strncpy_s(app.moneyTarget, 32, "100000000", _TRUNCATE);
     ::ImGui::SameLine();
     if (::ImGui::Button("9.99 亿")) ::strncpy_s(app.moneyTarget, 32, "999999999", _TRUNCATE);
+    ::ImGui::EndDisabled();
 
     ::ImGui::Spacing();
     ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
                          app.locatedXpAddress ? "③ 经验" : "③ 经验（随金额一并定位）");
     ::ImGui::SameLine(220.0f);
     ::ImGui::SetNextItemWidth(170);
+    ::ImGui::BeginDisabled(inputsLocked);
     ::ImGui::InputTextWithHint("##target_xp", "目标经验", app.xpTarget, 32,
                                ImGuiInputTextFlags_CharsDecimal);
+    ::ImGui::EndDisabled();
     ::ImGui::SameLine();
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 直接改经验 ", ImVec2(130, 28))) directModifyXp(app);
     ::ImGui::EndDisabled();
     ::ImGui::SameLine();
+    ::ImGui::BeginDisabled(inputsLocked);
     if (::ImGui::Button("5,000 (约10级)")) ::strncpy_s(app.xpTarget, 32, "5000", _TRUNCATE);
     ::ImGui::SameLine();
     if (::ImGui::Button("50,000 (约35级)")) ::strncpy_s(app.xpTarget, 32, "50000", _TRUNCATE);
@@ -2006,6 +2328,7 @@ void renderMoneyTab(AppState& app) {
     if (::ImGui::Button("150,000 (满级技能)")) ::strncpy_s(app.xpTarget, 32, "150000", _TRUNCATE);
     ::ImGui::SameLine();
     if (::ImGui::Button("1,000,000")) ::strncpy_s(app.xpTarget, 32, "1000000", _TRUNCATE);
+    ::ImGui::EndDisabled();
 
     ::ImGui::Spacing();
     ::ImGui::Separator();
@@ -2054,6 +2377,13 @@ void renderMoneyTab(AppState& app) {
         ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
                              "锁定 = 每 0.25 秒把数值写回一次，用来抵消游戏内真实的收支变化。"
                              "只是可选项，直接修改本身不需要它。");
+        if (app.freezer && app.freezer->blocked() > 0) {
+            ::ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f),
+                                 "锁定写入已被联机闸门拦截 %llu 次：%s（解锁条目仍保留，"
+                                 "退出联机后自动恢复写入）",
+                                 (unsigned long long)app.freezer->blocked(),
+                                 app.freezer->blockedReason().c_str());
+        }
     }
     ::ImGui::EndChild();
 
@@ -2240,6 +2570,20 @@ void renderVehicleTabImpl(AppState& app) {
             app.engineStateText = app.engineTuner->exportState();
             app.engineStatus = live;
         }
+        // 如实区分恢复记录状态：修改仍存在 / 尚未核对 / 对象已明确失效 / 已确认恢复
+        const char* recordState = "已确认恢复（无待恢复记录）";
+        ImVec4 recordColor(0.45f, 0.85f, 0.60f, 1.0f);
+        if (app.engineTuner->hasUnverifiedImportedRecord()) {
+            recordState = "上次运行的恢复记录尚未核对（已保留；不会把放大值当原厂值）";
+            recordColor = ImVec4(0.95f, 0.75f, 0.30f, 1.0f);
+        } else if (app.engineTuner->active()) {
+            recordState = "修改仍存在（后台保持中）";
+            recordColor = ImVec4(0.95f, 0.55f, 0.35f, 1.0f);
+        } else if (app.engineTuner->hasInvalidatedRecord()) {
+            recordState = "对象已明确失效（数值与本程序记录不符，记录已丢弃且未写入）";
+            recordColor = ImVec4(0.95f, 0.45f, 0.45f, 1.0f);
+        }
+        ::ImGui::TextColored(recordColor, "恢复记录：%s", recordState);
     }
     ::ImGui::Spacing();
     ::ImGui::TextColored(ImVec4(0.40f, 0.78f, 0.95f, 1.0f), "当前状态：%s", app.engineStatus.c_str());
@@ -2451,8 +2795,6 @@ std::string sanitizeTeleportTarget(const std::string& text) {
     while (!out.empty() && out.back() == ' ') out.pop_back();
     return out;
 }
-
-}  // namespace
 
 }  // namespace
 
@@ -3158,6 +3500,20 @@ void renderConfirmDialogs(AppState& app) {
 
 void renderApp(AppState& app) {
     applyPending(app);
+    consumePendingEconomy(app);  // 经济定位线程的结构化结果由本线程统一落地
+    // 刷新写入闸门策略快照（pid / 联运策略）：工作线程只读这份原子快照
+    updateWriteGatePolicy(app);
+    // 发动机后台（换车/新基准/恢复成败/待恢复记录变化）→ 立即持久化。
+    // 不从维护线程碰 ImGui / UI 状态；持久化失败保留修订号差值以便节流重试。
+    if (app.engineTuner) {
+        const uint64_t revision = app.engineTuner->stateRevision();
+        if (revision != app.lastEngineStateRevision &&
+            ::GetTickCount64() - app.lastEngineSaveTick >= 1000) {
+            app.lastEngineSaveTick = ::GetTickCount64();
+            app.engineStateText = app.engineTuner->exportState();
+            if (saveSettings(app)) app.lastEngineStateRevision = revision;
+        }
+    }
     ImGuiIO& io = ::ImGui::GetIO();
     ::ImGui::SetNextWindowPos(ImVec2(0, 0));
     ::ImGui::SetNextWindowSize(io.DisplaySize);
@@ -3309,4 +3665,3 @@ void renderApp(AppState& app) {
 }
 
 }  // namespace ets2
-

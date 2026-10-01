@@ -129,6 +129,10 @@ private:
 // ---------------- 数值锁定 ----------------
 class Freezer {
 public:
+    // 写入闸门：返回空串=允许写入；否则是拒绝原因（联机保护）。
+    // 每次实际写入前调用；被拦下时不写入（锁定条目保留，状态可查）。
+    using WriteGuard = std::function<std::string()>;
+
     ~Freezer() { stop(); }
     void start(ProcessMemory* mem, int intervalMs = 250);
     void stop();
@@ -140,6 +144,10 @@ public:
     std::vector<std::tuple<uint64_t, VType, double>> entries() const;
     uint64_t writes() const { return writes_.load(); }
     uint64_t failures() const { return fails_.load(); }
+    // 被闸门拦下的累计次数 + 最近一次拒绝原因（供界面如实提示）
+    uint64_t blocked() const { return blocked_.load(); }
+    std::string blockedReason() const;
+    void setWriteGuard(WriteGuard guard);
 
 private:
     void run();
@@ -151,6 +159,10 @@ private:
     int interval_ = 250;
     std::atomic<uint64_t> writes_{0};
     std::atomic<uint64_t> fails_{0};
+    std::atomic<uint64_t> blocked_{0};
+    mutable std::mutex guardMutex_;
+    WriteGuard guard_;
+    std::string blockedReason_ = "未启用";
 };
 
 }  // namespace ets2
