@@ -38,5 +38,9 @@ void        logLine(const std::string& text);
 std::vector<std::string>  logSnapshot();   // 线程安全地复制一份日志
 void        logClear();
 void        logSaveToFile(const std::wstring& path);
+bool        logStartFile(const std::wstring& path, std::string* error = nullptr);
+void        logStopFile();
+std::wstring logFilePath();
+std::string logFileError();
 
 }  // namespace ets2

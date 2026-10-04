@@ -97,14 +97,32 @@ std::string localTimeString(uint64_t unixSeconds) {
 namespace {
 std::mutex g_logMutex;
 std::vector<std::string> g_log;
+HANDLE g_logFile = INVALID_HANDLE_VALUE;
+std::wstring g_logPath;
+std::string g_logError;
+
+void appendLogLocked(const std::string& line) {
+    if (g_logFile == INVALID_HANDLE_VALUE) return;
+    const std::string bytes = line + "\r\n";
+    DWORD written = 0;
+    if (!::WriteFile(g_logFile, bytes.data(), (DWORD)bytes.size(), &written, nullptr) ||
+        written != bytes.size() || !::FlushFileBuffers(g_logFile)) {
+        g_logError = fmt("实时日志写入失败（错误 %lu）：%s", (unsigned long)::GetLastError(),
+                         W2U(g_logPath).c_str());
+        ::CloseHandle(g_logFile);
+        g_logFile = INVALID_HANDLE_VALUE;
+    }
+}
 }  // namespace
 
 void logLine(const std::string& text) {
     SYSTEMTIME st;
     ::GetLocalTime(&st);
-    std::string line = fmt("[%02d:%02d:%02d] %s", st.wHour, st.wMinute, st.wSecond, text.c_str());
+    std::string line = fmt("[%04d-%02d-%02d %02d:%02d:%02d] %s", st.wYear, st.wMonth,
+                           st.wDay, st.wHour, st.wMinute, st.wSecond, text.c_str());
     std::lock_guard<std::mutex> lock(g_logMutex);
     g_log.push_back(line);
+    appendLogLocked(line);
     if (g_log.size() > 2000) g_log.erase(g_log.begin(), g_log.begin() + 500);
 }
 
@@ -116,6 +134,41 @@ std::vector<std::string> logSnapshot() {
 void logClear() {
     std::lock_guard<std::mutex> lock(g_logMutex);
     g_log.clear();
+    appendLogLocked("[界面日志已清空，磁盘会话日志继续保留]");
+}
+
+bool logStartFile(const std::wstring& path, std::string* error) {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const std::string reason = fmt("无法创建实时日志（错误 %lu）：%s",
+            (unsigned long)::GetLastError(), W2U(path).c_str());
+        if (error) *error = reason;
+        g_logError = reason;
+        return false;
+    }
+    if (g_logFile != INVALID_HANDLE_VALUE) ::CloseHandle(g_logFile);
+    g_logFile = file;
+    g_logPath = path;
+    g_logError.clear();
+    return true;
+}
+
+void logStopFile() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    if (g_logFile != INVALID_HANDLE_VALUE) ::CloseHandle(g_logFile);
+    g_logFile = INVALID_HANDLE_VALUE;
+}
+
+std::wstring logFilePath() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    return g_logPath;
+}
+
+std::string logFileError() {
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    return g_logError;
 }
 
 void logSaveToFile(const std::wstring& path) {

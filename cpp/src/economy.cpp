@@ -1,6 +1,9 @@
 // economy.cpp —— 金钱 / 经验结构化定位的校验实现（只读，不写游戏内存）
 #include "economy.h"
 
+#include "gameplay.h"
+#include "layout.h"
+
 #include "common.h"
 
 #include <cmath>
@@ -43,9 +46,67 @@ bool plausibleSmallCounter(int64_t value) {
 
 }  // namespace
 
+uint64_t bankMoneyOffset() { return selectedGame() == GameId::Ats ? ats_economy_offsets::kMoney : economy_offsets::kBankMoneyAccount; }
+uint64_t economyXpOffset() { return selectedGame() == GameId::Ats ? ats_economy_offsets::kXp : economy_offsets::kEconomyExperiencePoints; }
+uint64_t economyBankRefOffset() { return selectedGame() == GameId::Ats ? ats_economy_offsets::kBankRef : economy_offsets::kEconomyBankRef; }
+
+namespace {
+bool atsTypeMatches(const ProcessMemory& memory, uint64_t object, uint64_t vtableRva) {
+    uint64_t base = 0, vtable = 0;
+    return memory.mainImage(&base) && memory.read(object, &vtable, sizeof(vtable)) && vtable == base + vtableRva;
+}
+bool probeAtsBank(const ProcessMemory& memory, uint64_t address, ProbeResult* out) {
+    ProbeResult r; r.address = address; r.maxScore = 7;
+    auto reject = [&](const char* reason) { r.detail = reason; if (out) *out = r; return false; };
+    if (address < ats_economy_offsets::kMoney) return reject("美卡金额地址无效");
+    r.object = address - ats_economy_offsets::kMoney;
+    int64_t fixed = 0, loan = 0; float ratio = 0, severity = 0;
+    uint8_t enabled = 0;
+    if (!atsTypeMatches(memory, r.object, layoutProfile(GameId::Ats).bankVtableRva))
+        return reject("美卡银行对象类型不匹配");
+    if (!readI64(memory,address,&r.value) || r.value < -1000000000000LL || r.value > 1000000000000LL)
+        return reject("美卡银行金额读取失败或超出范围");
+    if (!readI64(memory,r.object+0x18,&fixed) || fixed < 0 || fixed > 1000000)
+        return reject("美卡银行免赔额读取失败或超出范围");
+    if (!readF32(memory,r.object+0x20,&ratio) || ratio < 0 || ratio > 1)
+        return reject("美卡银行共保比例读取失败或超出 0～1");
+    // accident_severity is accumulated across accidents, not a normalized ratio.
+    // Live ATS reached 1.69; only finite nonnegative values are required here.
+    if (!readF32(memory,r.object+0x24,&severity) || severity < 0)
+        return reject("美卡银行事故累计值无效（必须有限且非负）");
+    if (!memory.read(r.object+0x50,&enabled,1) || enabled > 1)
+        return reject("美卡银行 App 标志无效");
+    if (!readI64(memory,r.object+0x58,&loan) || loan < 0 || loan > 1000000000)
+        return reject("美卡银行贷款额度读取失败或超出范围");
+    r.score = 7; r.detail = "美卡银行类型、金额、免赔额、共保、事故、贷款和 App 标志核对通过";
+    if(out) *out=r;
+    return true;
+}
+bool probeAtsEconomy(const ProcessMemory& memory, uint64_t address, ProbeResult* out) {
+    ProbeResult r; r.address=address; r.maxScore=8;
+    if(address < ats_economy_offsets::kXp) return false;
+    r.object=address-ats_economy_offsets::kXp;
+    int32_t xp=0, minutes=0; float seconds=0; uint64_t bank=0;
+    if(!atsTypeMatches(memory,r.object,layoutProfile(GameId::Ats).economyVtableRva) ||
+       !readI32(memory,address,&xp) || xp<0 || xp>1000000000 ||
+       !memory.read(r.object+ats_economy_offsets::kBankRef,&bank,8) || !isCanonical(bank) ||
+       !probeAtsBank(memory,bank+ats_economy_offsets::kMoney,nullptr) ||
+       !readI32(memory,r.object+0x19C,&minutes) || minutes<0 ||
+       !readF32(memory,r.object+0x1A0,&seconds) || seconds<0 || seconds>60) return false;
+    for(int i=0;i<6;++i) {
+        int32_t skill=0;
+        if(!readI32(memory,r.object+ats_economy_offsets::kSkills+4*i,&skill) || skill<0 || skill>6) return false;
+    }
+    r.value=xp; r.score=8; r.detail="美卡经济类型、银行引用、经验、六项技能与游戏时间核对通过";
+    if(out) *out=r;
+    return true;
+}
+}
+
 bool probeBankObject(const ProcessMemory& memory, uint64_t moneyAddress, ProbeResult* out) {
     ProbeResult result;
     result.maxScore = 7;
+    if (selectedGame() == GameId::Ats) return probeAtsBank(memory, moneyAddress, out);
     if (!isCanonical(moneyAddress) || moneyAddress < economy_offsets::kBankMoneyAccount) return false;
     result.address = moneyAddress;
     result.object = moneyAddress - economy_offsets::kBankMoneyAccount;
@@ -119,6 +180,7 @@ bool probeBankObject(const ProcessMemory& memory, uint64_t moneyAddress, ProbeRe
 bool probeEconomyObject(const ProcessMemory& memory, uint64_t xpAddress, ProbeResult* out) {
     ProbeResult result;
     result.maxScore = 9;
+    if (selectedGame() == GameId::Ats) return probeAtsEconomy(memory, xpAddress, out);
     if (!isCanonical(xpAddress) ||
         xpAddress < economy_offsets::kEconomyExperiencePoints) {
         return false;
@@ -208,13 +270,13 @@ bool economyReferencesBank(const ProcessMemory& memory, uint64_t economyObject,
                            uint64_t bankObject) {
     if (!isCanonical(economyObject) || !isCanonical(bankObject)) return false;
     int64_t ref = 0;
-    if (!readI64(memory, economyObject + economy_offsets::kEconomyBankRef, &ref)) return false;
+    if (!readI64(memory, economyObject + economyBankRefOffset(), &ref)) return false;
     return ref == (int64_t)bankObject;
 }
 
 uint64_t economyFromBankPointer(uint64_t bankPointerSlot) {
-    if (bankPointerSlot < economy_offsets::kEconomyBankRef) return 0;
-    return bankPointerSlot - economy_offsets::kEconomyBankRef;
+    if (bankPointerSlot < economyBankRefOffset()) return 0;
+    return bankPointerSlot - economyBankRefOffset();
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +354,7 @@ CandidatePick pickBestEconomyFromBankRefs(const ProcessMemory& memory,
         if (!economy) continue;
         // 经验地址 = 经济对象 + 0x780（由槽位反推，这里只加一次偏移）
         ProbeResult probe;
-        if (!probeEconomyObject(memory, economy + economy_offsets::kEconomyExperiencePoints,
+        if (!probeEconomyObject(memory, economy + economyXpOffset(),
                                 &probe)) {
             continue;
         }
@@ -336,6 +398,11 @@ constexpr int32_t kXpMax = 2000000000;            // 接近 int32 上限，防�
 
 bool writeBankMoneyVerified(const ProcessMemory& memory, uint64_t moneyAddress,
                             uint64_t expectedBank, int64_t value, std::string* error) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        if (error) *error = reason;
+        return false;
+    }
+    if (selectedGame() == GameId::Ats && !verifyGameLayout(memory, nullptr, error)) return false;
     // 1) 写入前重新校验 bank 结构：换存档/读档后旧地址可能已被复用
     ProbeResult probe;
     if (!probeBankObject(memory, moneyAddress, &probe)) {
@@ -368,6 +435,11 @@ bool writeBankMoneyVerified(const ProcessMemory& memory, uint64_t moneyAddress,
 
 bool writeEconomyExperienceVerified(const ProcessMemory& memory, uint64_t xpAddress,
                                     uint64_t expectedEconomy, int32_t value, std::string* error) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        if (error) *error = reason;
+        return false;
+    }
+    if (selectedGame() == GameId::Ats && !verifyGameLayout(memory, nullptr, error)) return false;
     // 1) 写入前重新校验经济对象结构（存档版本 / bank 引用 / 技能点布局）
     ProbeResult probe;
     if (!probeEconomyObject(memory, xpAddress, &probe)) {

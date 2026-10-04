@@ -52,6 +52,9 @@ public:
     ProcessMemory& operator=(const ProcessMemory&) = delete;
 
     bool open(DWORD pid, const std::string& name, std::string* error);
+    bool openReadOnly(DWORD pid, const std::string& name, std::string* error);
+    bool canWrite() const { return h_ && writable_; }
+    bool mainImage(uint64_t* base, std::wstring* path = nullptr) const;
     void close();
     bool alive() const;
     bool isOpen() const { return h_ != nullptr; }
@@ -70,9 +73,11 @@ public:
     std::vector<Region> regions(size_t maxRegionSize = kDefaultMaxRegion) const;
 
 private:
+    bool openWithAccess(DWORD, const std::string&, std::string*, bool writable);
     HANDLE      h_ = nullptr;
     DWORD       pid_ = 0;
     std::string name_;
+    bool writable_ = false;
 };
 
 // ---------------- 扫描 ----------------

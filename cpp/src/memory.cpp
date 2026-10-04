@@ -9,6 +9,24 @@
 
 namespace ets2 {
 
+bool ProcessMemory::mainImage(uint64_t* base, std::wstring* path) const {
+    if (!h_ || !base) return false;
+    // PEB image base remains readable when Toolhelp module snapshots are denied.
+    // This does not establish multiplayer status; that gate continues to fail closed.
+    struct BasicInfo { void* reserved; void* peb; void* reserved2[2]; ULONG_PTR pid; void* reserved3; };
+    using Query = LONG (NTAPI*)(HANDLE, ULONG, void*, ULONG, ULONG*);
+    auto query = reinterpret_cast<Query>(::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    BasicInfo info{};
+    if (!query || query(h_,0,&info,sizeof(info),nullptr)<0 || !info.peb ||
+        !read(reinterpret_cast<uint64_t>(info.peb)+0x10,base,sizeof(*base)) || !*base) return false;
+    if (path) {
+        wchar_t text[32768]; DWORD length=32768;
+        if (!::QueryFullProcessImageNameW(h_,0,text,&length)) return false;
+        path->assign(text,length);
+    }
+    return true;
+}
+
 namespace {
 const VTypeInfo kTypes[] = {
     {"int32", 4, false}, {"uint32", 4, false}, {"int64", 8, false},
@@ -97,9 +115,18 @@ std::string valueToString(const Value& v) {
 ProcessMemory::~ProcessMemory() { close(); }
 
 bool ProcessMemory::open(DWORD pid, const std::string& name, std::string* error) {
+    return openWithAccess(pid, name, error, true);
+}
+
+bool ProcessMemory::openReadOnly(DWORD pid, const std::string& name, std::string* error) {
+    return openWithAccess(pid, name, error, false);
+}
+
+bool ProcessMemory::openWithAccess(DWORD pid, const std::string& name, std::string* error,
+                                   bool writable) {
     close();
-    const DWORD kRights = PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_READ |
-                          PROCESS_VM_WRITE | SYNCHRONIZE;
+    const DWORD kRights = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE |
+        (writable ? PROCESS_VM_OPERATION | PROCESS_VM_WRITE : 0);
     HANDLE h = ::OpenProcess(kRights, FALSE, pid);
     if (!h) {
         DWORD err = ::GetLastError();
@@ -115,6 +142,7 @@ bool ProcessMemory::open(DWORD pid, const std::string& name, std::string* error)
     h_ = h;
     pid_ = pid;
     name_ = name;
+    writable_ = writable;
     return true;
 }
 
@@ -124,6 +152,7 @@ void ProcessMemory::close() {
         h_ = nullptr;
     }
     pid_ = 0;
+    writable_ = false;
 }
 
 bool ProcessMemory::alive() const {
@@ -141,7 +170,7 @@ bool ProcessMemory::read(uint64_t address, void* dst, size_t size, size_t* got) 
 }
 
 bool ProcessMemory::write(uint64_t address, const void* src, size_t size) const {
-    if (!h_ || !size) return false;
+    if (!h_ || !writable_ || !size) return false;
     SIZE_T written = 0;
     if (::WriteProcessMemory(h_, (LPVOID)(uintptr_t)address, src, size, &written) &&
         written == size) {

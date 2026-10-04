@@ -1,6 +1,8 @@
 // telemetry.cpp —— RenCloud/truckermudgeon SCS telemetry shared-memory revision 12
 #include "telemetry.h"
 
+#include "gameplay.h"
+
 #include <cmath>
 #include <cstring>
 
@@ -27,8 +29,13 @@ bool plausible(const TelemetrySnapshot& s, std::string* error) {
         if (error) *error = fmt("遥测插件版本过旧（revision %u，需要 12+）", s.pluginRevision);
         return false;
     }
-    if (s.game != 1) {
-        if (error) *error = fmt("共享内存不是欧卡2数据（game=%u）", s.game);
+    // 期望的 game 编号来自当前选择（欧卡2=1，美卡=2），不能只接受欧卡2。
+    const unsigned expectedGame = selectedGameDescriptor().telemetryGame;
+    if (s.game != expectedGame) {
+        if (error) {
+            *error = fmt("共享内存 game=%u 与当前选择的%s不符（应为 %u），已拒绝使用该遥测数据",
+                         s.game, selectedGameDescriptor().shortName, expectedGame);
+        }
         return false;
     }
     if (!std::isfinite(s.fuel) || !std::isfinite(s.fuelCapacity) || s.fuel < 0.0f ||

@@ -55,6 +55,15 @@ constexpr int      kEconomySkillCount = 6;
 
 }  // namespace economy_offsets
 
+// ATS 1.61.3.1 runtime bank/economy, verified against serialized unit identifiers
+// and values. These are distinct from the definition descriptor offsets above.
+namespace ats_economy_offsets {
+constexpr uint64_t kMoney = 0x10, kBankRef = 0x10, kXp = 0x77C, kSkills = 0x780;
+}
+uint64_t bankMoneyOffset();
+uint64_t economyXpOffset();
+uint64_t economyBankRefOffset();
+
 // 一个候选地址的校验结果：score 越高越可信，detail 供界面显示。
 struct ProbeResult {
     uint64_t address = 0;   // 被校验的字段地址（金钱地址 / 经验地址）

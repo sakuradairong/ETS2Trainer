@@ -1,6 +1,9 @@
 // engine.cpp —— 有界只读的附属总成探针实现 + 发动机动力调节
 #include "engine.h"
 
+#include "gameplay.h"
+#include "layout.h"
+
 #include "vehicle.h"
 
 #include <algorithm>
@@ -222,8 +225,8 @@ bool readEngineSignature(const ProcessMemory& memory, uint64_t address, float* t
     readFloat(memory, address + engine_runtime::kResistanceTorque, resistance);
     if (!inRange(*torque, 100.0f, 60000.0f)) return false;  // 允许已被本程序放大的扭矩
     if (!inRange(*rpmIdle, 300.0f, 1200.0f)) return false;
-    if (!inRange(*rpmLimit, 1200.0f, 4500.0f)) return false;
-    if (!inRange(*rpmLimitNeutral, 1200.0f, 4500.0f)) return false;
+    if (!inRange(*rpmLimit, 1200.0f, (selectedGame() == GameId::Ats ? 10000.0f : 4500.0f))) return false;
+    if (!inRange(*rpmLimitNeutral, 1200.0f, (selectedGame() == GameId::Ats ? 10000.0f : 4500.0f))) return false;
     if (*rpmIdle >= *rpmLimit) return false;
     if (*rpmLimitNeutral > *rpmLimit * 1.5f) return false;
     if (*resistance < 0.0f || *resistance > 3000.0f) return false;
@@ -251,6 +254,8 @@ bool locateEngineTarget(const ProcessMemory& memory, uint64_t context, EngineTar
         if (error) *error = "玩家上下文无效";
         return false;
     }
+    uint64_t imageBase = 0;
+    if (selectedGame() == GameId::Ats && !verifyGameLayout(memory, &imageBase, error)) return false;
     uint64_t container = 0;
     if (!memory.read(context + kContextToAccessoryData, &container, sizeof(container)) ||
         !isCanonical(container)) {
@@ -271,6 +276,11 @@ bool locateEngineTarget(const ProcessMemory& memory, uint64_t context, EngineTar
         uint64_t pointer = 0;
         ::memcpy(&pointer, window.data() + offset, sizeof(pointer));
         if (!isCanonical(pointer)) continue;
+        if (selectedGame() == GameId::Ats) {
+            uint64_t vtable = 0;
+            if (!memory.read(pointer, &vtable, sizeof(vtable)) ||
+                vtable != imageBase + layoutProfile(GameId::Ats).engineVtableRva) continue;
+        }
         float torque = 0.0f, idle = 0.0f, limit = 0.0f, neutral = 0.0f, resistance = 0.0f;
         if (readEngineSignature(memory, pointer, &torque, &idle, &limit, &neutral, &resistance)) {
             engineMatches.push_back(pointer);
@@ -419,11 +429,11 @@ bool engineValuesPlausible(const EngineFieldValues& values) {
         return false;
     }
     if (!std::isfinite(values.rpmLimit) || values.rpmLimit < 1200.0f ||
-        values.rpmLimit > 4500.0f) {
+        values.rpmLimit > (selectedGame() == GameId::Ats ? 10000.0f : 4500.0f)) {
         return false;
     }
     if (!std::isfinite(values.rpmLimitNeutral) || values.rpmLimitNeutral < 1200.0f ||
-        values.rpmLimitNeutral > 4500.0f) {
+        values.rpmLimitNeutral > (selectedGame() == GameId::Ats ? 10000.0f : 4500.0f)) {
         return false;
     }
     if (values.rpmIdle >= values.rpmLimit) return false;
@@ -541,6 +551,10 @@ void EngineTuner::restoreAndDetach() {
 }
 
 bool EngineTuner::apply(float scale, bool raiseLimit, std::string* error) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        if (error) *error = reason;
+        return false;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     if (!memory_ || !memory_->usable()) {
         if (error) *error = "尚未附加到游戏进程";
@@ -871,12 +885,12 @@ bool EngineTuner::computeValuesLocked(const ObjectState& state, float scale, boo
         return false;
     }
     if (!std::isfinite(values.rpmLimit) || values.rpmLimit < kMinWriteRpm ||
-        values.rpmLimit > kMaxWriteRpm || values.rpmLimit <= state.base.rpmIdle) {
+        values.rpmLimit > (selectedGame() == GameId::Ats ? 10000.0f : kMaxWriteRpm) || values.rpmLimit <= state.base.rpmIdle) {
         if (error) *error = fmt("目标转速上限 %.1f 不合理，已拒绝写入", (double)values.rpmLimit);
         return false;
     }
     if (!std::isfinite(values.rpmLimitNeutral) || values.rpmLimitNeutral < kMinWriteRpm ||
-        values.rpmLimitNeutral > kMaxWriteRpm) {
+        values.rpmLimitNeutral > (selectedGame() == GameId::Ats ? 10000.0f : kMaxWriteRpm)) {
         if (error) {
             *error = fmt("目标空挡转速上限 %.1f 不合理，已拒绝写入",
                          (double)values.rpmLimitNeutral);
