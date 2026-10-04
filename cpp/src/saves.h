@@ -13,6 +13,7 @@ struct SaveSlot {
     std::wstring gameSii;
     std::wstring profileName;
     std::wstring slotName;
+    std::string  displayName;
     bool         cloud = false;
     uint64_t     mtime = 0;      // Unix 秒
     uint64_t     size = 0;
@@ -44,17 +45,18 @@ struct BackupInfo {
     std::wstring profile;
     std::wstring slot;
     std::wstring label;
+    std::wstring game;          // 备份所属游戏（ets2/ats）；空 = 历史欧卡2 备份
     std::wstring originalDir;
     std::vector<std::wstring> files;
 };
 
 // ---------- 路径 ----------
-std::wstring documentsDir();                              // 文档\Euro Truck Simulator 2
+std::wstring documentsDir();                              // 文档\（当前选择游戏的目录）
 std::wstring steamInstallDir();                           // Steam 安装目录
 std::vector<std::wstring> cloudProfileDirs();             // 云存档 profiles 目录
 std::vector<SaveSlot>     listSlots();
 std::wstring              applicationDir();                // 当前可执行文件所在目录
-std::wstring              backupRoot();                   // 修改器目录\backups
+std::wstring              backupRoot();                   // 修改器目录\backups（美卡在 \ats 子目录）
 
 // ---------- 文件 ----------
 bool readFileBytes(const std::wstring& path, std::vector<uint8_t>& out);
@@ -63,9 +65,9 @@ bool writeFileBytes(const std::wstring& path, const std::vector<uint8_t>& data);
 // ---------- 解密 ----------
 std::string detectFormat(const std::vector<uint8_t>& data);
 bool        decryptSave(const std::wstring& path, std::vector<uint8_t>& inner,
-                        DecryptInfo* info, std::string* err);
+                        DecryptInfo* info, std::string* err, size_t maxInnerBytes = 0);
 bool        inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out,
-                       std::string* err);
+                       std::string* err, size_t maxOutputBytes = 0);
 bool        exportDecrypted(const SaveSlot& slot, const std::wstring& outPath,
                             DecryptInfo* info, std::string* err);
 

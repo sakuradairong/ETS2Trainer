@@ -1,5 +1,8 @@
 // saves.cpp —— 存档处理实现
 #include "saves.h"
+#include "savecopy.h"
+
+#include "gameplay.h"
 
 #include <bcrypt.h>
 #include <shlobj.h>
@@ -8,7 +11,9 @@
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <io.h>
+#include <share.h>
 #include <ctime>
 #include <map>
 #include <set>
@@ -20,6 +25,34 @@ namespace ets2 {
 namespace {
 
 //: ScsC 使用的固定 AES-256 密钥
+
+// 路径归属比较：统一分隔符与大小写，并要求目录边界（避免 "ETS2Other" 误判归入 "ETS2"）。
+std::wstring normalizePathForCompare(const std::wstring& path) {
+    if (path.empty()) return {};
+    const DWORD required = ::GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (!required) return {};
+    std::vector<wchar_t> absolute(required);
+    const DWORD length = ::GetFullPathNameW(path.c_str(), required, absolute.data(), nullptr);
+    if (!length || length >= required) return {};
+    std::wstring out;
+    out.reserve(length);
+    for (wchar_t c : std::wstring(absolute.data(), length)) {
+        if (c == L'/') c = L'\\';
+        if (c >= L'A' && c <= L'Z') c = (wchar_t)(c - L'A' + L'a');
+        out.push_back(c);
+    }
+    while (out.size() > 3 && out.back() == L'\\') out.pop_back();
+    return out;
+}
+
+bool pathWithinDir(const std::wstring& child, const std::wstring& dir) {
+    if (child.empty() || dir.empty()) return false;
+    const std::wstring c = normalizePathForCompare(child);
+    const std::wstring d = normalizePathForCompare(dir);
+    if (c.empty() || d.empty() || c.size() < d.size()) return false;
+    if (c.compare(0, d.size(), d) != 0) return false;
+    return c.size() == d.size() || c[d.size()] == L'\\';
+}
 const uint8_t kSiiKey[32] = {0x2a, 0x5f, 0xcb, 0x17, 0x91, 0xd2, 0x2f, 0xb6, 0x02, 0x45, 0xb3,
                              0xd8, 0x36, 0x9e, 0xd0, 0xb2, 0xc2, 0x73, 0x71, 0x56, 0x3f, 0xbf,
                              0x1f, 0x3c, 0x9e, 0xdf, 0x6b, 0x11, 0x82, 0x5a, 0x5d, 0x0a};
@@ -107,7 +140,7 @@ void buildFixedLengths(std::vector<uint8_t>& lit, std::vector<uint8_t>& dist) {
 }
 
 bool inflateBlockData(BitReader& br, const Huffman& lenH, const Huffman& distH,
-                      std::vector<uint8_t>& out, std::string* err) {
+                      std::vector<uint8_t>& out, std::string* err, size_t limit) {
     for (;;) {
         int sym = lenH.decode(br);
         if (sym < 0) {
@@ -115,6 +148,7 @@ bool inflateBlockData(BitReader& br, const Huffman& lenH, const Huffman& distH,
             return false;
         }
         if (sym < 256) {
+            if (limit && out.size() >= limit) { if (err) *err = "解压结果超过长度上限"; return false; }
             out.push_back((uint8_t)sym);
             continue;
         }
@@ -136,18 +170,19 @@ bool inflateBlockData(BitReader& br, const Huffman& lenH, const Huffman& distH,
             return false;
         }
         size_t start = out.size() - distance;
+        if (limit && length > limit - out.size()) { if (err) *err = "解压结果超过长度上限"; return false; }
         for (size_t i = 0; i < length; ++i) out.push_back(out[start + i]);
     }
 }
 
 }  // namespace
 
-bool inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out, std::string* err) {
+bool inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out, std::string* err, size_t limit) {
     BitReader br;
     br.p = in;
     br.size = inSize;
     out.clear();
-    out.reserve(inSize * 4 + 64);
+    out.reserve(limit ? (std::min)(limit, inSize * 4 + 64) : inSize * 4 + 64);
 
     std::vector<uint8_t> fixedLit, fixedDist;
     buildFixedLengths(fixedLit, fixedDist);
@@ -166,15 +201,21 @@ bool inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out, std
                 return false;
             }
             uint16_t len = (uint16_t)(in[br.pos] | (in[br.pos + 1] << 8));
+            uint16_t nlen = (uint16_t)(in[br.pos + 2] | (in[br.pos + 3] << 8));
             br.pos += 4;
+            if ((uint16_t)(len ^ 0xFFFF) != nlen) {
+                if (err) *err = "解压失败：存储块 NLEN 校验失败";
+                return false;
+            }
             if (br.pos + len > br.size) {
                 if (err) *err = "解压失败：存储块数据不完整";
                 return false;
             }
+            if (limit && len > limit - out.size()) { if (err) *err = "解压结果超过长度上限"; return false; }
             out.insert(out.end(), in + br.pos, in + br.pos + len);
             br.pos += len;
         } else if (type == 1) {
-            if (!inflateBlockData(br, fixedLenH, fixedDistH, out, err)) return false;
+            if (!inflateBlockData(br, fixedLenH, fixedDistH, out, err, limit)) return false;
         } else if (type == 2) {
             int hlit = (int)br.bits(5) + 257;
             int hdist = (int)br.bits(5) + 1;
@@ -214,7 +255,7 @@ bool inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out, std
             Huffman lenH, distH;
             lenH.build(lengths.data(), hlit);
             distH.build(lengths.data() + hlit, hdist);
-            if (!inflateBlockData(br, lenH, distH, out, err)) return false;
+            if (!inflateBlockData(br, lenH, distH, out, err, limit)) return false;
         } else {
             if (err) *err = "解压失败：未知块类型";
             return false;
@@ -223,6 +264,12 @@ bool inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out, std
             if (err) *err = "解压失败：数据提前结束";
             return false;
         }
+    }
+    // BitReader reads only the bytes needed for each symbol. Unused bits in
+    // the final byte are legal padding; unread whole bytes are not part of this stream.
+    if (br.pos != br.size) {
+        if (err) *err = "解压失败：压缩流结束后存在多余数据";
+        return false;
     }
     return true;
 }
@@ -295,6 +342,64 @@ private:
 
 }  // namespace
 
+namespace {
+
+constexpr size_t kMaxEncryptedInputBytes = 128ull * 1024 * 1024;
+constexpr size_t kMaxDecodedOutputBytes = 512ull * 1024 * 1024;
+
+uint32_t adler32Of(const uint8_t* data, size_t size) {
+    uint32_t a = 1, b = 0;
+    size_t i = 0;
+    while (i < size) {
+        const size_t stop = (std::min)(size, i + 5552);
+        for (; i < stop; ++i) {
+            a += data[i];
+            b += a;
+        }
+        a %= 65521u;
+        b %= 65521u;
+    }
+    return (b << 16) | a;
+}
+
+// 单句柄精确读取：拒绝并发写/删除，先取大小再按需分配，避免无界读取与截断读取。
+bool readSaveFileBounded(const std::wstring& path, std::vector<uint8_t>& out, std::string* err) {
+    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (err) *err = "打开存档文件失败（文件不存在或被占用）";
+        return false;
+    }
+    LARGE_INTEGER size{};
+    if (!::GetFileSizeEx(file, &size) || size.QuadPart < 0) {
+        ::CloseHandle(file);
+        if (err) *err = "读取存档文件大小失败";
+        return false;
+    }
+    if ((uint64_t)size.QuadPart > kMaxEncryptedInputBytes) {
+        ::CloseHandle(file);
+        if (err) *err = "存档文件超过输入上限（128MiB）";
+        return false;
+    }
+    out.assign((size_t)size.QuadPart, 0);
+    size_t offset = 0;
+    while (offset < out.size()) {
+        const DWORD want = (DWORD)(std::min)((size_t)0x10000000u, out.size() - offset);
+        DWORD got = 0;
+        if (!::ReadFile(file, out.data() + offset, want, &got, nullptr) || got == 0) {
+            ::CloseHandle(file);
+            out.clear();
+            if (err) *err = "读取存档文件失败（数据不完整）";
+            return false;
+        }
+        offset += got;
+    }
+    ::CloseHandle(file);
+    return true;
+}
+
+}  // namespace
+
 std::string detectFormat(const std::vector<uint8_t>& data) {
     if (data.size() >= 4) {
         if (::memcmp(data.data(), "ScsC", 4) == 0) return "scs";
@@ -307,8 +412,11 @@ std::string detectFormat(const std::vector<uint8_t>& data) {
 }
 
 bool readFileBytes(const std::wstring& path, std::vector<uint8_t>& out) {
-    FILE* fp = nullptr;
-    if (_wfopen_s(&fp, path.c_str(), L"rb") != 0 || !fp) return false;
+    // Logs may still have an active writer; this function only reads a bounded snapshot.
+    // The CRT supplies _wfsopen (no _wfsopen_s counterpart); path and mode are fixed inputs.
+#pragma warning(suppress: 4996)
+    FILE* fp = ::_wfsopen(path.c_str(), L"rb", _SH_DENYNO);
+    if (!fp) return false;
     fseek(fp, 0, SEEK_END);
     long long size = _ftelli64(fp);
     fseek(fp, 0, SEEK_SET);
@@ -351,22 +459,37 @@ bool writeFileBytes(const std::wstring& path, const std::vector<uint8_t>& data) 
 }
 
 bool decryptSave(const std::wstring& path, std::vector<uint8_t>& inner, DecryptInfo* info,
-                 std::string* err) {
+                 std::string* err, size_t maxInnerBytes) {
+    if (err) err->clear();
+    inner.clear();
+    if (info) *info = DecryptInfo{};
+    const size_t outCap = maxInnerBytes ? (std::min)(maxInnerBytes, kMaxDecodedOutputBytes)
+                                        : kMaxDecodedOutputBytes;
     std::vector<uint8_t> raw;
-    if (!readFileBytes(path, raw)) {
-        if (err) *err = "读取存档文件失败";
+    if (!readSaveFileBounded(path, raw, err)) return false;
+    if (raw.empty()) {
+        if (err) *err = "存档文件为空";
         return false;
     }
-    DecryptInfo local;
-    local.innerFormat = detectFormat(raw);
-    local.innerSize = raw.size();
-    if (local.innerFormat != "scs") {  // 已经是明文/二进制
+    DecryptInfo local{};
+    const std::string outer = detectFormat(raw);
+    if (outer != "scs") {  // 非 ScsC：只接受已识别的明文格式
+        if (outer == "unknown") {
+            if (err) *err = "未知存档格式（既不是 ScsC 密文也不属于已知明文格式）";
+            return false;
+        }
+        if (raw.size() > outCap) {
+            if (err) *err = "明文超过输出长度上限";
+            return false;
+        }
+        local.innerFormat = outer;
+        local.innerSize = raw.size();
         inner = std::move(raw);
         if (info) *info = local;
         return true;
     }
     if (raw.size() < 56) {
-        if (err) *err = "ScsC 文件过短";
+        if (err) *err = "ScsC 文件过短（缺少 56 字节头）";
         return false;
     }
     local.encrypted = true;
@@ -374,9 +497,16 @@ bool decryptSave(const std::wstring& path, std::vector<uint8_t>& inner, DecryptI
     for (int i = 0; i < 4; ++i) {
         local.declaredSize |= (uint64_t)raw[52 + (size_t)i] << (8 * i);
     }
+    if (local.declaredSize > outCap) {
+        if (err) *err = "ScsC 声明明文长度超过输出上限";
+        return false;
+    }
     const uint8_t* iv = raw.data() + 36;
-    size_t cipherSize = raw.size() - 56;
-    cipherSize -= cipherSize % 16;
+    const size_t cipherSize = raw.size() - 56;
+    if (cipherSize == 0 || (cipherSize % 16) != 0) {
+        if (err) *err = "密文长度不是 16 的倍数（密文被截断或补齐异常）";
+        return false;
+    }
     AesCbc aes;
     std::string aesErr;
     if (!aes.open(&aesErr)) {
@@ -386,26 +516,82 @@ bool decryptSave(const std::wstring& path, std::vector<uint8_t>& inner, DecryptI
     std::vector<uint8_t> payload;
     if (!aes.decrypt(iv, raw.data() + 56, cipherSize, payload, err)) return false;
     aes.close();
-    // 去掉 PKCS7 填充
-    if (!payload.empty()) {
-        uint8_t pad = payload.back();
-        if (pad > 0 && pad <= 16 && (size_t)pad <= payload.size()) {
-            payload.resize(payload.size() - pad);
+    // PKCS7：每个填充字节都必须等于填充长度。
+    if (payload.empty()) {
+        if (err) *err = "密文解密结果为空（PKCS7 填充无效）";
+        return false;
+    }
+    const uint8_t pad = payload.back();
+    if (pad < 1 || pad > 16 || (size_t)pad > payload.size()) {
+        if (err) *err = "PKCS7 填充长度无效";
+        return false;
+    }
+    for (size_t i = payload.size() - (size_t)pad; i < payload.size(); ++i) {
+        if (payload[i] != pad) {
+            if (err) *err = "PKCS7 填充字节不一致";
+            return false;
         }
     }
+    payload.resize(payload.size() - (size_t)pad);
     local.payloadSize = payload.size();
-    // zlib 头 0x78 -> 解压
-    if (!payload.empty() && payload[0] == 0x78) {
+    // zlib 候选：CM 为 deflate(8) 或首个字节为已知的 0x78。
+    const bool zlibCandidate =
+        payload.size() >= 2 && ((payload[0] & 0x0Fu) == 0x08u || payload[0] == 0x78u);
+    if (zlibCandidate) {
+        if (payload.size() < 6) {
+            if (err) *err = "zlib 数据截断（缺少头部或 Adler32 尾）";
+            return false;
+        }
+        const uint8_t cmf = payload[0];
+        const uint8_t flg = payload[1];
+        if ((cmf & 0x0Fu) != 0x08u) {
+            if (err) *err = "zlib 头 CM 不是 deflate(8)";
+            return false;
+        }
+        if (((cmf >> 4) & 0x0Fu) > 7u) {
+            if (err) *err = "zlib 头 CINFO 超出 32K 窗口";
+            return false;
+        }
+        if ((((uint32_t)cmf << 8) | flg) % 31u != 0u) {
+            if (err) *err = "zlib 头 FCHECK 校验失败";
+            return false;
+        }
+        if ((flg & 0x20u) != 0u) {
+            if (err) *err = "zlib 头 FDICT 预置字典不受支持";
+            return false;
+        }
         std::vector<uint8_t> plain;
         std::string zerr;
-        if (!inflateRaw(payload.data() + 2, payload.size() - 2, plain, &zerr)) {
-            if (err) *err = zerr;
+        if (!inflateRaw(payload.data() + 2, payload.size() - 6, plain, &zerr, outCap)) {
+            if (err) *err = zerr.empty() ? std::string("zlib 解压失败") : zerr;
+            return false;
+        }
+        const uint8_t* tail = payload.data() + payload.size() - 4;
+        const uint32_t expected = ((uint32_t)tail[0] << 24) | ((uint32_t)tail[1] << 16) |
+                                  ((uint32_t)tail[2] << 8) | (uint32_t)tail[3];
+        if (adler32Of(plain.data(), plain.size()) != expected) {
+            if (err) *err = "zlib Adler32 校验不匹配（明文已损坏）";
             return false;
         }
         payload = std::move(plain);
         local.compressed = true;
+    } else if (detectFormat(payload) == "unknown") {
+        if (err) *err = "解密后格式无法识别（既非已知明文也非 zlib）";
+        return false;
+    }
+    if (payload.size() > outCap) {
+        if (err) *err = "解密内容超过输出长度上限";
+        return false;
+    }
+    if ((uint64_t)payload.size() != local.declaredSize) {
+        if (err) *err = "明文长度与 ScsC 声明长度不一致";
+        return false;
     }
     local.innerFormat = detectFormat(payload);
+    if (local.innerFormat != "text" && local.innerFormat != "bsii" && local.innerFormat != "3nk") {
+        if (err) *err = "解密后内容不是已知明文格式（text/bsii/3nk）";
+        return false;
+    }
     local.innerSize = payload.size();
     inner = std::move(payload);
     if (info) *info = local;
@@ -415,12 +601,68 @@ bool decryptSave(const std::wstring& path, std::vector<uint8_t>& inner, DecryptI
 bool exportDecrypted(const SaveSlot& slot, const std::wstring& outPath, DecryptInfo* info,
                      std::string* err) {
     std::vector<uint8_t> inner;
-    if (!decryptSave(slot.gameSii, inner, info, err)) return false;
-    if (!writeFileBytes(outPath, inner)) {
-        if (err) *err = "写入导出文件失败";
+    if (!decryptSave(slot.gameSii, inner, info, err)) {
+        if (err && err->empty()) *err = "读取或解密存档失败";
         return false;
     }
-    return true;
+    // 导出采用“先写唯一临时文件、再以不覆盖方式发布”的语义：
+    // 目标已存在（含并发竞态）一律失败且原样保留，绝不覆盖已有导出。
+    const size_t slash = outPath.find_last_of(L"\\/");
+    if (slash == std::wstring::npos || slash + 1 >= outPath.size()) {
+        if (info) *info = DecryptInfo{};
+        if (err) *err = "导出路径无效（缺少文件名）";
+        return false;
+    }
+    const std::wstring dir = outPath.substr(0, slash);
+    if (::GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (info) *info = DecryptInfo{};
+        if (err) {
+            const DWORD attr = ::GetFileAttributesW(outPath.c_str());
+            *err = (attr & FILE_ATTRIBUTE_DIRECTORY) ? "导出目标已存在且是目录" : "导出目标已存在，未覆盖";
+        }
+        return false;
+    }
+    for (int attempt = 0; attempt < 16; ++attempt) {
+        std::wstring temp = dir + L"\\~ets2export_" + std::to_wstring(::GetCurrentProcessId()) +
+                            L"_" + std::to_wstring(::GetTickCount64()) + L"_" +
+                            std::to_wstring(attempt) + L".tmp";
+        HANDLE h = ::CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) continue;
+        bool ok = false;
+        do {
+            const uint8_t* ptr = inner.data();
+            size_t remaining = inner.size();
+            bool wrote = true;
+            while (remaining > 0) {
+                DWORD chunk = (remaining > 0x40000000u) ? 0x40000000u : (DWORD)remaining;
+                DWORD written = 0;
+                if (!::WriteFile(h, ptr, chunk, &written, nullptr) || written != chunk) { wrote = false; break; }
+                ptr += written; remaining -= written;
+            }
+            if (!wrote || (!inner.empty() && !::FlushFileBuffers(h))) break;
+            ok = true;
+        } while (false);
+        ::CloseHandle(h);
+        if (!ok) {
+            ::DeleteFileW(temp.c_str());
+            if (info) *info = DecryptInfo{};
+            if (err) *err = "写入导出文件失败";
+            return false;
+        }
+        // 不覆盖发布：目标若在竞态中被创建，MoveFileExW 失败且临时文件被清理。
+        if (::MoveFileExW(temp.c_str(), outPath.c_str(), MOVEFILE_WRITE_THROUGH)) return true;
+        ::DeleteFileW(temp.c_str());
+        if (::GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (info) *info = DecryptInfo{};
+            if (err) *err = "导出目标已存在，未覆盖";
+            return false;
+        }
+        // 与异常目标竞争，换一个临时名重试；用尽后按写入失败处理。
+    }
+    if (info) *info = DecryptInfo{};
+    if (err) *err = "写入导出文件失败";
+    return false;
 }
 
 // ======================= 路径与存档定位 =======================
@@ -532,8 +774,13 @@ std::wstring documentsDir() {
             base = std::wstring(buf) + L"\\Documents";
         }
     }
-    std::wstring candidates[] = {base + L"\\Euro Truck Simulator 2",
-                                 base + L"\\OneDrive\\Documents\\Euro Truck Simulator 2"};
+    // 目录名按当前选择的游戏解析（欧卡2 / 美卡），选错游戏不会读错存档。
+    std::wstring subdir;
+    for (const char* p = selectedGameDescriptor().documentsSubdir; p && *p; ++p) {
+        subdir.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+    }
+    std::wstring candidates[] = {base + L"\\" + subdir,
+                                 base + L"\\OneDrive\\Documents\\" + subdir};
     for (const auto& c : candidates) {
         if (isDir(c)) return c;
     }
@@ -567,9 +814,13 @@ std::vector<std::wstring> cloudProfileDirs() {
     std::vector<std::wstring> out;
     std::wstring steam = steamInstallDir();
     if (steam.empty()) return out;
+    std::wstring appId;
+    for (const char* p = selectedGameDescriptor().steamAppId; p && *p; ++p) {
+        appId.push_back(static_cast<wchar_t>(static_cast<unsigned char>(*p)));
+    }
     std::wstring userdata = steam + L"\\userdata";
     for (const auto& user : listDirs(userdata)) {
-        std::wstring profiles = userdata + L"\\" + user + L"\\227300\\remote\\profiles";
+        std::wstring profiles = userdata + L"\\" + user + L"\\" + appId + L"\\remote\\profiles";
         if (isDir(profiles)) out.push_back(profiles);
     }
     return out;
@@ -577,7 +828,13 @@ std::vector<std::wstring> cloudProfileDirs() {
 
 std::wstring applicationDir() { return exeDir(); }
 
-std::wstring backupRoot() { return applicationDir() + L"\\backups"; }
+std::wstring backupRoot() {
+    // 欧卡2 沿用历史目录（保留既有备份可恢复）；美卡单独子目录，
+    // 备份列表/恢复因此不会跨游戏串档。
+    const std::wstring base = applicationDir() + L"\\backups";
+    if (selectedGame() == GameId::Ets2) return base;
+    return base + L"\\ats";
+}
 
 std::vector<SaveSlot> listSlots() {
     std::vector<SaveSlot> slots;
@@ -617,6 +874,7 @@ std::vector<SaveSlot> listSlots() {
                     slot.format = "unknown";
                 }
                 slot.formatText = describeFormat(slot.format);
+                slot.displayName = readSaveDisplayName(slot);
                 slot.label = makeLabel(slot);
                 slots.push_back(std::move(slot));
             }
@@ -925,6 +1183,25 @@ std::wstring backupSlot(const SaveSlot& slot, const char* label, std::string* er
         if (err) *err = "创建唯一备份目录失败";
         return L"";
     }
+    if (!ensureDirRecursive(dir)) {
+        if (err) *err = "创建备份目录失败";
+        return L"";
+    }
+    // 先创建目录，再写游戏标签，避免每次首次备份都因目录不存在而失败。
+    {
+        const std::string tag = std::string("game=") + gameKey(selectedGame()) + "\n";
+        FILE* f = nullptr;
+        ::_wfopen_s(&f, (dir + L"\\game.tag").c_str(), L"wb");
+        bool tagOk = false;
+        if (f) {
+            tagOk = (std::fwrite(tag.data(), 1, tag.size(), f) == tag.size());
+            std::fclose(f);
+        }
+        if (!tagOk) {
+            if (err) *err = "备份失败：无法写入游戏标签，已中止（避免产生无归属备份）";
+            return L"";
+        }
+    }
     std::wstring filesDir = dir + L"\\files";
     if (!ensureDirRecursive(filesDir)) {
         if (err) *err = "创建备份子目录失败";
@@ -986,6 +1263,13 @@ std::vector<BackupInfo> listBackups() {
         info.label = U2W(iniValue(ini, "label"));
         info.originalDir = U2W(iniValue(ini, "original"));
         info.files = splitSemi(iniValue(ini, "files"));
+        {
+            std::vector<uint8_t> tagBytes;
+            if (readFileBytes(dir + L"\\game.tag", tagBytes)) {
+                const std::string tag(tagBytes.begin(), tagBytes.end());
+                info.game = U2W(trim(iniValue(tag, "game")));
+            }
+        }
         out.push_back(std::move(info));
     }
     // 目录名以时间戳开头，倒序即最新在前
@@ -995,6 +1279,34 @@ std::vector<BackupInfo> listBackups() {
 }
 
 bool restoreBackup(const BackupInfo& info, std::string* err) {
+    // 备份按游戏隔离：标签缺失视为历史欧卡2 备份（仅欧卡2 可恢复）。
+    const std::wstring backupGame = info.game.empty() ? std::wstring(L"ets2") : info.game;
+    const std::wstring currentGame = U2W(gameKey(selectedGame()));
+    if (backupGame != currentGame) {
+        if (err) {
+            *err = fmt("该备份属于%s，当前选择的是%s，已拒绝恢复（备份按游戏隔离）",
+                       backupGame == L"ets2" ? "欧卡2" : "美卡",
+                       selectedGameDescriptor().shortName);
+        }
+        return false;
+    }
+    // 来源必须是当前游戏的文档目录或它的云存档 profiles 目录
+    // （大小写不敏感 + 目录边界；合法 case 变体与云存档都不会被误拒）。
+    if (!info.originalDir.empty()) {
+        bool underGameRoot = pathWithinDir(info.originalDir, documentsDir());
+        if (!underGameRoot) {
+            for (const auto& cloud : cloudProfileDirs()) {
+                if (pathWithinDir(info.originalDir, cloud)) {
+                    underGameRoot = true;
+                    break;
+                }
+            }
+        }
+        if (!underGameRoot) {
+            if (err) *err = "该备份的来源路径不属于当前游戏（文档或云存档），已拒绝恢复";
+            return false;
+        }
+    }
     if (!isDir(info.filesDir)) {
         if (err) *err = "备份文件目录不存在";
         return false;
