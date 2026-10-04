@@ -4,12 +4,17 @@
 #include "economytest.h"
 #include "engine.h"
 #include "enginetest.h"
+#include "savecopytest.h"
+#include "trucktransfertest.h"
+#include "profilesplittest.h"
+#include "bsiitest.h"
 #include "gameio.h"
 #include "memory.h"
 #include "saves.h"
 #include "telemetry.h"
 #include "ui.h"
-#include "vehicletest.h"
+#include "gameplay.h"
+#include "layout.h"
 
 #include <bcrypt.h>
 #include <d3d11.h>
@@ -25,6 +30,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <unordered_set>
@@ -402,81 +408,72 @@ int runCrossTest(const std::wstring& outPath) {
 
 //: 真实游戏只读实测：只读固定版本指纹、4 级车辆指针链与遥测，不遍历游戏堆。
 int runLiveTest(const std::wstring& outPath) {
+    g_report.clear();
+    const auto& game = selectedGameDescriptor();
+    note(fmt("=== %s 只读诊断（PID %u；不申请写入权限） ===", game.shortName, ::GetCurrentProcessId()));
     DWORD pid = 0;
     std::wstring exe;
-    note("=== 真实欧卡2 只读实测 ===");
-    if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
-        note("游戏没在运行（请先启动游戏再执行本测试）");
-    } else {
-        note(fmt("找到 %s (PID %u)", W2U(exe).c_str(), pid));
-        ProcessMemory mem;
-        std::string err;
-        if (!mem.open(pid, W2U(exe), &err)) {
-            note("附加失败: " + err);
-        } else {
-            std::vector<std::wstring> mp = detectMultiplayer(pid);
-            MultiplayerStatus mpStatus = checkMultiplayer(pid, true);
-            note("联机检测：" + mpStatus.detail +
-                 (mpStatus.blocksWrite() ? "（写入会被拒绝）" : "（允许写入）"));
-            note(fmt("游戏窗口：hwnd=0x%llX", (unsigned long long)findGameWindow(pid)));
-            std::vector<Region> regions = mem.regions();
-            uint64_t total = 0, lowTotal = 0;
-            int lowCount = 0;
-            for (const auto& r : regions) {
-                total += r.size;
-                if (r.base < 0x100000000ull) {
-                    lowTotal += r.size;
-                    ++lowCount;
-                }
+    const bool found = findProcess(selectedProcessName(), &pid, &exe);
+    note(found ? fmt("找到 %s (PID %u)", W2U(exe).c_str(), pid)
+               : "目标游戏没有运行");
+    // Telemetry is independent of process attachment and remains useful when process access is denied.
+    TelemetrySnapshot telemetry;
+    std::string error;
+    const bool telemetryOk = readTelemetry(&telemetry, &error);
+    note(telemetryOk
+        ? fmt("遥测通过：game=%u revision=%u fuel=%.2f/%.2f L wear=%.5f/%.5f/%.5f/%.5f/%.5f",
+              telemetry.game, telemetry.pluginRevision, telemetry.fuel, telemetry.fuelCapacity,
+              telemetry.wear[0], telemetry.wear[1], telemetry.wear[2], telemetry.wear[3], telemetry.wear[4])
+        : "遥测不可用：" + error);
+    bool opened = false, layoutOk = !game.verifiedLayouts;
+    if (found) {
+        ProcessMemory memory;
+        opened = memory.openReadOnly(pid, W2U(exe), &error);
+        note(opened ? "只读进程句柄已打开：禁止写入 API" : "只读附加失败：" + error);
+        const auto mp = checkMultiplayer(pid, true);
+        note("联机状态：" + mp.detail);
+        if (!game.verifiedLayouts) {
+            note("固定布局检查跳过：美卡尚未验证，不尝试欧卡偏移。通用扫描/存档/控制台仍可用。");
+        } else if (opened && telemetryOk) {
+            VehicleLocker vehicle;
+            VehicleAddresses addresses;
+            layoutOk = vehicle.bind(&memory, pid, &error) && vehicle.probe(&addresses, &telemetry, &error);
+            note(layoutOk ? "当前游戏车辆指针及遥测交叉验证通过" : "当前游戏布局校验失败：" + error);
+            if (layoutOk) {
+                EngineTarget target;
+                const bool engineOk = locateEngineTarget(memory, addresses.context, &target, &error);
+                note(engineOk ? fmt("发动机只读核对：唯一匹配 %d，扭矩 %.1f N·m，转速 %.0f/%.0f", target.engineMatches, target.torque, target.rpmLimit, target.rpmLimitNeutral) : "发动机核对失败：" + error);
+                layoutOk = layoutOk && engineOk;
             }
-            note(fmt("可写内存：%d 个区域 / %s（已跳过超大区与非缓存内存）", (int)regions.size(),
-                     formatSize(total).c_str()));
-            note(fmt("低地址(<4GB)游戏池：%d 个区域 / %s（仅统计，未读取）", lowCount,
-                     formatSize(lowTotal).c_str()));
-            TelemetrySnapshot telemetry;
-            std::string telemetryError;
-            if (readTelemetry(&telemetry, &telemetryError)) {
-                note(fmt("遥测：fuel %.2f / %.2f L，wear %.5f/%.5f/%.5f/%.5f/%.5f",
-                         telemetry.fuel, telemetry.fuelCapacity, telemetry.wear[0],
-                         telemetry.wear[1], telemetry.wear[2], telemetry.wear[3],
-                         telemetry.wear[4]));
-                VehicleLocker vehicle;
-                uint64_t started = ::GetTickCount64();
-                if (vehicle.bind(&mem, pid, &telemetryError)) {
-                    VehicleAddresses addresses;
-                    if (vehicle.probe(&addresses, &telemetry, &telemetryError)) {
-                        note(fmt("车辆固定指针链校验通过：truck=%s / %.0f 毫秒",
-                                 hexAddr(addresses.truck).c_str(),
-                                 (double)(::GetTickCount64() - started)));
-                    } else {
-                        note("车辆固定指针链未通过安全校验: " + telemetryError);
-                    }
-                } else {
-                    note("车辆版本指纹未通过: " + telemetryError);
-                }
-            } else {
-                note("遥测不可用: " + telemetryError);
-            }
-            note("全程只读，没有写入任何数据。");
-        }
-    }
-    std::string text;
-    for (const auto& line : g_report) {
-        text += line;
-        text += "\r\n";
-    }
-    writeFileBytes(outPath, std::vector<uint8_t>(text.begin(), text.end()));
-    if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
-        HANDLE h = ::GetStdHandle(STD_OUTPUT_HANDLE);
-        if (h && h != INVALID_HANDLE_VALUE) {
-            for (const auto& line : g_report) {
-                std::string msg = line + "\r\n";
-                DWORD written = 0;
-                ::WriteConsoleA(h, msg.c_str(), (DWORD)msg.size(), &written, nullptr);
+            if (opened && selectedGame() == GameId::Ats) {
+                uint64_t base = 0;
+                if (verifyGameLayout(memory, &base, &error)) {
+                    ScanSession scan(memory, VType::UInt64, 8);
+                    ScanOptions opt;
+                    scan.firstScan(static_cast<double>(base + layoutProfile(GameId::Ats).bankVtableRva), opt, nullptr, nullptr);
+                    std::vector<uint64_t> fields = scan.addresses();
+                    for (auto& address : fields) address += ats_economy_offsets::kMoney;
+                    const auto bank = pickBestBankCandidate(memory, fields, 4096);
+                    bool economyOk = false;
+                    if (bank.unique) {
+                        ScanSession refs(memory, VType::UInt64, 8);
+                        refs.firstScan(static_cast<double>(bank.object), opt, nullptr, nullptr);
+                        const auto economy = pickBestEconomyFromBankRefs(memory, refs.addresses(), bank.object, 4096);
+                        economyOk = economy.unique;
+                        note(fmt("银行只读核对：金额 %lld；经济对象唯一=%d，经验 %lld", static_cast<long long>(bank.value), economy.unique ? 1 : 0, static_cast<long long>(economy.value)));
+                    } else note("银行对象不是唯一有效候选，拒绝自动写入");
+                    layoutOk = layoutOk && bank.unique && economyOk;
+                } else layoutOk = false;
             }
         }
     }
-    return 0;
+    const bool ok = found && opened && telemetryOk && layoutOk;
+    note(ok ? "只读诊断通过；未验证任何写入功能。" : "只读诊断未通过，请按上述具体原因处理。");
+    note("全程未向游戏或遥测共享内存写入。");
+    std::string report;
+    for (const auto& line : g_report) report += line + "\r\n";
+    const bool saved = writeFileBytes(outPath, {report.begin(), report.end()});
+    return saved && ok ? 0 : 1;
 }
 
 //: 发动机 / 变速箱数据只读定位诊断：有界指针遍历 + 字段签名校验，全程不写入。
@@ -485,7 +482,7 @@ int runEngineProbeTest(const std::wstring& outPath) {
     note("=== 发动机数据只读定位（有界指针遍历，不扫描内存） ===");
     DWORD pid = 0;
     std::wstring exe;
-    if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+    if (!findProcess(selectedProcessName(), &pid, &exe)) {
         note("游戏没在运行（请先启动游戏并进入驾驶界面）");
     } else {
         note(fmt("找到 %s (PID %u)", W2U(exe).c_str(), pid));
@@ -703,7 +700,7 @@ int runPowerTest(const std::wstring& outPath) {
     note("=== 发动机动力调节验证（写入后立即恢复原值） ===");
     DWORD pid = 0;
     std::wstring exe;
-    if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+    if (!findProcess(selectedProcessName(), &pid, &exe)) {
         note("游戏没在运行（请先启动游戏并进入驾驶界面）");
     } else {
         note(fmt("找到 %s (PID %u)", W2U(exe).c_str(), pid));
@@ -838,7 +835,7 @@ int runFieldProbe(const std::wstring& outPath) {
     note("=== 附加字段只读探查（变速箱传动比 / 发动机曲线）===");
     DWORD pid = 0;
     std::wstring exe;
-    if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+    if (!findProcess(selectedProcessName(), &pid, &exe)) {
         note("游戏没在运行");
     } else {
         ProcessMemory mem;
@@ -1016,7 +1013,7 @@ int runFlyCheck(const std::wstring& outPath) {
     }
     DWORD pid = 0;
     std::wstring exe;
-    if (findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+    if (findProcess(selectedProcessName(), &pid, &exe)) {
         note("游戏正在运行：写入 config.cfg 会被游戏退出时覆盖，请先完全退出游戏。");
     } else {
         note("游戏未运行：现在可以安全写入 config.cfg。");
@@ -1091,7 +1088,7 @@ int runConvoyCheck(const std::wstring& outPath) {
     note("=== 联运模式只读检查 ===");
     DWORD pid = 0;
     std::wstring exe;
-    const bool running = findProcess(L"eurotrucks2.exe", &pid, &exe);
+    const bool running = findProcess(selectedProcessName(), &pid, &exe);
     MultiplayerStatus status = checkMultiplayer(pid, true);
     note("联机判定：" + status.detail +
          (status.blocksWrite() ? "（写入会被拒绝）" : "（允许写入）"));
@@ -1142,7 +1139,7 @@ int runAutoLocateTest(const std::wstring& outPath) {
                  telemetry.wear[1], telemetry.wear[2], telemetry.wear[3], telemetry.wear[4]));
         DWORD pid = 0;
         std::wstring exe;
-        if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+        if (!findProcess(selectedProcessName(), &pid, &exe)) {
             note("游戏进程未运行");
         } else {
             enableDebugPrivilege();
@@ -1293,6 +1290,408 @@ int runParseTest() {
 }
 
 // 自检：无界面；只对自身进程读写，对存档只读（明文测试在临时副本上进行）
+// 离线合成回归：不探测真实进程/存档/配置/备份环境，只验证游戏选择与路由契约。
+// 用 --gametest 运行；报告写到 exe 同目录的 gametest_report.txt。
+int runGameSelftest(const std::wstring& outPath) {
+    std::string report;
+    int passed = 0, failed = 0;
+    auto check = [&](const char* name, bool ok, const std::string& detail) {
+        report += fmt("[%s] %s%s\n", ok ? "PASS" : "FAIL", name,
+                      detail.empty() ? "" : ("  " + detail).c_str());
+        if (ok) {
+            ++passed;
+        } else {
+            ++failed;
+        }
+    };
+
+    // 1. 选择 → 进程名 / 遥测编号 / 路径
+    setSelectedGame(GameId::Ets2);
+    check("默认选择=欧卡2", selectedGame() == GameId::Ets2, "");
+    check("欧卡2进程名", std::wstring(selectedProcessName()) == L"eurotrucks2.exe", "");
+    check("欧卡2遥测编号=1", selectedGameDescriptor().telemetryGame == 1u, "");
+    const std::wstring ets2Docs = documentsDir();
+    const std::wstring ets2Backups = backupRoot();
+    setSelectedGame(GameId::Ats);
+    check("美卡进程名=amtrucks.exe", std::wstring(selectedProcessName()) == L"amtrucks.exe", "");
+    check("美卡遥测编号=2", selectedGameDescriptor().telemetryGame == 2u, "");
+    check("美卡文档目录不同", documentsDir() != ets2Docs, W2U(documentsDir()));
+    check("美卡备份目录隔离", backupRoot() != ets2Backups, W2U(backupRoot()));
+    check("美卡有独立的版本布局", supportsVerifiedStructures(GameId::Ats) && layoutProfile(GameId::Ats).rootRva != layoutProfile(GameId::Ets2).rootRva, "");
+    const auto& atsProfile = layoutProfile(GameId::Ats);
+    check("美卡正确版本指纹通过", layoutFingerprintMatches(atsProfile, atsProfile.timestamp, atsProfile.imageSize, atsProfile.rootInstruction), "");
+    auto wrongBytes = atsProfile.rootInstruction; wrongBytes[3] ^= 1;
+    check("美卡拒绝被修改的代码", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp, atsProfile.imageSize, wrongBytes), "");
+    check("美卡拒绝错误版本", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp+1, atsProfile.imageSize, atsProfile.rootInstruction), "");
+    check("美卡拒绝欧卡签名", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp, atsProfile.imageSize, layoutProfile(GameId::Ets2).rootInstruction), "");
+
+    // 2. 结构化写入 fail-closed：动力调校 / 固定油量与无损 / 现金写入
+    {
+        EngineTuner tuner;
+        std::string err;
+        check("未附加的美卡动力调校被拒", !tuner.apply(1.25f, false, &err) && !err.empty(), err);
+    }
+    {
+        VehicleLocker locker;
+        std::string err1, err2;
+        check("未绑定的美卡油量被拒", !locker.setFuelEnabled(true, &err1) && !err1.empty(), err1);
+        check("未绑定的美卡无损被拒", !locker.setDamageEnabled(true, &err2) && !err2.empty(), err2);
+    }
+    {
+        ProcessMemory memory;
+        std::string err;
+        check("无有效美卡进程的现金写入被拒",
+              !writeBankMoneyVerified(memory, 0, 0, 1, &err) && !err.empty(), err);
+    }
+
+    // ATS fixtures use the observed runtime offsets, not the ETS2 definition table.
+    {
+        ProcessMemory memory; std::string error; uint64_t base=0;
+        const bool opened=memory.openReadOnly(::GetCurrentProcessId(),"fixture",&error) && memory.mainImage(&base);
+        std::array<uint8_t,0x80> bank{}, otherBank{};
+        std::array<uint8_t,0x800> economy{};
+        auto put=[](auto& bytes, size_t offset, const auto& value) { ::memcpy(bytes.data()+offset,&value,sizeof(value)); };
+        const uint64_t bankBase=reinterpret_cast<uint64_t>(bank.data()), econBase=reinterpret_cast<uint64_t>(economy.data());
+        const uint64_t bankVtable=base+atsProfile.bankVtableRva, econVtable=base+atsProfile.economyVtableRva;
+        const int64_t money=28015, fixed=2523, loan=130000;
+        const float ratio=0.25234f, severity=1.690996f, seconds=29.0f;
+        const uint8_t enabled=1; const int32_t xp=115, minutes=1901;
+        put(bank,0,bankVtable); put(bank,0x10,money); put(bank,0x18,fixed); put(bank,0x20,ratio);
+        put(bank,0x24,severity); put(bank,0x50,enabled); put(bank,0x58,loan);
+        put(economy,0,econVtable); put(economy,0x10,bankBase); put(economy,0x19C,minutes);
+        put(economy,0x1A0,seconds); put(economy,0x77C,xp);
+        ProbeResult bankProbe, econProbe;
+        check("美卡运行银行偏移与整数免赔额",opened && probeBankObject(memory,bankBase+0x10,&bankProbe) && bankProbe.value==28015 && bankProbe.object==bankBase,"");
+        check("美卡经济偏移及银行关联",opened && probeEconomyObject(memory,econBase+0x77C,&econProbe) && econProbe.value==115 && economyReferencesBank(memory,econBase,bankBase),"");
+        check("美卡事故累计超过 1 仍可定位",probeBankObject(memory,bankBase+0x10,nullptr) && probeEconomyObject(memory,econBase+0x77C,nullptr),"");
+        put(bank,0x24,250.0f);
+        check("美卡多次事故累计仍可定位",probeBankObject(memory,bankBase+0x10,nullptr),"");
+        put(bank,0x24,-0.01f);
+        ProbeResult rejected;
+        check("美卡负事故值拒绝并说明原因",!probeBankObject(memory,bankBase+0x10,&rejected) && rejected.detail.find("事故累计值")!=std::string::npos,"");
+        const uint32_t nonfinite=0x7F800000u;
+        put(bank,0x24,nonfinite);
+        check("美卡非有限事故值拒绝",!probeBankObject(memory,bankBase+0x10,nullptr),"");
+        put(bank,0x24,severity); put(bank,0x20,1.01f);
+        check("美卡共保比例仍须不超过 1",!probeBankObject(memory,bankBase+0x10,nullptr),"");
+        put(bank,0x20,ratio);
+        check("美卡拒绝欧卡金额偏移",!probeBankObject(memory,bankBase+0x18,nullptr),"");
+        check("美卡拒绝欧卡经验偏移",!probeEconomyObject(memory,econBase+0x780,nullptr),"");
+        auto picked=pickBestBankCandidate(memory,{bankBase+0x10},4);
+        check("美卡自动类型扫描唯一候选",picked.unique && picked.value==28015,"");
+        otherBank=bank;
+        picked=pickBestBankCandidate(memory,{bankBase+0x10,reinterpret_cast<uint64_t>(otherBank.data())+0x10},4);
+        check("美卡银行歧义拒绝",!picked.unique && picked.tied==2,"");
+        picked=pickBestBankCandidate(memory,{bankBase+0x10,reinterpret_cast<uint64_t>(otherBank.data())+0x10},1);
+        check("美卡银行截断拒绝",!picked.unique && picked.truncated,"");
+        picked=pickBestEconomyFromBankRefs(memory,{econBase+0x10},bankBase,4);
+        check("美卡经济引用自动定位",picked.unique && picked.fieldAddress==econBase+0x77C,"");
+        put(economy,0x780,int32_t(7));
+        check("美卡技能错位拒绝",!probeEconomyObject(memory,econBase+0x77C,nullptr),"");
+        put(economy,0x780,int32_t(0)); put(bank,0,uint64_t(0));
+        check("美卡银行对象复用拒绝",!probeBankObject(memory,bankBase+0x10,nullptr) && !probeEconomyObject(memory,econBase+0x77C,nullptr),"");
+        put(bank,0,bankVtable);
+        check("美卡拒绝写入其他进程",!writeBankMoneyVerified(memory,bankBase+0x10,bankBase,1000000,&error) && *reinterpret_cast<const int64_t*>(bank.data()+0x10)==28015, error);
+    }
+
+    {
+        AppState fixture;
+        fixture.engineStateEts2="ets_credentials";
+        fixture.engineStateText="ats_credentials";
+        fixture.engineStateAts="stale_ats_credentials";
+        const auto text=settingsText(fixture);
+        check("双游戏动力凭据分别保存",text.find("engine_state=ets_credentials\n")!=std::string::npos && text.find("engine_state_ats=ats_credentials\n")!=std::string::npos,"");
+        const std::wstring path=applicationDir()+L"\\gametest_engine_keys.ini";
+        writeFileBytes(path,{text.begin(),text.end()});
+        AppState loaded; loadSettingsFrom(loaded,path);
+        check("美卡只加载自己的动力凭据",loaded.engineStateText=="ats_credentials" && loaded.engineStateEts2=="ets_credentials","");
+        ::DeleteFileW(path.c_str());
+    }
+
+    // 3. 跨游戏备份恢复被拒（历史无标签 = 欧卡2；路径边界不被前缀误判）
+    {
+        BackupInfo legacy;
+        legacy.originalDir = ets2Docs + L"\\profiles\\p1";
+        BackupInfo atsTagged;
+        atsTagged.game = L"ats";
+        atsTagged.originalDir = documentsDir() + L"\\profiles\\p1";
+        std::string err1, err2, err3;
+        check("美卡拒绝历史欧卡2备份", !restoreBackup(legacy, &err1) && !err1.empty(), err1);
+        setSelectedGame(GameId::Ets2);
+        check("欧卡2拒绝美卡备份", !restoreBackup(atsTagged, &err2) && !err2.empty(), err2);
+        BackupInfo wrongPath = atsTagged;
+        wrongPath.game = L"ets2";
+        wrongPath.originalDir = ets2Docs + L"Other\\profiles\\p1";
+        check("来源路径边界不误判", !restoreBackup(wrongPath, &err3) && !err3.empty(), err3);
+    }
+
+    // 4. settings：记录当前游戏、忽略历史 anti_roll_factor、收藏点按游戏分区
+    {
+        AppState app;
+        app.teleportSpots.clear();
+        setSelectedGame(GameId::Ats);
+        const std::string text = settingsText(app);
+        check("settings 记录 game=ats", text.find("game=ats") != std::string::npos, "");
+        check("settings 不再写 anti_roll", text.find("anti_roll") == std::string::npos, "");
+        check("settings 写美卡收藏键", text.find("teleport_spots_ats=") != std::string::npos, "");
+        wchar_t tempBuf[MAX_PATH] = {0};
+        const DWORD tempLen = ::GetTempPathW(MAX_PATH, tempBuf);
+        const std::wstring tmp =
+            std::wstring(tempBuf, tempLen) + L"ets2trainer_gametest_settings.ini";
+        {
+            const std::string seed = "game=ats\nanti_roll_factor=5\nmoney_type=f32\n";
+            HANDLE h = ::CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                     FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                DWORD written = 0;
+                ::WriteFile(h, seed.data(), (DWORD)seed.size(), &written, nullptr);
+                ::CloseHandle(h);
+            }
+        }
+        AppState loaded;
+        const GameId beforeLoad = selectedGame();
+        loadSettingsFrom(loaded, tmp);
+        check(selectionLockedFromCli() ? "命令行选择不被设置覆盖" : "settings 读取 game=ats",
+              selectedGame() == (selectionLockedFromCli() ? beforeLoad : GameId::Ats), "");
+        check("settings 忽略历史 anti_roll_factor",
+              !loaded.autoFuelLock && !loaded.autoDamageLock, "");
+        ::DeleteFileW(tmp.c_str());
+    }
+
+    // Exercise the decoder with actual shared-memory bytes; no live mapping is opened.
+    {
+        std::array<uint8_t, 1056> bytes{};
+        bytes[0] = 1;
+        const uint32_t revision = 12;
+        const float capacity = 500.0f, fuel = 100.0f;
+        ::memcpy(bytes.data() + 40, &revision, sizeof(revision));
+        ::memcpy(bytes.data() + 704, &capacity, sizeof(capacity));
+        ::memcpy(bytes.data() + 1000, &fuel, sizeof(fuel));
+        for (GameId game : kAllGameIds) {
+            setSelectedGame(game);
+            TelemetrySnapshot snapshot;
+            std::string error;
+            const uint32_t matching = gameDescriptor(game).telemetryGame;
+            ::memcpy(bytes.data() + 52, &matching, sizeof(matching));
+            check(game == GameId::Ats ? "美卡真实缓冲区匹配" : "欧卡真实缓冲区匹配",
+                  decodeTelemetryBuffer(bytes.data(), bytes.size(), &snapshot, &error), error);
+            const uint32_t opposite = matching == 1 ? 2 : 1;
+            ::memcpy(bytes.data() + 52, &opposite, sizeof(opposite));
+            check(game == GameId::Ats ? "美卡拒绝欧卡缓冲区" : "欧卡拒绝美卡缓冲区",
+                  !decodeTelemetryBuffer(bytes.data(), bytes.size(), &snapshot, &error) &&
+                  error.find("不符") != std::string::npos, error);
+        }
+    }
+    // Switching runs the production cleanup using a dedicated test settings file.
+    {
+        setSelectedGame(GameId::Ets2);
+        AppState app;
+        app.slots.emplace_back(); app.backups.emplace_back();
+        app.selectedSlot = app.selectedBackup = 0;
+        app.slotValues.hasMoney = true;
+        ::strcpy_s(app.saveMoney, "123");
+        app.cameraLoaded = true;
+        app.flyDeveloper = app.flyConsole = 1;
+        app.flySpeedSaved = "999";
+        app.consoleKey = 'K';
+        app.convoy.active = true;
+        app.requestRestoreConfirm = app.showBackupDialog = true;
+        ::strcpy_s(app.cityInput, "berlin");
+        app.locatedMoneyAddress = 0x12345;
+        app.teleportSpots.emplace_back("欧洲", "berlin");
+        const std::wstring settings = applicationDir() + L"\\gametest_switch_settings.ini";
+        check("切换清空旧游戏缓存", selectGame(app, GameId::Ats, settings) &&
+              app.slots.empty() && app.backups.empty() && app.selectedSlot == -1 &&
+              app.selectedBackup == -1 && !app.slotValues.hasMoney && !app.saveMoney[0] &&
+              !app.cameraLoaded && app.flyDeveloper == -1 && app.flyConsole == -1 &&
+              app.flySpeedSaved.empty() && app.consoleKey == 0xC0 && !app.convoy.active &&
+              !app.requestRestoreConfirm && !app.showBackupDialog && !app.cityInput[0] &&
+              !app.locatedMoneyAddress && !app.attached, "");
+        app.teleportSpots.emplace_back("美国", "phoenix");
+        check("切回欧卡保留欧洲收藏", selectGame(app, GameId::Ets2, settings) &&
+              app.teleportSpots.size() == 1 && app.teleportSpots[0].second == "berlin", "");
+        check("切回美卡保留美国收藏", selectGame(app, GameId::Ats, settings) &&
+              app.teleportSpots.size() == 1 && app.teleportSpots[0].second == "phoenix", "");
+        ::DeleteFileW(settings.c_str());
+        app.engineStateEts2 = "1;3800;3800;0;2200;2200;4750;4750;0;2200;2200;1.25;0";
+        const std::string saved = settingsText(app);
+        check("美卡保存保留欧卡恢复凭据", saved.find(app.engineStateEts2) != std::string::npos, "");
+        app.engineTuner = std::make_unique<EngineTuner>();
+        check("切至欧卡加载欧卡恢复凭据", selectGame(app, GameId::Ets2, settings) &&
+              app.engineTuner->hasUnverifiedImportedRecord(), "");
+        check("未恢复的发动机记录阻止切换", !selectGame(app, GameId::Ats, settings) &&
+              selectedGame() == GameId::Ets2 && !app.engineTuner->exportState().empty(), "");
+        ::DeleteFileW(settings.c_str());
+    }
+    {
+        setSelectedGame(GameId::Ets2);
+        BackupInfo escaped;
+        escaped.originalDir = documentsDir() + L"\\..\\American Truck Simulator\\profiles\\p1";
+        std::string error;
+        check("备份拒绝点点路径逃逸", !restoreBackup(escaped, &error) &&
+              error.find("不属于当前游戏") != std::string::npos, error);
+    }
+    // A brand-new backup must create its directory before writing the game tag.
+    {
+        const std::filesystem::path fixture = std::filesystem::path(applicationDir()) /
+            (L"gametest_save_" + std::to_wstring(::GetCurrentProcessId()));
+        std::error_code ec;
+        const bool created = std::filesystem::create_directory(fixture, ec);
+        check("创建独立存档测试目录", created && !ec, "");
+        if (created && !ec) {
+            const std::string text = "SiiNunit\n{\nbank : _nameless.bank {\n money_account: 100\n}\n}\n";
+            SaveSlot slot;
+            slot.slotDir = fixture.wstring();
+            slot.gameSii = (fixture / L"game.sii").wstring();
+            slot.profileName = L"gametest";
+            slot.slotName = std::to_wstring(::GetCurrentProcessId());
+            const bool seeded = writeFileBytes(slot.gameSii, {text.begin(), text.end()});
+            check("生成合成存档", seeded, "");
+            for (GameId game : kAllGameIds) {
+                setSelectedGame(game);
+                std::string error;
+                const std::wstring dir = seeded ? backupSlot(slot, "gametest", &error) : L"";
+                std::vector<uint8_t> tag, copied;
+                const auto list = listBackups();
+                const auto found = std::find_if(list.begin(), list.end(), [&](const BackupInfo& b) {
+                    return b.path == dir && b.game == U2W(gameKey(game));
+                });
+                const bool ok = !dir.empty() &&
+                    readFileBytes(dir + L"\\game.tag", tag) &&
+                    std::string(tag.begin(), tag.end()) == std::string("game=") + gameKey(game) + "\n" &&
+                    readFileBytes(dir + L"\\files\\game.sii", copied) &&
+                    std::string(copied.begin(), copied.end()) == text && found != list.end();
+                check(game == GameId::Ats ? "美卡首次备份和标签有效" : "欧卡首次备份和标签有效", ok, error);
+                if (!dir.empty() && std::filesystem::path(dir).parent_path() == std::filesystem::path(backupRoot()))
+                    std::filesystem::remove_all(std::filesystem::path(dir), ec);
+            }
+            std::filesystem::remove_all(fixture, ec);
+        }
+    }
+    // Transactions target only the test process's own floats.
+    {
+        setSelectedGame(GameId::Ets2);
+        ProcessMemory memory;
+        std::string error;
+        const bool opened = memory.open(::GetCurrentProcessId(), "gametest", &error);
+        check("车辆离线测试打开自身进程", opened, error);
+        if (opened) {
+            float fuel = 0.5f, correction = 0.05f, damage = 0.3f, sentinel = 7.0f;
+            VehicleAddresses a;
+            a.fuel = (uint64_t)(uintptr_t)&fuel;
+            a.fuelCorrection = (uint64_t)(uintptr_t)&correction;
+            a.damageFields = {(uint64_t)(uintptr_t)&damage};
+            VehicleLocker locker;
+            locker.bindForTesting(&memory, 0);
+            locker.setCommandsForTesting(true, true);
+            auto result = locker.runMaintenanceCycle(a, false, &error);
+            check("保留油量无损事务", result.action == VehicleLocker::CycleAction::Applied &&
+                  fuel == 1.0f && correction == 0.0f && damage == 0.0f && sentinel == 7.0f, error);
+            fuel = 0.5f; correction = 0.05f; damage = 0.3f;
+            locker.setBeforeFieldWriteHookForTesting([&](size_t i) {
+                if (i == 1) locker.setCommandsForTesting(false, false);
+            });
+            locker.setCommandsForTesting(true, true);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("事务中途取消精确回滚", result.action == VehicleLocker::CycleAction::Failed &&
+                  fuel == 0.5f && correction == 0.05f && damage == 0.3f, error);
+            locker.setBeforeFieldWriteHookForTesting({});
+            locker.setCommandsForTesting(true, true);
+            locker.setCycleHookAfterSnapshot([&] { locker.setCommandsForTesting(false, false); });
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("过期车辆周期不写入", result.action == VehicleLocker::CycleAction::SkippedStale &&
+                  fuel == 0.5f && damage == 0.3f, error);
+            locker.setCycleHookAfterSnapshot({});
+            locker.setCommandsForTesting(true, true);
+            locker.setWriteGuard([] { return std::string("test guard"); });
+            locker.setGuardIntervalMs(0);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("车辆写入守卫保留", result.action == VehicleLocker::CycleAction::Blocked &&
+                  fuel == 0.5f && damage == 0.3f, error);
+            locker.setWriteGuard({});
+            setSelectedGame(GameId::Ats);
+            locker.setCommandsForTesting(true, true);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("美卡合成油量与无损周期", result.action == VehicleLocker::CycleAction::Applied &&
+                  fuel == 1.0f && correction == 0.0f && damage == 0.0f, "");
+        }
+    }
+    // Read-only access remains readable and refuses all writes even to our own buffer.
+    {
+        ProcessMemory memory;
+        float value = 12.5f, changed = 99.0f, read = 0.0f;
+        std::string error;
+        const uint64_t address = (uint64_t)(uintptr_t)&value;
+        const bool opened = memory.openReadOnly(::GetCurrentProcessId(), "readonly-test", &error);
+        check("只读句柄可读且不能写", opened && !memory.canWrite() &&
+              memory.read(address, &read, sizeof(read)) && read == value &&
+              !memory.write(address, &changed, sizeof(changed)) && value == 12.5f, error);
+        memory.close();
+        check("关闭只读句柄清空状态", !memory.isOpen() && !memory.canWrite(), "");
+    }
+    // Unattached ATS rejects automatic economy without leaving a pending write intent.
+    {
+        setSelectedGame(GameId::Ats);
+        AppState app;
+        app.autoWriteMoneyAfterLocate = app.autoWriteXpAfterLocate = true;
+        startLocateEconomy(app);
+        check("美卡未附加时不扫描且清空写入意图", !app.busy.load() && !app.worker.joinable() &&
+              !app.attached && !app.autoWriteMoneyAfterLocate && !app.autoWriteXpAfterLocate &&
+              app.locateStatus.find("还没有附加") != std::string::npos, app.locateStatus);
+    }
+    // Persist each message immediately, serialize concurrent writers, and retain disk evidence on clear.
+    {
+        const std::wstring path = applicationDir() + fmtW(L"\\gametest_live_%u_%llu.log",
+            ::GetCurrentProcessId(), (unsigned long long)::GetTickCount64());
+        std::string error;
+        const bool started = logStartFile(path, &error);
+        check("实时日志创建独立会话文件", started, error);
+        if (started) {
+            logLine("live-log-first 中文");
+            std::vector<uint8_t> bytes;
+            const bool immediate = readFileBytes(path, bytes);
+            check("日志无需退出即可读取", immediate &&
+                  std::string(bytes.begin(), bytes.end()).find("live-log-first 中文") != std::string::npos, "");
+            auto writer = [](int n) { for (int i = 0; i < 40; ++i) logLine(fmt("thread-%d-%d", n, i)); };
+            std::thread a(writer, 1), b(writer, 2);
+            a.join(); b.join();
+            logClear();
+            logLine("after-clear");
+            logStopFile();
+            readFileBytes(path, bytes);
+            const std::string content(bytes.begin(), bytes.end());
+            size_t pos = 0, count = 0;
+            while ((pos = content.find("thread-", pos)) != std::string::npos) { ++count; pos += 7; }
+            check("并发日志完整且清空不抹除磁盘记录", count == 80 &&
+                  content.find("live-log-first 中文") != std::string::npos &&
+                  content.find("after-clear") != std::string::npos, "");
+            check("拒绝覆盖既有会话日志", !logStartFile(path, &error) &&
+                  !logFileError().empty(), error);
+            ::DeleteFileW(path.c_str());
+        }
+    }
+    setSelectedGame(GameId::Ets2);
+    for (const auto& item : runEngineTunerTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runEconomyLocateTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runSaveCopyTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runTruckTransferTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runProfileSplitTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runBsiiTests()) check(item.name.c_str(), item.ok, item.detail);
+    setSelectedGame(GameId::Ets2);   // 恢复默认，避免影响后续运行
+    report += fmt("共 %d 项通过，%d 项失败\n", passed, failed);
+    if (!outPath.empty()) {
+        HANDLE h = ::CreateFileW(outPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            ::WriteFile(h, report.data(), (DWORD)report.size(), &written, nullptr);
+            ::CloseHandle(h);
+        }
+    }
+    ::OutputDebugStringA(report.c_str());
+    return (failed == 0) ? 0 : 1;
+}
+
 int runSelfTest(const std::wstring& outPath) {
     note("ETS2 Trainer (C++) 自检报告");
 
@@ -1406,7 +1805,7 @@ int runSelfTest(const std::wstring& outPath) {
     check("管理员权限检测", true, isAdmin() ? "(当前是管理员)" : "(当前不是管理员)");
     DWORD gamePid = 0;
     std::wstring exe;
-    bool gameRunning = findProcess(L"eurotrucks2.exe", &gamePid, &exe);
+    bool gameRunning = findProcess(selectedProcessName(), &gamePid, &exe);
     check("查找欧卡2 进程", true,
           gameRunning ? fmt("(找到 PID %u)", gamePid) : "(游戏没在运行，属正常)");
     if (gameRunning) {
@@ -1577,13 +1976,6 @@ int runSelfTest(const std::wstring& outPath) {
     note("");
     note("=== 9. 发动机动力调节（内存镜像状态机测试）===");
     for (const auto& item : runEngineTunerTests()) {
-        check(item.name, item.ok, item.detail);
-    }
-
-    // ---------- 9b. 防侧翻备份管理（离线，不依赖游戏）----------
-    note("");
-    note("=== 9b. 防侧翻备份（与车辆对象绑定，逐项验证清除）===");
-    for (const auto& item : runVehicleAntiRollTests()) {
         check(item.name, item.ok, item.detail);
     }
 
@@ -1881,6 +2273,17 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         ::CloseHandle(event);
         return waited == WAIT_OBJECT_0 ? 259 : 11;
     }
+    // 命令行 --game=ets2 / --game=ats：必须在任何进程/存档探测之前确定目标游戏。
+    {
+        const size_t gamePos = cmdLine.find(L"--game=");
+        if (gamePos != std::wstring::npos) {
+            std::wstring key = cmdLine.substr(gamePos + 7);
+            const size_t stop = key.find_first_of(L" \t\"");
+            if (stop != std::wstring::npos) key = key.substr(0, stop);
+            GameId parsed;
+            if (parseGameKey(W2U(key), &parsed)) { setSelectedGame(parsed); lockSelectionFromCli(); }
+        }
+    }
     if (cmdLine.find(L"--target-helper=") != std::wstring::npos) {
         size_t pos = cmdLine.find(L"--target-helper=") + 16;
         std::wstring path = cmdLine.substr(pos);
@@ -1940,6 +2343,10 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         return runSelfTest(path);
     }
 
+    if (cmdLine.find(L"--gametest") != std::wstring::npos) {
+        return runGameSelftest(applicationDir() + L"\\gametest_report.txt");
+    }
+
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_CLASSDC;
@@ -1958,7 +2365,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     const int initialHeight = (std::min)(820, (std::max)(650, workHeight - 40));
     const int initialX = workArea.left + (std::max)(0, (workWidth - initialWidth) / 2);
     const int initialY = workArea.top + (std::max)(0, (workHeight - initialHeight) / 2);
-    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"欧卡2 修改器  ETS2 Trainer (C++)  v2.0",
+    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"欧卡2 / 美卡 修改器  Truck Trainer",
                                 WS_OVERLAPPEDWINDOW, initialX, initialY, initialWidth, initialHeight,
                                 nullptr, nullptr, wc.hInstance, nullptr);
     if (!hwnd) return 1;
@@ -1986,6 +2393,18 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     AppState app;
     g_app = &app;
     loadSettings(app);
+    SYSTEMTIME logTime;
+    ::GetLocalTime(&logTime);
+    const std::filesystem::path logDir = std::filesystem::path(applicationDir()) / L"logs";
+    std::error_code logEc;
+    std::filesystem::create_directories(logDir, logEc);
+    const std::wstring logName = fmtW(L"trainer_%04d%02d%02d_%02d%02d%02d_%03d_%u.log",
+        logTime.wYear, logTime.wMonth, logTime.wDay, logTime.wHour, logTime.wMinute,
+        logTime.wSecond, logTime.wMilliseconds, ::GetCurrentProcessId());
+    std::string logError;
+    if (!logStartFile((logDir / logName).wstring(), &logError)) logLine(logError);
+    logLine(fmt("会话开始：PID=%u game=%s exe=%s 管理员=%s", ::GetCurrentProcessId(),
+        gameKey(selectedGame()), W2U(selectedProcessName()).c_str(), isAdmin() ? "是" : "否"));
     initFonts(app);
     refreshSaves(app);
     refreshFlyMode(app);      // 读取 config.cfg 的开发者/控制台/飞行速度状态
@@ -1994,20 +2413,64 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     {
         DWORD pid = 0;
         std::wstring exe;
-        if (findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+        if (findProcess(selectedProcessName(), &pid, &exe)) {
             app.procStatus = fmt("发现 %s (PID %u) —— 点「附加游戏」开始", W2U(exe).c_str(), pid);
         } else {
-            app.procStatus = "没有找到 eurotrucks2.exe，请先启动游戏";
+            app.procStatus = fmt("没有找到 %s，请先启动游戏", W2U(selectedProcessName()).c_str());
         }
-        logLine("欧卡2 修改器 (C++ / Dear ImGui / Direct3D 11) 已启动。");
+        logLine(fmt("欧卡2 / 美卡 修改器已启动，当前目标：%s。", selectedGameDescriptor().shortName));
         logLine(isAdmin() ? "当前是管理员权限。" : "当前不是管理员，若读取失败请以管理员身份运行。");
         logLine(app.procStatus);
     }
 
     bool done = false;
     bool smokeTest = cmdLine.find(L"--smoketest") != std::wstring::npos;
+    const bool saveCopyUiSmoke = smokeTest && cmdLine.find(L"--savecopy-ui") != std::wstring::npos;
+    const bool truckTransferUiSmoke = smokeTest && cmdLine.find(L"--trucktransfer-ui") != std::wstring::npos;
+    const bool truckTransferClickUiSmoke = smokeTest && cmdLine.find(L"--trucktransfer-click-ui") != std::wstring::npos;
+    const bool profileSplitUiSmoke = smokeTest && cmdLine.find(L"--profilesplit-ui") != std::wstring::npos;
+    if (profileSplitUiSmoke) {
+        app.activeTab = 4; app.splitGame = selectedGame(); app.splitUiFixture = true;
+        for (const char* name : {"TMP", "ProMods", "联运"}) {
+            ProfileSplitRow row; row.selected = true;
+            row.source.profileName = L"界面测试档案"; row.source.displayName = name;
+            row.source.slotName = std::to_wstring(app.splitRows.size()+3);
+            ::strcpy_s(row.name, name); app.splitRows.push_back(row);
+        }
+        app.showProfileSplit = true;
+    }
+    if(truckTransferClickUiSmoke) {
+        app.activeTab=4;
+        app.slots.clear();app.selectedSlot=-1;
+        app.truckTransferUiProbe.capture=true;
+    }
+    if (truckTransferUiSmoke) {
+        app.activeTab = 4;
+        app.truckTransferRequest.game = selectedGame();
+        app.truckTransferRequest.source.slotDir = L"ui-source-not-a-save";
+        app.truckTransferRequest.source.label = "源档案 / 测试存档";
+        SaveSlot target; target.slotDir = L"ui-target-not-a-save"; target.label = "目标档案 / 测试存档";
+        app.transferTargets = {target};
+        app.truckTransferRequest.target = target;
+        app.transferTargetIndex = 0;
+        app.transferSourceInventory.trucks = {{"_nameless.1", "volvo.fh_2024", 52}};
+        app.transferTargetInventory.garages = {{"garage.koln", 2}};
+        ::strcpy_s(app.transferName, "车辆导入副本");
+        app.transferNote = "界面冒烟：模拟源卡车与目标空车库，不执行导入。";
+        app.showTruckTransfer = true;
+    }
+    if (saveCopyUiSmoke) {
+        app.activeTab = 4;
+        app.copyRequest.game = selectedGame();
+        app.copyRequest.source.profileName = L"界面测试档案";
+        app.copyRequest.source.slotName = L"1";
+        app.copyRequest.source.slotDir = L"ui-fixture-not-a-save";
+        ::strcpy_s(app.copyName, "中文副本 \"测试\"");
+        app.showCopyDialog = true;
+    }
     uint64_t startTick = ::GetTickCount64();
     int frames = 0;
+    int smokeResult = 0;
     while (!done) {
         MSG msg;
         while (::PeekMessageW(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -2019,6 +2482,12 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
 
         ::ImGui_ImplDX11_NewFrame();
         ::ImGui_ImplWin32_NewFrame();
+        if(truckTransferClickUiSmoke && (frames==2 || frames==3)) {
+            auto& input=::ImGui::GetIO();
+            input.AddFocusEvent(true);
+            input.AddMousePosEvent(app.truckTransferUiProbe.buttonX,app.truckTransferUiProbe.buttonY);
+            input.AddMouseButtonEvent(0,frames==2);
+        }
         ::ImGui::NewFrame();
         handleGlobalHotkeys(app);
         renderApp(app);
@@ -2032,6 +2501,17 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         ++frames;
 
         if (smokeTest && frames >= 30) {
+            if(truckTransferClickUiSmoke) {
+                const auto& probe=app.truckTransferUiProbe;
+                const bool ok=probe.clicked && probe.noticeVisible && !app.truckTransferNotice.empty() && !app.worker.joinable();
+                smokeResult=ok ? 0 : 1;
+                logLine(fmt("[ %s ] 车辆复制按钮点击：clicked=%d notice_visible=%d worker_started=%d",ok ? "PASS" : "FAIL",
+                            probe.clicked,probe.noticeVisible,app.worker.joinable()));
+                logLine("车辆复制点击提示："+app.truckTransferNotice);
+            }
+            if (profileSplitUiSmoke) logLine("档案拆分界面冒烟：三个存档的选择、独立档案命名与提示已渲染；未创建档案。");
+            if (truckTransferUiSmoke) logLine("车辆导入界面冒烟：源卡车、目标存档、空车库与名称弹窗已渲染；未执行导入。");
+            if (saveCopyUiSmoke) logLine("存档复制界面冒烟：列表与复制名称弹窗已渲染；未执行复制。");
             logLine(fmt("冒烟测试：窗口创建成功，已渲染 %d 帧（hwnd=0x%llX, 窗口 %ux%u）", frames,
                         (unsigned long long)(uintptr_t)hwnd, g_width, g_height));
             logLine(fmt("界面构造：标签页 6 个（含「车辆 油量/无损/动力」），存档槽 %d 个，中文字体 %s",
@@ -2041,6 +2521,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             done = true;
         }
         if (smokeTest && ::GetTickCount64() - startTick > 15000) {
+            smokeResult=1;
             logLine("冒烟测试：超时退出");
             logSaveToFile(applicationDir() + L"\\smoketest_report.txt");
             done = true;
@@ -2058,14 +2539,16 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     if (app.freezer) app.freezer->stop();
     app.mem.close();
     saveSettings(app);
+    logLine("会话正常退出：已停止后台线程并保存设置。");
     logSaveToFile(applicationDir() + L"\\ETS2Trainer.log");
+    logStopFile();
     ::ImGui_ImplDX11_Shutdown();
     ::ImGui_ImplWin32_Shutdown();
     ::ImGui::DestroyContext();
     cleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    return 0;
+    return smokeResult;
 }
 
 

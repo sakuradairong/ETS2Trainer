@@ -31,15 +31,17 @@ set "LIBS=d3d11.lib dxgi.lib bcrypt.lib user32.lib gdi32.lib shell32.lib ole32.l
 if /i "%~1"=="check" goto check
 if /i "%~1"=="clean" goto clean
 if /i "%~1"=="test" goto testbuild
+set "OUTPUT=..\ETS2Trainer.exe"
+if /i "%~1"=="next" set "OUTPUT=..\ETS2Trainer_next.exe"
 
 del /q build\*.obj >nul 2>&1
 echo [build] 1/2 compiling with /MP ...
 cl %FLAGS% /MP4 %INCS% /c src\*.cpp %IMGUI_SRC% /Fo:build\ > build\compile.log 2>&1
 if errorlevel 1 goto build_fail
 echo [build] 2/2 linking ...
-link /nologo /OUT:"..\ETS2Trainer.exe" /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:NO /MANIFESTINPUT:app.manifest build\*.obj %LIBS% > build\link.log 2>&1
+link /nologo /OUT:"%OUTPUT%" /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTUAC:NO /MANIFESTINPUT:app.manifest build\*.obj %LIBS% > build\link.log 2>&1
 if errorlevel 1 goto link_fail
-echo [build] OK, output: ETS2Trainer.exe
+echo [build] OK, output: %OUTPUT%
 exit /b 0
 
 :check

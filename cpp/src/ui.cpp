@@ -2,6 +2,7 @@
 #include "ui.h"
 
 #include "economy.h"
+#include "layout.h"
 #include "imgui.h"
 
 #include <shellapi.h>
@@ -146,12 +147,10 @@ void resetProcessState(AppState& app) {
     app.damageLock = false;
     app.autoFuelLock = false;
     app.autoDamageLock = false;
-    app.autoAntiRollLock = false;
     app.moneyStatus = "未附加：请重新扫描现金。";
     app.xpStatus = "未附加：请重新扫描经验。";
     app.fuelStatus = "未附加：无限油量已停止。";
     app.damageStatus = "未附加：车辆无损已停止。";
-    app.antiRollStatus = "未附加：防侧翻已停止。";
     app.scanStatus = "未附加：扫描已失效。";
     // 结构化定位结果绑定的地址随进程失效，必须一起清掉
     app.locatedMoneyAddress = 0;
@@ -168,12 +167,34 @@ void resetProcessState(AppState& app) {
     app.pendingMultiAction = 0;
     app.pendingMultiKind = -1;
     app.requestMultiConfirm = false;
+    app.showCopyDialog = false;
+    app.copyRequest = {};
+    app.copyName[0] = 0;
+    app.showTruckTransfer = false;
+    app.showTruckTransferNotice = false;
+    app.truckTransferNotice.clear();
+    app.truckTransferRequest = {};
+    app.transferSourceInventory = {};
+    app.transferTargetInventory = {};
+    app.transferTargets.clear();
+    app.transferTargetIndex = -1;
+    app.transferNote.clear();
+    app.transferInspectBusy = false; app.transferTargetReady = false;
+    ++app.transferInspectionGeneration;
+    app.showProfileSplit = false;
+    app.splitRows.clear();
+    app.splitUiFixture = false;
     { std::lock_guard<std::mutex> lock(app.resultMutex);
       app.pendingReady = false;
       app.pendingLog.clear();
       app.pendingStatus.clear();
       app.pendingProgressNote.clear();
-      app.pendingEconomy = PendingEconomyResult{}; }
+      app.pendingEconomy = PendingEconomyResult{};
+      app.pendingCopy = {};
+      app.pendingCopyTruck = false;
+      app.pendingCopyReady = false; }
+    { std::lock_guard<std::mutex> lock(app.resultMutex);
+      app.pendingSplit = {}; app.pendingSplitReady = false; }
 }
 
 // ---------- 数值类型下拉框 ----------
@@ -284,14 +305,14 @@ bool validateAttachedSessionReuse(std::string* error) {
         return false;
     }
     app.pid = ::GetCurrentProcessId();
-    app.autoFuelLock = app.autoDamageLock = app.autoAntiRollLock = true;
+    app.autoFuelLock = app.autoDamageLock = true;
     app.moneyLock = app.xpLock = true;
     app.enginePowerOption = 3;
     app.engineRaiseLimit = true;
     app.locatedMoneyAddress = 123;
     for (int i = 0; i < 10; ++i) {
         if (!ensureAttached(app) || !app.autoFuelLock || !app.autoDamageLock ||
-            !app.autoAntiRollLock || !app.moneyLock || !app.xpLock ||
+            !app.moneyLock || !app.xpLock ||
             app.enginePowerOption != 3 || !app.engineRaiseLimit ||
             app.locatedMoneyAddress != 123 || app.mem.pid() != ::GetCurrentProcessId()) {
             if (error) *error = "复用当前附加会话时已有功能/定位状态被重置";
@@ -301,15 +322,89 @@ bool validateAttachedSessionReuse(std::string* error) {
     return true;
 }
 
+static std::string serializeSpots(const AppState& app);
+static void parseSpotsInto(const std::string& value, AppState& app);
+
+// 切换目标游戏：必须先停下所有写入线程并恢复现场，再改变选择。
+// 任何未确认的发动机恢复凭据都会阻止切换，绝不静默丢弃。
+bool selectGame(AppState& app, GameId id, const std::wstring& settingsPath) {
+    if (id == selectedGame()) return true;
+    app.cancel.store(true);
+    joinWorker(app);
+    resetProcessState(app);   // 先停动力/车辆/冻结器并清空扫描与地址，才允许换选择
+    if (app.engineTuner && (app.engineTuner->active() ||
+                            app.engineTuner->hasInvalidatedRecord() ||
+                            !app.engineTuner->exportState().empty())) {
+        app.procStatus = "切换已取消：发动机原值尚未确认恢复，请先完成恢复再切换游戏。";
+        logLine(app.procStatus);
+        return false;
+    }
+    // 先把当前收藏清单归档到所属游戏，再切换选择（设置保存也按游戏分区）
+    if (selectedGame() == GameId::Ets2) {
+        app.teleportSpotsEts2 = serializeSpots(app);
+        app.engineStateEts2 = app.engineStateText;
+    } else {
+        app.teleportSpotsAts = serializeSpots(app);
+        app.engineStateAts = app.engineStateText;
+    }
+    detachGame(app);
+    app.engineStateText.clear();
+    setSelectedGame(id);
+    app.engineStateText = id == GameId::Ets2 ? app.engineStateEts2 : app.engineStateAts;
+    if (app.engineTuner) app.engineTuner->importState(app.engineStateText);
+    // 再装入目标游戏的收藏清单
+    app.teleportSpots.clear();
+    parseSpotsInto(id == GameId::Ets2 ? app.teleportSpotsEts2 : app.teleportSpotsAts, app);
+    // 存档/备份/选择等都不允许带进新游戏，否则可能在旧存档上执行新操作
+    app.slots.clear();
+    app.backups.clear();
+    app.selectedSlot = -1;
+    app.selectedBackup = -1;
+    app.slotValues = {};
+    app.telemetry = {};
+    app.telemetryAvailable = false;
+    app.telemetryCheckedAt = 0;
+    app.telemetryError.clear();
+    app.saveMoney[0] = app.saveXp[0] = '\0';
+    app.saveNote = "请选择当前游戏的存档。";
+    app.requestRestoreConfirm = app.showBackupDialog = false;
+    app.camera = {};
+    app.cameraLoaded = false;
+    app.flyDeveloper = app.flyConsole = -1;
+    app.flySpeedSaved.clear();
+    ::strcpy_s(app.flySpeed, "100");
+    app.flyNote = "请重新检查当前游戏的 config.cfg 和相机按键。";
+    app.consoleKey = 0xC0;
+    ::strcpy_s(app.consoleCmd, "g_set_time 12 0");
+    app.consoleNote.clear();
+    app.convoy = {};
+    app.convoyNote = "请刷新当前游戏的联机状态。";
+    app.cityFilter[0] = app.cityInput[0] = app.coordInput[0] = app.spotName[0] = '\0';
+    app.teleportNote = "请读取当前游戏的城市列表。";
+    app.lastEngineStateRevision = app.lastEngineSaveTick = 0;
+    app.mapCities.clear();
+    app.mapCitySelected = -1;
+    app.mpHits.clear();
+    app.memInfo.clear();
+    app.procStatus = fmt("已切换到%s：请附加 %s；存档/配置/备份均按该游戏路径读取。",
+                         selectedGameDescriptor().shortName,
+                         W2U(selectedProcessName()).c_str());
+    logLine(app.procStatus);
+    if (!supportsVerifiedStructures(selectedGame())) logLine(structuralWriteBlockReason());
+    const bool saved = settingsPath.empty() ? saveSettings(app) : saveSettingsTo(app, settingsPath);
+    if (!saved) app.procStatus += "（设置保存失败，当前选择仅在本次运行生效）";
+    return true;
+}
+
 void attachGame(AppState& app) {
     app.cancel.store(true);
     joinWorker(app);
     DWORD pid = 0;
     std::wstring exe;
-    if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+    if (!findProcess(selectedProcessName(), &pid, &exe)) {
         resetProcessState(app);
         app.mem.close();
-        app.procStatus = "没有找到 eurotrucks2.exe，请先启动游戏";
+        app.procStatus = fmt("没有找到 %s，请先启动游戏", W2U(selectedProcessName()).c_str());
         logLine(app.procStatus);
         app.attached = false;
         // 清掉上一轮的进程/联机痕迹，避免界面显示与当前状态矛盾
@@ -341,7 +436,7 @@ void attachGame(AppState& app) {
     app.freezer->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     app.freezer->start(&app.mem, 250);
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
-    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
+    // 写入闸门：油量/无损的后台周期在真正写入前都会调用它（联机保护）。
     // 不捕获 AppState：worker 线程只读线程安全的策略快照。
     app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     app.procStatus = fmt("已附加：%s (PID %u)", W2U(exe).c_str(), pid);
@@ -359,6 +454,13 @@ void attachGame(AppState& app) {
                       formatSize(total).c_str());
     logLine(app.procStatus);
     logLine(app.memInfo);
+    logLine("附加后联机检测：" + mp.detail);
+    TelemetrySnapshot telemetry;
+    std::string telemetryError;
+    if (readTelemetry(&telemetry, &telemetryError))
+        logLine(fmt("附加后遥测：game=%u revision=%u fuel=%.2f/%.2f L", telemetry.game,
+            telemetry.pluginRevision, telemetry.fuel, telemetry.fuelCapacity));
+    else logLine("附加后遥测不可用：" + telemetryError);
 }
 
 void detachGame(AppState& app) {
@@ -397,11 +499,59 @@ void loadSettings(AppState& app) {
     loadSettingsFrom(app, applicationDir() + L"\\settings.ini");
 }
 
+// 收藏点序列化/解析（切换游戏时按游戏分区保存，互不覆盖）
+static std::string serializeSpots(const AppState& app) {
+    std::string spots;
+    for (const auto& spot : app.teleportSpots) {
+        if (!spots.empty()) spots += ",";
+        spots += spot.first + "|" + spot.second;
+    }
+    return spots;
+}
+
+static void parseSpotsInto(const std::string& value, AppState& app) {
+    app.teleportSpots.clear();
+    char separator = ',';
+    if (value.find(',') == std::string::npos && value.find(';') != std::string::npos &&
+        value.find('|') != value.rfind('|')) {
+        separator = ';';
+    }
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        const size_t sep = value.find(separator, pos);
+        const std::string item =
+            value.substr(pos, (sep == std::string::npos) ? std::string::npos : sep - pos);
+        const size_t bar = item.find('|');
+        if (bar != std::string::npos && bar > 0 && bar + 1 < item.size()) {
+            app.teleportSpots.emplace_back(item.substr(0, bar), item.substr(bar + 1));
+        }
+        if (sep == std::string::npos) break;
+        pos = sep + 1;
+    }
+}
+
 void loadSettingsFrom(AppState& app, const std::wstring& path) {
     std::ifstream in{std::filesystem::path(path)};
     if (!in) return;
-    std::string line;
-    while (std::getline(in, line)) {
+    std::vector<std::string> lines;
+    {
+        std::string raw;
+        while (std::getline(in, raw)) lines.push_back(raw);
+    }
+    // 先确定游戏选择，之后的存档目录/收藏等按键都按它解析
+    for (const auto& probe : lines) {
+        const size_t eqPos = probe.find('=');
+        if (eqPos == std::string::npos) continue;
+        if (trim(probe.substr(0, eqPos)) == "game") {
+            GameId parsed;
+            // --game=... 在命令行明确指定时，settings.ini 不得覆盖
+            if (!selectionLockedFromCli() &&
+                parseGameKey(trim(probe.substr(eqPos + 1)), &parsed)) {
+                setSelectedGame(parsed);
+            }
+        }
+    }
+    for (const std::string& line : lines) {
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = trim(line.substr(0, eq));
@@ -423,22 +573,28 @@ void loadSettingsFrom(AppState& app, const std::wstring& path) {
                                   ? parsed : 1.0f;
         }
         else if (key == "workers") app.workers = ::atoi(value.c_str());
-        else if (key == "engine_state") {
-            app.engineStateText = value;
-            if (app.engineTuner) app.engineTuner->importState(value);
-        }
-        else if (key == "fly_speed") ::strncpy_s(app.flySpeed, value.c_str(), _TRUNCATE);
-        else if (key == "anti_roll_factor") {
-            app.antiRollFactor = (float)::atof(value.c_str());
-            // 非法/越界配置回落到推荐值，防止把重心写反（反向加大侧翻）
-            if (!(app.antiRollFactor >= 1.0f) || app.antiRollFactor > 6.0f) {
-                app.antiRollFactor = 3.0f;
+        else if (key == "engine_state" || key == "engine_state_ats") {
+            const bool ats = key == "engine_state_ats";
+            (ats ? app.engineStateAts : app.engineStateEts2) = value;
+            if (ats == (selectedGame() == GameId::Ats)) {
+                app.engineStateText = value;
+                if (app.engineTuner) app.engineTuner->importState(value);
             }
         }
+        else if (key == "fly_speed") ::strncpy_s(app.flySpeed, value.c_str(), _TRUNCATE);
         else if (key == "mp_policy") app.mpPolicy = ::atoi(value.c_str()) == 1 ? 1 : 0;
         else if (key == "check_convoy") app.checkConvoy = (::atoi(value.c_str()) != 0);
         else if (key == "hotkeys_enabled") app.hotkeysEnabled = (::atoi(value.c_str()) != 0);
-        else if (key == "teleport_spots") {
+        else if (key == "teleport_spots" || key == "teleport_spots_ats") {
+            // 收藏点按游戏分区：只加载当前选择游戏的键，避免把欧卡2 的收藏带进美卡
+            if ((key == "teleport_spots_ats") != (selectedGame() == GameId::Ats)) {
+                if (key == "teleport_spots_ats") {
+                    app.teleportSpotsAts = value;
+                } else {
+                    app.teleportSpotsEts2 = value;
+                }
+                continue;
+            }
             // 格式：名字|目标,名字|目标（分隔符必须是 sanitize 白名单外的字符，
             // 否则坐标里的 ';' 会把一个收藏拆碎）
             // 兼容旧版：旧版用 ';' 分隔多条，仅当出现多个 '|' 且没有新分隔符时才按旧规则解析。
@@ -480,11 +636,11 @@ std::string settingsText(const AppState& app) {
     text += fmt("console_key=%d\n", app.consoleKey);
     text += fmt("max_region_gb=%g\n", (double)app.maxRegionGb);
     text += fmt("workers=%d\n", app.workers);
-    const std::string engineState =
-        app.engineTuner ? app.engineTuner->exportState() : app.engineStateText;
-    text += "engine_state=" + engineState + "\n";
+    const std::string currentEngineState = app.engineTuner ? app.engineTuner->exportState() : app.engineStateText;
+    text += "engine_state=" + (selectedGame() == GameId::Ets2 ? currentEngineState : app.engineStateEts2) + "\n";
+    text += "engine_state_ats=" + (selectedGame() == GameId::Ats ? currentEngineState : app.engineStateAts) + "\n";
     text += "fly_speed=" + std::string(app.flySpeed) + "\n";
-    text += fmt("anti_roll_factor=%g\n", (double)app.antiRollFactor);
+    text += std::string("game=") + gameKey(selectedGame()) + "\n";
     text += fmt("mp_policy=%d\n", app.mpPolicy);
     text += fmt("check_convoy=%d\n", app.checkConvoy ? 1 : 0);
     text += fmt("hotkeys_enabled=%d\n", app.hotkeysEnabled ? 1 : 0);
@@ -494,7 +650,15 @@ std::string settingsText(const AppState& app) {
         if (!spots.empty()) spots += ",";
         spots += spot.first + "|" + spot.second;
     }
-    text += "teleport_spots=" + spots + "\n";
+    // 收藏点按游戏分区保存：美卡写 teleport_spots_ats，不覆盖欧卡2 的收藏
+    // 两个游戏的收藏都写入；非当前游戏的原样保留，切游戏不会删掉对方的收藏
+    if (selectedGame() == GameId::Ats) {
+        text += "teleport_spots_ats=" + spots + "\n";
+        text += "teleport_spots=" + app.teleportSpotsEts2 + "\n";
+    } else {
+        text += "teleport_spots=" + spots + "\n";
+        text += "teleport_spots_ats=" + app.teleportSpotsAts + "\n";
+    }
     return text;
 }
 
@@ -577,7 +741,7 @@ std::string writeGateReasonInternal(bool forceRefresh) {
     DWORD pid = g_writeGatePolicy.pid.load();
     if (!pid) {
         std::wstring exe;
-        if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+        if (!findProcess(selectedProcessName(), &pid, &exe)) {
             // 没有游戏进程：此处不拦（写入本身会以"尚未附加"失败），避免给出误导性的联机拒绝
             return std::string();
         }
@@ -903,8 +1067,8 @@ void sendConsole(AppState& app, const std::string& command) {
     DWORD pid = app.pid;
     if (!pid || !app.mem.alive()) {
         std::wstring exe;
-        if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
-            app.consoleNote = "没有找到 eurotrucks2.exe，请先启动游戏。";
+        if (!findProcess(selectedProcessName(), &pid, &exe)) {
+            app.consoleNote = fmt("没有找到 %s，请先启动游戏。", W2U(selectedProcessName()).c_str());
             return;
         }
     }
@@ -1002,6 +1166,12 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
         status = fuel ? "无限油量已关闭。" : "无损锁定已关闭。";
         return;
     }
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        state = false;
+        status = reason;
+        logLine(reason);
+        return;
+    }
     if (!ensureAttached(app)) {
         state = false;
         status = "还没有附加到游戏进程";
@@ -1023,10 +1193,10 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
             return;
         }
     }
-    bool other = fuel ? (app.autoDamageLock || app.autoAntiRollLock)
-                      : (app.autoFuelLock || app.autoAntiRollLock);
+    bool other = fuel ? (app.autoDamageLock)
+                      : (app.autoFuelLock);
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
-    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
+    // 写入闸门：油量/无损的后台周期在真正写入前都会调用它（联机保护）。
     // 不捕获 AppState：worker 线程只读线程安全的策略快照。
     app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
     std::string error;
@@ -1046,63 +1216,6 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
     logLine(status);
 }
 
-void toggleAutoAntiRollLock(AppState& app, bool enabled, float factor) {
-    // 强度收敛到安全区间（与 VehicleLocker 内部一致的防御性钳制）
-    if (!(factor >= 1.0f)) factor = 1.0f;
-    if (factor > 6.0f) factor = 6.0f;
-    app.antiRollFactor = factor;
-    if (!enabled) {
-        if (app.vehicleLocker) {
-            std::string ignored;
-            // 关闭由 locker 的 worker 线程用开启前的快照精确还原（异步）
-            app.vehicleLocker->setAntiRollEnabled(false, factor, &ignored);
-        }
-        app.autoAntiRollLock = false;
-        app.antiRollStatus =
-            "防侧翻已关闭：正在把重心与稳定性参数还原为开启前的原值（换车/读档也会自动恢复）。";
-        logLine(app.antiRollStatus);
-        return;
-    }
-    if (!ensureAttached(app)) {
-        app.autoAntiRollLock = false;
-        app.antiRollStatus = "还没有附加到游戏进程";
-        return;
-    }
-    if (!app.mpHits.empty()) {
-        app.autoAntiRollLock = false;
-        app.antiRollStatus = "检测到联机特征，已拒绝启用车辆锁定；请只在单机使用。";
-        return;
-    }
-    {
-        MultiplayerStatus mp = checkMultiplayer(app.pid, true);
-        app.mpBlocks = mp.blocksWrite();
-        app.mpDetail = mp.detail;
-        if (mp.blocksWrite()) {
-            app.autoAntiRollLock = false;
-            app.antiRollStatus = "写入类功能在联机中始终禁用：" + mp.detail;
-            logLine(app.antiRollStatus);
-            return;
-        }
-    }
-    const bool other = app.autoFuelLock || app.autoDamageLock;
-    if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
-    // 写入闸门：油量/无损/防侧翻的后台周期在真正写入前都会调用它（联机保护）。
-    // 不捕获 AppState：worker 线程只读线程安全的策略快照。
-    app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
-    std::string error;
-    if (!other) {
-        if (!app.vehicleLocker->bind(&app.mem, app.pid, &error)) {
-            app.autoAntiRollLock = false;
-            app.antiRollStatus = "自动定位失败：" + error;
-            logLine(app.antiRollStatus);
-            return;
-        }
-    }
-    bool ok = app.vehicleLocker->setAntiRollEnabled(true, factor, &error);
-    app.autoAntiRollLock = ok;
-    app.antiRollStatus = ok ? app.vehicleLocker->status() : ("防侧翻启用失败：" + error);
-    logLine(app.antiRollStatus);
-}
 
 // ---------- 发动机动力调节 ----------
 namespace {
@@ -1121,7 +1234,7 @@ EngineTuner& ensureEngineTuner(AppState& app) {
 // 运行期间每 5 秒复查一次联机状态；命中即让保持线程恢复原值并停止。
 EngineTuner::Guard engineGuardFor(DWORD pid) {
     (void)pid;
-    // 与油量/无损/防侧翻/经济写入共用同一套写入闸门（线程安全快照）
+    // 与油量/无损/经济写入共用同一套写入闸门（线程安全快照）
     return [](std::string* reason) {
         const std::string blocked = writeGateReasonFromPolicy();
         if (!blocked.empty()) {
@@ -1142,6 +1255,13 @@ std::string multiplayerSummary() {
 }  // namespace
 
 void applyEnginePower(AppState& app, int option, bool raiseLimit) {
+    if (!supportsVerifiedStructures(selectedGame())) {
+        app.enginePowerOption = 0;
+        app.engineRaiseLimit = false;
+        app.engineStatus = structuralWriteBlockReason();
+        logLine(app.engineStatus);
+        return;
+    }
     const int index = (option < 0 || option > 3) ? 0 : option;
     EngineTuner& tuner = ensureEngineTuner(app);
 
@@ -1197,7 +1317,7 @@ void applyEnginePower(AppState& app, int option, bool raiseLimit) {
 void detectConsoleKey(AppState& app) {
     std::vector<SaveSlot> slots = app.slots.empty() ? listSlots() : app.slots;
     if (slots.empty()) {
-        app.consoleNote = "没有找到欧卡2 的 profile，无法自动识别按键";
+        app.consoleNote = fmt("没有找到%s的 profile，无法自动识别按键", selectedGameDescriptor().shortName);
         return;
     }
     int vk = consoleKeyFromControls(slots.front().profileDir + L"\\controls.sii");
@@ -1214,7 +1334,7 @@ void detectConsoleKey(AppState& app) {
 void checkConsoleConfig(AppState& app) {
     DWORD runningPid = 0;
     std::wstring runningExe;
-    if (findProcess(L"eurotrucks2.exe", &runningPid, &runningExe)) {
+    if (findProcess(selectedProcessName(), &runningPid, &runningExe)) {
         app.consoleNote =
             "请先完全退出游戏：游戏退出时会重写 config.cfg，运行中修改会被覆盖（未做任何改动）。";
         logLine(app.consoleNote);
@@ -1294,7 +1414,7 @@ void refreshFlyMode(AppState& app) {
 void detectCameraKeys(AppState& app) {
     std::vector<SaveSlot> slots = app.slots.empty() ? listSlots() : app.slots;
     if (slots.empty()) {
-        app.flyNote = "没有找到欧卡2 的 profile，无法识别相机按键";
+        app.flyNote = fmt("没有找到%s的 profile，无法识别相机按键", selectedGameDescriptor().shortName);
         return;
     }
     CameraBindings bindings;
@@ -1315,7 +1435,7 @@ void detectCameraKeys(AppState& app) {
 void enableFlyMode(AppState& app) {
     DWORD runningPid = 0;
     std::wstring runningExe;
-    if (findProcess(L"eurotrucks2.exe", &runningPid, &runningExe)) {
+    if (findProcess(selectedProcessName(), &runningPid, &runningExe)) {
         app.flyNote = "请先完全退出游戏：游戏退出时会重写 config.cfg，运行中修改会被覆盖（未做任何改动）。";
         logLine(app.flyNote);
         return;
@@ -1367,8 +1487,8 @@ void toggleFreeCamera(AppState& app) {
     DWORD pid = app.pid;
     if (!pid) {
         std::wstring exe;
-        if (!findProcess(L"eurotrucks2.exe", &pid, &exe)) {
-            app.flyNote = "没有找到 eurotrucks2.exe，请先启动游戏。";
+        if (!findProcess(selectedProcessName(), &pid, &exe)) {
+            app.flyNote = fmt("没有找到 %s，请先启动游戏。", W2U(selectedProcessName()).c_str());
             return;
         }
     }
@@ -1425,6 +1545,332 @@ void selectSlot(AppState& app, int index) {
     }
 }
 
+void consumePendingCopy(AppState& app) {
+    SaveCopyResult result;
+    bool truck = false;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if (!app.pendingCopyReady) return;
+        result = std::move(app.pendingCopy);
+        truck = app.pendingCopyTruck;
+        app.pendingCopyTruck = false;
+        app.pendingCopyReady = false;
+    }
+    if (result.game != selectedGame()) return;
+    if (result.ok) {
+        refreshSaves(app);
+        for (int i = 0; i < (int)app.slots.size(); ++i)
+            if (::_wcsicmp(app.slots[i].slotDir.c_str(), result.slotDir.c_str()) == 0) { selectSlot(app, i); break; }
+        app.saveNote = std::string(truck ? "卡车已导入新存档「" : "已复制为「") + result.displayName + "」，新槽位：" + W2U(result.slotName) +
+            "。启动游戏后在同一档案的载入列表中查看；云存档请等待 Steam 同步完成。";
+    } else app.saveNote = std::string(truck ? "车辆导入失败：" : "复制失败：") + result.error;
+    logLine(app.saveNote);
+}
+
+void consumePendingSplit(AppState& app) {
+    ProfileSplitResult result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if (!app.pendingSplitReady) return;
+        result = std::move(app.pendingSplit); app.pendingSplitReady = false;
+    }
+    if (result.game != selectedGame()) return;
+    if (!result.created.empty()) refreshSaves(app);
+    std::string names;
+    for (const auto& profile : result.created) {
+        if (!names.empty()) names += "、";
+        names += "「" + profile.name + "」";
+    }
+    if (result.ok) app.saveNote = "已生成独立本地档案：" + names +
+        "。启动游戏后选择对应档案，检查模组管理器，再载入保留的存档。";
+    else app.saveNote = "拆分未全部完成：" + result.error +
+        (names.empty() ? "。未生成新档案。" : "。已生成并保留：" + names + "；其余项目请更换名称后重试。");
+    logLine(app.saveNote);
+}
+
+void openProfileSplit(AppState& app) {
+    if (app.busy || app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) {
+        app.saveNote = "请先选中 TMP、ProMods 或联运所在档案的一个存档"; return;
+    }
+    std::string error;
+    if (copyBlockedByRunningGame(selectedGame(), &error)) { app.saveNote = error; return; }
+    const auto source = app.slots[app.selectedSlot];
+    app.splitRows.clear(); app.splitGame = selectedGame(); app.splitUiFixture = false;
+    for (const auto& slot : app.slots) if (::_wcsicmp(slot.profileDir.c_str(), source.profileDir.c_str()) == 0) {
+        ProfileSplitRow row; row.source = slot;
+        row.selected = ::_wcsicmp(slot.slotDir.c_str(), source.slotDir.c_str()) == 0;
+        const auto name = slot.displayName.empty() ? W2U(slot.profileName) + "-" + W2U(slot.slotName) : slot.displayName;
+        ::strncpy_s(row.name, name.c_str(), _TRUNCATE); app.splitRows.push_back(row);
+    }
+    app.showProfileSplit = true;
+}
+
+void startProfileSplit(AppState& app) {
+    if (app.busy || app.splitUiFixture) return;
+    joinWorker(app); consumePendingCopy(app); consumePendingSplit(app);
+    ProfileSplitRequest request; request.game = app.splitGame;
+    for (const auto& row : app.splitRows) if (row.selected) request.items.push_back({row.source, row.name});
+    app.busy = true; app.cancel = false; app.saveNote = "正在准备独立档案并校验完整存档……";
+    app.worker = std::thread([&app, request] {
+        ProfileSplitResult result;
+        try { result = splitSelectedProfiles(request, [&app] { return app.cancel.load(); }); }
+        catch (const std::exception& e) { result.game = request.game; result.error = e.what(); }
+        { std::lock_guard<std::mutex> lock(app.resultMutex);
+          app.pendingSplit = std::move(result); app.pendingSplitReady = true; }
+        app.busy = false;
+    });
+}
+
+void renderProfileSplitDialog(AppState& app) {
+    if (app.showProfileSplit) { ::ImGui::OpenPopup("拆分为独立档案##split"); app.showProfileSplit = false; }
+    ::ImGui::SetNextWindowSize(ImVec2(780, 0), ImGuiCond_Appearing);
+    if (!::ImGui::BeginPopupModal("拆分为独立档案##split", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if (app.splitRows.empty() || app.splitGame != selectedGame()) {
+        ::ImGui::CloseCurrentPopup(); ::ImGui::EndPopup(); return;
+    }
+    ::ImGui::Text("%s / 源档案：%s", gameDescriptor(app.splitGame).shortName,
+                  W2U(app.splitRows.front().source.profileName).c_str());
+    ::ImGui::TextWrapped("勾选需要分离的存档，每个存档填写一个不同的新档案名（例如 TMP、ProMods、联运）。最多选择 16 个。");
+    ::ImGui::TextWrapped("每个新档案仅保留选中的存档，继承当前设置、控制器和模组配置。历史模组顺序无法自动还原；首次载入前请检查模组管理器。");
+    ::ImGui::TextWrapped("生成到本地 profiles；支持加密进度，原档案保留。Steam 云源的本地控制器设置会一起复制。");
+    ::ImGui::BeginChild("##split-list", ImVec2(0, 270), ImGuiChildFlags_Borders);
+    if (::ImGui::BeginTable("##split-rows", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ::ImGui::TableSetupColumn("选择", ImGuiTableColumnFlags_WidthFixed, 45);
+        ::ImGui::TableSetupColumn("槽位", ImGuiTableColumnFlags_WidthFixed, 105);
+        ::ImGui::TableSetupColumn("存档名称"); ::ImGui::TableSetupColumn("新档案名称"); ::ImGui::TableHeadersRow();
+        for (int i = 0; i < (int)app.splitRows.size(); ++i) {
+            auto& row = app.splitRows[i]; ::ImGui::PushID(i); ::ImGui::TableNextRow();
+            ::ImGui::TableSetColumnIndex(0); ::ImGui::Checkbox("##enabled", &row.selected);
+            ::ImGui::TableSetColumnIndex(1); ::ImGui::TextUnformatted(W2U(row.source.slotName).c_str());
+            ::ImGui::TableSetColumnIndex(2); ::ImGui::TextUnformatted(row.source.displayName.c_str());
+            ::ImGui::TableSetColumnIndex(3); ::ImGui::BeginDisabled(!row.selected);
+            ::ImGui::SetNextItemWidth(-1); ::ImGui::InputText("##name", row.name, sizeof(row.name));
+            ::ImGui::EndDisabled(); ::ImGui::PopID();
+        }
+        ::ImGui::EndTable();
+    }
+    ::ImGui::EndChild();
+    size_t count = 0; std::set<std::wstring> names; std::string error;
+    for (const auto& row : app.splitRows) if (row.selected) {
+        ++count; std::wstring folder; std::string why;
+        if (!profileFolderName(row.name, &folder, &why)) { if (error.empty()) error = why; }
+        else if (!names.insert(folder).second) error = "新档案名称不能重复";
+    }
+    if (!count || count > 16) error = "请选择 1 至 16 个存档";
+    ::ImGui::Text("将创建 %zu 个独立档案", count);
+    if (!error.empty()) ::ImGui::TextWrapped("%s", error.c_str());
+    ::ImGui::TextDisabled("同名档案会拒绝覆盖。若中途失败，结果会列出已生成的档案。");
+    ::ImGui::BeginDisabled(!error.empty() || app.splitUiFixture);
+    if (::ImGui::Button("生成独立档案")) { startProfileSplit(app); ::ImGui::CloseCurrentPopup(); }
+    ::ImGui::EndDisabled(); ::ImGui::SameLine();
+    if (::ImGui::Button("取消")) ::ImGui::CloseCurrentPopup();
+    ::ImGui::EndPopup();
+}
+
+void startSaveCopy(AppState& app) {
+    if (app.busy) return;
+    joinWorker(app);
+    consumePendingCopy(app);
+    SaveCopyRequest request = app.copyRequest;
+    request.displayName = app.copyName;
+    app.cancel = false;
+    app.busy = true;
+    app.saveNote = "正在复制并校验存档文件……";
+    app.worker = std::thread([&app, request] {
+        SaveCopyResult result;
+        try { result = copySlotToNewSave(request, [&app] { return app.cancel.load(); }); }
+        catch (const std::exception& e) { result.game = request.game; result.error = e.what(); }
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingCopy = std::move(result);
+            app.pendingCopyTruck = false;
+            app.pendingCopyReady = true;
+        }
+        app.busy = false;
+    });
+}
+
+
+void consumePendingTransferInspection(AppState& app) {
+    PendingTransferInspection result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if(!app.pendingTransferInspection.ready) return;
+        result=std::move(app.pendingTransferInspection);
+        app.pendingTransferInspection={};
+    }
+    if(result.game!=selectedGame() || result.generation!=app.transferInspectionGeneration) return;
+    app.transferInspectBusy=false;
+    app.progressDone=1;
+    if(result.target) {
+        app.transferTargetReady=result.ok;
+        app.transferTargetInventory=result.ok ? std::move(result.inventory) : TransferInventory{};
+        app.transferNote=!result.ok ? "目标无法使用："+result.error :
+            app.transferTargetInventory.garages.empty() ? "目标没有车辆和司机均为空的车库位置。" :
+            "目标版本和依赖检查通过。请选择车库和新存档名称。";
+    } else {
+        app.transferSourceInventory=result.ok ? std::move(result.inventory) : TransferInventory{};
+        app.transferNote=!result.ok ? "无法读取源车辆："+result.error :
+            app.transferSourceInventory.trucks.empty() ? "源存档没有可复制的自有卡车。" :
+            app.transferTargets.empty() ? "没有其他目标存档，请先在目标档案创建一个可用存档。" :
+            "源车辆已读取。请选择卡车和目标存档。";
+    }
+}
+
+void startTransferInspection(AppState& app,bool target) {
+    if(app.busy) return;
+    joinWorker(app);
+    const auto request=app.truckTransferRequest;
+    const uint64_t generation=++app.transferInspectionGeneration;
+    app.transferInspectBusy=true; app.cancel=false; app.busy=true;
+    app.progressDone=0; app.progressTotal=1;
+    app.progressNote=target ? "读取目标车库并检查兼容性" : "读取源车辆";
+    app.transferNote=target ? "正在自动解密和转换目标存档，并检查版本与依赖……" :
+                             "正在自动解密和转换源存档，请稍候……";
+    app.worker=std::thread([&app,request,generation,target]{
+        PendingTransferInspection result;
+        result.game=request.game; result.generation=generation; result.target=target;
+        auto canceled=[&app]{return app.cancel.load();};
+        result.ok=target ? inspectTruckTransferTarget(request.source,request.target,&result.inventory,&result.error,canceled) :
+                           inspectTruckTransferSlot(request.source,&result.inventory,&result.error,canceled);
+        result.ready=true;
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingTransferInspection=std::move(result);
+        }
+        app.busy=false;
+    });
+}
+
+void openTruckTransfer(AppState& app) {
+    auto explain=[&](const std::string& message) {
+        app.saveNote=message;
+        app.truckTransferNotice=message;
+        app.showTruckTransferNotice=true;
+        logLine("跨存档复制卡车："+message);
+    };
+    if(app.busy) {explain("当前任务正在处理中，请完成或取消后再复制卡车。");return;}
+    std::string error;
+    if(copyBlockedByRunningGame(selectedGame(),&error)){explain(error);return;}
+    if(app.selectedSlot<0 || app.selectedSlot>=(int)app.slots.size()) {
+        explain("请先在下方存档列表中选中提供卡车的源存档，再点击「跨存档复制卡车」。");return;
+    }
+    app.truckTransferRequest={};
+    app.truckTransferRequest.game=selectedGame();
+    app.truckTransferRequest.source=app.slots[app.selectedSlot];
+    app.transferSourceInventory={};
+    app.transferTargets.clear();
+    for(const auto& slot:app.slots)
+        if(::_wcsicmp(slot.slotDir.c_str(),app.truckTransferRequest.source.slotDir.c_str())!=0)
+            app.transferTargets.push_back(slot);
+    app.transferTruckIndex=0;app.transferTargetIndex=-1;app.transferGarageIndex=0;
+    app.transferTargetInventory={};
+    app.transferTargetReady=false;
+    ::strncpy_s(app.transferName,"车辆导入副本",_TRUNCATE);
+    app.showTruckTransfer=true;
+    logLine("跨存档复制卡车：打开选择窗口并读取源车辆。");
+    startTransferInspection(app,false);
+}
+
+void startTruckTransfer(AppState& app) {
+    if(app.busy || !app.transferTargetReady || app.transferTruckIndex<0 ||
+       app.transferTruckIndex>=(int)app.transferSourceInventory.trucks.size() ||
+       app.transferGarageIndex<0 || app.transferGarageIndex>=(int)app.transferTargetInventory.garages.size()) return;
+    joinWorker(app);consumePendingCopy(app);
+    TruckTransferRequest request=app.truckTransferRequest;
+    request.truckId=app.transferSourceInventory.trucks.at(app.transferTruckIndex).id;
+    request.garageId=app.transferTargetInventory.garages.at(app.transferGarageIndex).id;
+    request.displayName=app.transferName;
+    app.busy=true;app.cancel=false;
+    app.progressDone=0;app.progressTotal=1;app.progressNote="转换并复制卡车到新存档";
+    app.saveNote="正在校验卡车配件和目标存档，并创建车辆导入副本……";
+    app.worker=std::thread([&app,request]{
+        auto result=transferTruckToNewSave(request,[&app]{return app.cancel.load();});
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingCopy=std::move(result);app.pendingCopyTruck=true;app.pendingCopyReady=true;
+        }
+        app.busy=false;
+    });
+}
+
+void renderTruckTransferDialog(AppState& app) {
+    const char* notice="跨存档复制卡车提示##transfer_notice";
+    if(app.showTruckTransferNotice) {::ImGui::OpenPopup(notice);app.showTruckTransferNotice=false;}
+    ::ImGui::SetNextWindowSize(ImVec2(560,0),ImGuiCond_Appearing);
+    if(::ImGui::BeginPopupModal(notice,nullptr,ImGuiWindowFlags_AlwaysAutoResize)) {
+        ::ImGui::TextWrapped("%s",app.truckTransferNotice.c_str());
+        if(app.truckTransferUiProbe.capture) app.truckTransferUiProbe.noticeVisible=true;
+        if(::ImGui::Button("知道了")) ::ImGui::CloseCurrentPopup();
+        ::ImGui::EndPopup();
+    }
+    if(app.showTruckTransfer){::ImGui::OpenPopup("跨存档复制卡车##transfer");app.showTruckTransfer=false;}
+    ::ImGui::SetNextWindowSize(ImVec2(740,0),ImGuiCond_Appearing);
+    if(!::ImGui::BeginPopupModal("跨存档复制卡车##transfer",nullptr,ImGuiWindowFlags_AlwaysAutoResize)) return;
+    if(app.truckTransferRequest.source.slotDir.empty() ||
+       app.truckTransferRequest.game!=selectedGame()){
+        ::ImGui::CloseCurrentPopup();::ImGui::EndPopup();return;
+    }
+    ::ImGui::TextWrapped("源：%s / %s",gameDescriptor(app.truckTransferRequest.game).shortName,
+                        app.truckTransferRequest.source.label.c_str());
+    ::ImGui::TextWrapped("自动解密并读取现有存档，无需设置游戏存档格式。复制到目标档案的新存档槽，保留两份原档。需同游戏、同存档版本及兼容的 DLC／模组。");
+    ::ImGui::BeginDisabled(app.busy);
+    ::ImGui::SetNextItemWidth(650);
+    const auto& trucks=app.transferSourceInventory.trucks;
+    if(::ImGui::BeginCombo("卡车",trucks.empty()?"无车辆":trucks[app.transferTruckIndex].label.c_str())){
+        for(int i=0;i<(int)trucks.size();++i){
+            ::ImGui::PushID(i);
+            auto label=trucks[i].label+" / "+trucks[i].id+" / "+std::to_string(trucks[i].accessories)+" 配件";
+            if(::ImGui::Selectable(label.c_str(),i==app.transferTruckIndex))app.transferTruckIndex=i;
+            ::ImGui::PopID();
+        }
+        ::ImGui::EndCombo();
+    }
+    ::ImGui::SetNextItemWidth(650);
+    if(::ImGui::BeginCombo("目标存档",app.transferTargetIndex<0?"请选择目标存档":app.transferTargets[app.transferTargetIndex].label.c_str())){
+        for(int i=0;i<(int)app.transferTargets.size();++i){
+            ::ImGui::PushID(i);
+            if(::ImGui::Selectable(app.transferTargets[i].label.c_str(),i==app.transferTargetIndex)){
+                app.transferTargetIndex=i;app.transferGarageIndex=0;
+                app.truckTransferRequest.target=app.transferTargets[i];
+                app.transferTargetInventory={}; app.transferTargetReady=false;
+                startTransferInspection(app,true);
+            }
+            ::ImGui::PopID();
+        }
+        ::ImGui::EndCombo();
+    }
+    const auto& garages=app.transferTargetInventory.garages;
+    ::ImGui::SetNextItemWidth(650);
+    if(::ImGui::BeginCombo("目标车库",garages.empty()?"无可用空位":garages[app.transferGarageIndex].id.c_str())){
+        for(int i=0;i<(int)garages.size();++i){
+            const auto label=garages[i].id+"（"+std::to_string(garages[i].freeSlots)+" 个空位）";
+            if(::ImGui::Selectable(label.c_str(),i==app.transferGarageIndex))app.transferGarageIndex=i;
+        }
+        ::ImGui::EndCombo();
+    }
+    ::ImGui::SetNextItemWidth(500);
+    ::ImGui::InputText("新存档名称",app.transferName,sizeof(app.transferName));
+    ::ImGui::EndDisabled();
+    ::ImGui::TextWrapped("%s",app.transferNote.c_str());
+    std::string escaped,error;
+    bool valid=siiEscapeName(app.transferName,&escaped,&error);
+    if(!valid)::ImGui::TextWrapped("%s",error.c_str());
+    ::ImGui::BeginDisabled(!valid || garages.empty() || trucks.empty() || app.transferTargetIndex<0 ||
+                           !app.transferTargetReady || app.transferInspectBusy || app.busy);
+    if(::ImGui::Button("复制卡车并另存为新槽位")){startTruckTransfer(app);::ImGui::CloseCurrentPopup();}
+    ::ImGui::EndDisabled();
+    ::ImGui::SameLine();
+    if(::ImGui::Button(app.transferInspectBusy ? "取消读取并关闭" : "关闭")) {
+        if(app.transferInspectBusy) app.cancel=true;
+        app.transferInspectBusy=false; app.transferTargetReady=false;
+        ++app.transferInspectionGeneration;
+        ::ImGui::CloseCurrentPopup();
+    }
+    ::ImGui::EndPopup();
+}
+
+
 void backupSelectedSlot(AppState& app) {
     if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) {
         app.saveNote = "请先在列表里选中一个存档";
@@ -1460,8 +1906,8 @@ void performRestoreSelectedBackup(AppState& app) {
         return;
     }
     DWORD gamePid = 0;
-    if (findProcess(L"eurotrucks2.exe", &gamePid, nullptr)) {
-        app.saveNote = "还原已取消：请先退出欧卡2，避免游戏或 Steam 云同步覆盖文件。";
+    if (findProcess(selectedProcessName(), &gamePid, nullptr)) {
+        app.saveNote = fmt("还原已取消：请先退出%s，避免游戏或 Steam 云同步覆盖文件。", selectedGameDescriptor().shortName);
         return;
     }
     const BackupInfo info = app.backups[(size_t)app.selectedBackup];
@@ -1484,7 +1930,7 @@ void performRestoreSelectedBackup(AppState& app) {
             return;
         }
     } else if (::GetFileAttributesW(info.originalDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        app.saveNote = "还原已取消：目标目录存在，但不是当前可识别的欧卡2存档。";
+        app.saveNote = fmt("还原已取消：目标目录不是当前可识别的%s存档。", selectedGameDescriptor().shortName);
         logLine(app.saveNote);
         return;
     }
@@ -1506,33 +1952,85 @@ void performRestoreSelectedBackup(AppState& app) {
 
 }  // namespace
 
+namespace {
+
+bool isDirSegment(const std::wstring& path) {
+    const DWORD attr = ::GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+bool exportFilePathExists(const std::wstring& path) {
+    return ::GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+std::wstring sanitizeExportPart(const std::wstring& raw) {
+    std::wstring out;
+    for (wchar_t ch : raw) {
+        if (ch < 0x20 || ch == 0x7F) continue;
+        if (wcschr(L"<>:\"/\\|?*", ch) != nullptr) continue;
+        out.push_back(ch);
+    }
+    while (!out.empty() && (out.back() == L'.' || out.back() == L' ')) out.pop_back();
+    while (!out.empty() && out.front() == L' ') out.erase(out.begin());
+    if (out.empty()) out = L"unknown";
+    if (out == L"." || out == L"..") out = L"unknown";
+    if (out.size() > 40) out.resize(40);
+    return out;
+}
+
+std::wstring exportTimestamp() {
+    SYSTEMTIME st{};
+    ::GetLocalTime(&st);
+    wchar_t buf[32];
+    swprintf_s(buf, L"%04u%02u%02u_%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour,
+               st.wMinute, st.wSecond);
+    return buf;
+}
+
+}  // namespace
+
 void exportSelectedSlot(AppState& app) {
     if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) {
         app.saveNote = "请先在列表里选中一个存档";
         return;
     }
     const SaveSlot& slot = app.slots[(size_t)app.selectedSlot];
-    std::string name = fmt("%s_%s.sii", W2U(slot.profileName).c_str(), W2U(slot.slotName).c_str());
-    for (auto& c : name) {
-        if (c == ' ' || c == '/' || c == '\\' || c == ':') c = '_';
+    const std::wstring exports = documentsDir() + L"\\exports";
+    if (!isDirSegment(exports) && !::CreateDirectoryW(exports.c_str(), nullptr)) {
+        const DWORD e = ::GetLastError();
+        if (e != ERROR_ALREADY_EXISTS || !isDirSegment(exports)) {
+            app.saveNote = "导出失败：无法创建导出目录（可能是权限不足或路径被占用）";
+            logLine(app.saveNote);
+            return;
+        }
     }
-    std::wstring outDir = slot.profileDir;
-    size_t slash = outDir.find_last_of(L"\\/");
-    outDir = (slash == std::wstring::npos) ? outDir : outDir.substr(0, slash);
-    slash = outDir.find_last_of(L"\\/");
-    outDir = (slash == std::wstring::npos) ? outDir : outDir.substr(0, slash);
-    std::wstring exports = outDir + L"\\exports";
-    ::CreateDirectoryW(exports.c_str(), nullptr);
-    std::wstring outPath = exports + L"\\" + U2W(name);
+    const std::wstring base = L"save_" + sanitizeExportPart(slot.profileName) + L"_" +
+                              sanitizeExportPart(slot.slotName) + L"_" + exportTimestamp();
+    std::wstring outPath;
+    for (int i = 0; i < 1000; ++i) {
+        std::wstring candidate = exports + L"\\" + base + (i == 0 ? L"" : L"_" + std::to_wstring(i)) + L".sii";
+        if (!exportFilePathExists(candidate)) { outPath = candidate; break; }
+    }
+    if (outPath.empty()) {
+        app.saveNote = "导出失败：同名文件过多，请清理导出目录后重试";
+        logLine(app.saveNote);
+        return;
+    }
     DecryptInfo info;
     std::string err;
     if (!exportDecrypted(slot, outPath, &info, &err)) {
+        if (err.empty()) err = "未知错误";
         app.saveNote = "导出失败：" + err;
         logLine(app.saveNote);
         return;
     }
-    app.saveNote = fmt("已解密导出（内层 %s，%s）-> %s", info.innerFormat.c_str(),
-                       formatSize(info.innerSize).c_str(), W2U(outPath).c_str());
+    const char* kind = "已识别明文";
+    if (info.innerFormat == "text") kind = "SII文本：可用文本编辑器查看";
+    else if (info.innerFormat == "bsii") kind = "BSII二进制：已解密，但未转换为可读文本";
+    else if (info.innerFormat == "3nk") kind = "3nK二进制：已解密，但未转换为可读文本";
+    app.saveNote = fmt("已解密导出（%s，%s）-> %s。%s", kind,
+                       formatSize(info.innerSize).c_str(), W2U(outPath).c_str(),
+                       "重复导出不会覆盖旧文件");
     logLine(app.saveNote);
 }
 
@@ -1540,7 +2038,7 @@ void applyTextPatch(AppState& app) {
     // 存档编辑仅在游戏完全退出后允许：避免游戏自动存档覆盖新值、读写文件竞争，
     // 同时杜绝在线会话中通过存档编辑绕过进程内存写入闸门。
     DWORD runningPid = 0;
-    if (findProcess(L"eurotrucks2.exe", &runningPid, nullptr)) {
+    if (findProcess(selectedProcessName(), &runningPid, nullptr)) {
         app.saveNote = "请先完全退出游戏，再修改明文存档（游戏运行中可能自动保存并覆盖该文件）。";
         logLine(app.saveNote);
         return;
@@ -1809,16 +2307,32 @@ void clearLocatedEconomy(AppState& app) {
 }
 
 void startLocateEconomy(AppState& app) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        app.autoWriteMoneyAfterLocate = app.autoWriteXpAfterLocate = false;
+        app.locateStatus = reason;
+        logLine(reason);
+        return;
+    }
     if (app.busy.load()) {
         app.locateStatus = "已有任务在进行，请等它结束。";
         return;
     }
     if (!ensureAttached(app)) {
+        app.autoWriteMoneyAfterLocate = app.autoWriteXpAfterLocate = false;
         app.locateStatus = "还没有附加到游戏进程。";
         return;
     }
+    const bool atsAuto = selectedGame() == GameId::Ats;
     double moneyValue = 0.0;
-    if (!parseNumber(app.moneyCurrent, false, &moneyValue)) {
+    if (atsAuto) {
+        uint64_t imageBase = 0;
+        if (!verifyGameLayout(app.mem, &imageBase, &app.locateStatus)) {
+            app.autoWriteMoneyAfterLocate = app.autoWriteXpAfterLocate = false;
+            logLine(app.locateStatus);
+            return;
+        }
+        moneyValue = static_cast<double>(imageBase + layoutProfile(GameId::Ats).bankVtableRva);
+    } else if (!parseNumber(app.moneyCurrent, false, &moneyValue)) {
         app.locateStatus = "请先在「游戏当前值」里填写游戏里显示的当前金钱。";
         return;
     }
@@ -1852,10 +2366,10 @@ void startLocateEconomy(AppState& app) {
     app.progressDone.store(0);
     app.progressTotal.store(2);
     app.progressNote = "结构化定位：查找金额";
-    app.locateStatus = "定位中：在内存里寻找与当前金额一致的 bank 对象…";
-    logLine("开始结构化定位金钱/经验（基于 1.61.1.1 单位字段表）");
+    app.locateStatus = atsAuto ? "定位中：按美卡银行类型寻找当前金额对象…" : "定位中：在内存里寻找与当前金额一致的 bank 对象…";
+    logLine("开始结构化定位金钱/经验（按当前游戏独立运行时布局）");
 
-    app.worker = std::thread([&app, moneyValue, xpValue, hasXp, workers, regionCap,
+    app.worker = std::thread([&app, moneyValue, atsAuto, xpValue, hasXp, workers, regionCap,
                               autoWriteMoney, autoWriteXp, moneyTargetValue, moneyTargetValid,
                               moneyTargetError, xpTargetValue, xpTargetValid,
                               xpTargetError]() {
@@ -1877,8 +2391,9 @@ void startLocateEconomy(AppState& app) {
         const uint64_t moneyHits =
             moneyScan.firstScan(moneyValue, opt, progressFn, cancelFn);
         if (!app.cancel.load() && moneyHits > 0) {
-            const CandidatePick pick =
-                pickBestBankCandidate(app.mem, moneyScan.addresses(), kEconomyProbeCap);
+            std::vector<uint64_t> moneyFields = moneyScan.addresses();
+            if (atsAuto) for (auto& address : moneyFields) address += ats_economy_offsets::kMoney;
+            const CandidatePick pick = pickBestBankCandidate(app.mem, moneyFields, kEconomyProbeCap);
             if (pick.truncated) {
                 result.moneyTruncated = true;
                 result.moneyDetail =
@@ -1902,9 +2417,14 @@ void startLocateEconomy(AppState& app) {
             } else {
                 result.moneyDetail = fmt("金额候选 %llu 个，但都没有通过 bank 结构校验",
                                          (unsigned long long)moneyHits);
+                if (moneyFields.size() == 1) {
+                    ProbeResult rejected;
+                    if (!probeBankObject(app.mem, moneyFields.front(), &rejected) && !rejected.detail.empty())
+                        result.moneyDetail += "：" + rejected.detail;
+                }
             }
         } else if (!app.cancel.load()) {
-            result.moneyDetail = "内存中没有找到与当前金额一致的数值（可在游戏里买卖一次让金额变化后重试）";
+            result.moneyDetail = atsAuto ? "未找到美卡银行类型对象，请确认存档已加载后重新定位" : "内存中没有找到与当前金额一致的数值（可在游戏里买卖一次让金额变化后重试）";
         }
 
         app.progressDone.store(1);
@@ -2060,6 +2580,11 @@ void startLocateEconomy(AppState& app) {
 // ---------------------------------------------------------------------------
 
 void directModifyMoney(AppState& app) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        app.locateStatus = reason;
+        logLine(reason);
+        return;
+    }
     if (app.busy.load()) {
         app.locateStatus = "已有任务在进行，请等它结束。";
         return;
@@ -2081,7 +2606,7 @@ void directModifyMoney(AppState& app) {
         return;
     }
     double current = 0.0;
-    if (!parseNumber(app.moneyCurrent, false, &current)) {
+    if (selectedGame() == GameId::Ets2 && !parseNumber(app.moneyCurrent, false, &current)) {
         app.locateStatus = "第一次使用需要引导定位：把游戏里显示的当前金额填到「游戏当前值」，"
                            "再点「直接改钱」（之后就不需要再填了）。";
         return;
@@ -2092,6 +2617,11 @@ void directModifyMoney(AppState& app) {
 }
 
 void directModifyXp(AppState& app) {
+    if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
+        app.locateStatus = reason;
+        logLine(reason);
+        return;
+    }
     if (app.busy.load()) {
         app.locateStatus = "已有任务在进行，请等它结束。";
         return;
@@ -2113,7 +2643,7 @@ void directModifyXp(AppState& app) {
         return;
     }
     double current = 0.0;
-    if (!parseNumber(app.moneyCurrent, false, &current)) {
+    if (selectedGame() == GameId::Ets2 && !parseNumber(app.moneyCurrent, false, &current)) {
         app.locateStatus = "经验地址随金钱定位一并取得：把游戏里显示的当前金额填到「游戏当前值」，"
                            "再点「直接改经验」。";
         return;
@@ -2245,6 +2775,14 @@ void writeLocatedXp(AppState& app, bool lock) {
 }
 
 void renderMoneyTab(AppState& app) {
+    if (!supportsVerifiedStructures(selectedGame())) {
+        ::ImGui::TextWrapped("美卡自动金钱/经验定位尚未适配。请使用下面的通用扫描，或在存档管理中修改支持的明文字段。");
+        renderValuePanel(app, PanelKind::Money, "现金（手动扫描）", "输入当前金额，变化后收窄。",
+                         &app.moneyType, app.moneyCurrent, app.moneyTarget, &app.moneyLock);
+        renderValuePanel(app, PanelKind::Xp, "经验（手动扫描）", "输入当前经验，变化后收窄。",
+                         &app.xpType, app.xpCurrent, app.xpTarget, &app.xpLock);
+        return;
+    }
     // ---------------- 主流程：直接修改（免锁定） ----------------
     ::ImGui::BeginChild("##locate_economy", ImVec2(0, 0),
                         ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
@@ -2252,14 +2790,14 @@ void renderMoneyTab(AppState& app) {
     ::ImGui::Separator();
     ::ImGui::Spacing();
     ::ImGui::TextWrapped("程序定位游戏自己的权威存储（bank.money_account / economy.experience_points）"
-                         "后一次性写入。游戏界面、收支结算、自动存档读的都是这两个字段，"
+                         "后一次性写入。美卡自动识别银行对象，无需填写当前金额。游戏界面、收支结算、自动存档读的都是这两个字段，"
                          "所以写完不会被改回去，也不需要「锁定」。");
     ::ImGui::Spacing();
 
     // 第一次使用的引导输入：定位需要用当前金额做一次种子扫描。
     // 定位期间禁用输入：工作线程只使用启动前复制的快照，界面缓冲区不能同时被编辑。
     const bool inputsLocked = app.busy.load();
-    if (!app.locatedMoneyAddress) {
+    if (!app.locatedMoneyAddress && selectedGame() == GameId::Ets2) {
         ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 当前金额（仅首次定位需要）");
         ::ImGui::SameLine(220.0f);
         ::ImGui::SetNextItemWidth(170);
@@ -2420,11 +2958,31 @@ void renderMoneyTab(AppState& app) {
 }
 
 void renderVehicleTabImpl(AppState& app) {
-    if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock || app.autoAntiRollLock)) {
+    if (!supportsVerifiedStructures(selectedGame())) {
+        ::ImGui::TextWrapped("美卡车辆固定内存功能尚未适配；当前仅显示只读遥测。手动扫描不会使用欧卡偏移。");
+        if (::GetTickCount64() - app.telemetryCheckedAt >= 1000) {
+            app.telemetryCheckedAt = ::GetTickCount64();
+            app.telemetryAvailable = readTelemetry(&app.telemetry, &app.telemetryError);
+        }
+        if (app.telemetryAvailable) {
+            ::ImGui::Text("油量：%.2f / %.2f L", app.telemetry.fuel, app.telemetry.fuelCapacity);
+            ::ImGui::Text("速度：%.1f km/h ｜ 遥测 revision %u", app.telemetry.speed * 3.6f, app.telemetry.pluginRevision);
+            ::ImGui::Text("发动机 / 变速箱 / 车厢 / 底盘 / 车轮磨损：%.2f%% / %.2f%% / %.2f%% / %.2f%% / %.2f%%",
+                app.telemetry.wear[0] * 100.0f, app.telemetry.wear[1] * 100.0f,
+                app.telemetry.wear[2] * 100.0f, app.telemetry.wear[3] * 100.0f, app.telemetry.wear[4] * 100.0f);
+        } else ::ImGui::TextWrapped("遥测：%s", app.telemetryError.c_str());
+        if (::ImGui::CollapsingHeader("手动油量和损伤扫描")) {
+            renderValuePanel(app, PanelKind::Fuel, "油量（手动扫描）", "扫描后根据游戏变化继续收窄。",
+                &app.fuelType, app.fuelCurrent, app.fuelTarget, &app.fuelLock);
+            renderValuePanel(app, PanelKind::Damage, "损伤（手动扫描）", "确认类型及地址后再写入。",
+                &app.damageType, app.damageCurrent, app.damageTarget, &app.damageLock);
+        }
+        return;
+    }
+    if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock)) {
         const std::string liveStatus = app.vehicleLocker->status();
         if (app.autoFuelLock) app.fuelStatus = liveStatus;
         if (app.autoDamageLock) app.damageStatus = liveStatus;
-        if (app.autoAntiRollLock) app.antiRollStatus = liveStatus;
     }
 
     // --- 一键车辆状态锁定 Card ---
@@ -2469,52 +3027,6 @@ void renderVehicleTabImpl(AppState& app) {
     ::ImGui::Spacing();
     ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "油量：%s", app.fuelStatus.c_str());
     ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "损伤：%s", app.damageStatus.c_str());
-    ::ImGui::EndChild();
-
-    ::ImGui::Spacing();
-
-    // --- 防侧翻 / 动态重心稳定 Card ---
-    ::ImGui::BeginChild("##anti_roll", ImVec2(0, 0),
-                        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 防侧翻 / 重心稳定");
-    ::ImGui::Separator();
-    ::ImGui::Spacing();
-
-    bool antiRoll = app.autoAntiRollLock;
-    if (::ImGui::Checkbox("防侧翻（高速过弯自动回正）", &antiRoll)) {
-        toggleAutoAntiRollLock(app, antiRoll, app.antiRollFactor);
-    }
-    ::ImGui::SameLine(380.0f);
-    if (app.autoAntiRollLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 生效中 %.1fx ]", app.antiRollFactor);
-    } else {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
-    }
-
-    ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("强度");
-    ::ImGui::SameLine();
-    static const float kFactors[] = {1.5f, 2.0f, 3.0f, 5.0f};
-    static const char* kFactorLabels[] = {"1.5×", "2.0×", "3.0× 推荐", "5.0×"};
-    for (int i = 0; i < 4; ++i) {
-        if (i > 0) ::ImGui::SameLine();
-        const bool active = std::fabs(app.antiRollFactor - kFactors[i]) < 0.1f;
-        if (active) {
-            ::ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.95f, 1.0f));
-        }
-        if (::ImGui::Button(kFactorLabels[i])) {
-            app.antiRollFactor = kFactors[i];
-            if (app.autoAntiRollLock && app.vehicleLocker) {
-                app.vehicleLocker->setAntiRollFactor(app.antiRollFactor);
-            }
-        }
-        if (active) {
-            ::ImGui::PopStyleColor();
-        }
-    }
-
-    ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "状态：%s", app.antiRollStatus.c_str());
     ::ImGui::EndChild();
 
     ::ImGui::Spacing();
@@ -2938,7 +3450,7 @@ void renderTeleportSection(AppState& app) {
         DWORD pid = app.pid;
         if (!pid) {
             std::wstring exe;
-            findProcess(L"eurotrucks2.exe", &pid, &exe);
+            findProcess(selectedProcessName(), &pid, &exe);
         }
         if (pid) {
             uintptr_t hwnd = findGameWindow(pid);
@@ -3023,7 +3535,7 @@ std::string multiplayerGateForSafeFeature(const AppState& app) {
     DWORD pid = app.pid;
     if (!pid) {
         std::wstring exe;
-        findProcess(L"eurotrucks2.exe", &pid, &exe);
+        findProcess(selectedProcessName(), &pid, &exe);
     }
     MultiplayerStatus status = checkMultiplayer(pid);
     if (status.kind == MultiplayerKind::TruckersMp) {
@@ -3215,7 +3727,7 @@ void renderFlyModeSection(AppState& app) {
             DWORD pid = app.pid;
             if (!pid) {
                 std::wstring exe;
-                findProcess(L"eurotrucks2.exe", &pid, &exe);
+                findProcess(selectedProcessName(), &pid, &exe);
             }
             if (pid) {
                 uintptr_t hwnd = findGameWindow(pid);
@@ -3239,7 +3751,7 @@ void renderFlyModeSection(AppState& app) {
             DWORD pid = app.pid;
             if (!pid) {
                 std::wstring exe;
-                findProcess(L"eurotrucks2.exe", &pid, &exe);
+                findProcess(selectedProcessName(), &pid, &exe);
             }
             if (pid) {
                 sendKeyTap('1', pid);
@@ -3249,7 +3761,8 @@ void renderFlyModeSection(AppState& app) {
 }
 
 void renderSaveTabImpl(AppState& app) {
-    ::ImGui::TextUnformatted("本地与 Steam 云存档；加密存档只读，明文存档可改现金 / 经验（需先退出游戏）。");
+    ::ImGui::BeginDisabled(app.busy);
+    ::ImGui::TextUnformatted("本地与 Steam 云存档；复制卡车支持自动解密和转换，明文存档可改现金 / 经验（需先退出游戏）。");
     ::ImGui::Spacing();
     if (::ImGui::Button("刷新存档列表", ImVec2(120, 0))) refreshSaves(app);
     ::ImGui::SameLine();
@@ -3262,9 +3775,77 @@ void renderSaveTabImpl(AppState& app) {
         ::CreateDirectoryW(root.c_str(), nullptr);
         ::ShellExecuteW(nullptr, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
+    ::ImGui::SameLine();
+    if (::ImGui::Button("打开导出文件夹", ImVec2(130, 0))) {
+        const std::wstring exports = documentsDir() + L"\\exports";
+        if (!isDirSegment(exports)) ::CreateDirectoryW(exports.c_str(), nullptr);
+        if (!isDirSegment(exports)) {
+            app.saveNote = "打开导出文件夹失败：目标不是可用目录";
+            logLine(app.saveNote);
+        } else if ((INT_PTR)::ShellExecuteW(nullptr, L"open", exports.c_str(), nullptr, nullptr,
+                                            SW_SHOWNORMAL) <= 32) {
+            app.saveNote = "打开导出文件夹失败：系统无法打开该目录";
+            logLine(app.saveNote);
+        }
+    }
+
+    ::ImGui::SameLine();
+    if (::ImGui::Button("复制为新存档")) {
+        if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) app.saveNote = "请先选择源存档";
+        else {
+            std::string error;
+            if (copyBlockedByRunningGame(selectedGame(), &error)) app.saveNote = error;
+            else {
+                app.copyRequest = {selectedGame(), app.slots[(size_t)app.selectedSlot], {}};
+                const auto& name = app.copyRequest.source.displayName;
+                ::strncpy_s(app.copyName, (name.empty() ? std::string("存档副本") : name + " 副本").c_str(), _TRUNCATE);
+                app.showCopyDialog = true;
+            }
+        }
+    }
+    if (app.showCopyDialog) { ::ImGui::OpenPopup("复制为新存档##copy"); app.showCopyDialog = false; }
+    if (::ImGui::BeginPopupModal("复制为新存档##copy", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (app.copyRequest.source.slotDir.empty()) ::ImGui::CloseCurrentPopup();
+        ::ImGui::Text("游戏：%s", gameDescriptor(app.copyRequest.game).shortName);
+        ::ImGui::Text("档案：%s / 源槽位：%s", W2U(app.copyRequest.source.profileName).c_str(), W2U(app.copyRequest.source.slotName).c_str());
+        ::ImGui::TextUnformatted("在同一档案创建空闲编号；保留全部存档文件和游戏进度。名称最多 64 个字符。");
+        ::ImGui::SetNextItemWidth(420);
+        ::ImGui::InputText("新存档名称", app.copyName, sizeof(app.copyName));
+        std::string escaped, error;
+        bool valid = siiEscapeName(app.copyName, &escaped, &error);
+        if (!valid) ::ImGui::TextWrapped("%s", error.c_str());
+        ::ImGui::BeginDisabled(!valid);
+        if (::ImGui::Button("开始复制")) { startSaveCopy(app); ::ImGui::CloseCurrentPopup(); }
+        ::ImGui::EndDisabled();
+        ::ImGui::SameLine();
+        if (::ImGui::Button("取消")) ::ImGui::CloseCurrentPopup();
+        ::ImGui::EndPopup();
+    }
 
     ::ImGui::Spacing();
-    if (::ImGui::BeginTable("##slots", 6,
+    if (::ImGui::Button("跨存档复制卡车")) {
+        if(app.truckTransferUiProbe.capture) app.truckTransferUiProbe.clicked=true;
+        openTruckTransfer(app);
+    }
+    if(app.truckTransferUiProbe.capture) {
+        const auto lo=::ImGui::GetItemRectMin(),hi=::ImGui::GetItemRectMax();
+        app.truckTransferUiProbe.buttonX=(lo.x+hi.x)/2;
+        app.truckTransferUiProbe.buttonY=(lo.y+hi.y)/2;
+    }
+    if(app.busy && ::ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ::ImGui::SetTooltip("当前任务正在处理中，请完成或取消后再复制卡车。");
+    ::ImGui::SameLine();
+    ::ImGui::TextDisabled("直接选择现有存档；退出对应游戏后使用");
+    ::ImGui::EndDisabled();
+    renderTruckTransferDialog(app);
+    ::ImGui::BeginDisabled(app.busy);
+    ::ImGui::Spacing();
+    if (::ImGui::Button("拆分为独立档案")) openProfileSplit(app);
+    ::ImGui::SameLine();
+    ::ImGui::TextDisabled("同一档案的多个存档 → 各自独立的本地档案");
+    renderProfileSplitDialog(app);
+    ::ImGui::TextWrapped("%s",app.saveNote.c_str());
+    if (::ImGui::BeginTable("##slots", 7,
                             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
                             ImVec2(0, 230))) {
@@ -3274,6 +3855,7 @@ void renderSaveTabImpl(AppState& app) {
         ::ImGui::TableSetupColumn("位置", ImGuiTableColumnFlags_WidthFixed, 70);
         ::ImGui::TableSetupColumn("格式", ImGuiTableColumnFlags_WidthFixed, 110);
         ::ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 90);
+        ::ImGui::TableSetupColumn("存档名称", ImGuiTableColumnFlags_WidthStretch);
         ::ImGui::TableHeadersRow();
         for (int i = 0; i < (int)app.slots.size(); ++i) {
             const SaveSlot& slot = app.slots[(size_t)i];
@@ -3296,6 +3878,8 @@ void renderSaveTabImpl(AppState& app) {
             ::ImGui::TextUnformatted(slot.formatText.c_str());
             ::ImGui::TableSetColumnIndex(5);
             ::ImGui::TextUnformatted(formatSize(slot.size).c_str());
+            ::ImGui::TableSetColumnIndex(6);
+            ::ImGui::TextUnformatted(slot.displayName.empty() ? "—" : slot.displayName.c_str());
         }
         ::ImGui::EndTable();
     }
@@ -3316,7 +3900,6 @@ void renderSaveTabImpl(AppState& app) {
     ::ImGui::InputText("##sxp", app.saveXp, sizeof(app.saveXp), ImGuiInputTextFlags_CharsDecimal);
     ::ImGui::SameLine();
     if (::ImGui::Button("写入明文存档", ImVec2(130, 0))) applyTextPatch(app);
-    ::ImGui::TextWrapped("%s", app.saveNote.c_str());
 
     ::ImGui::Spacing();
     ::ImGui::TextUnformatted("备份列表");
@@ -3351,17 +3934,20 @@ void renderSaveTabImpl(AppState& app) {
         }
         ::ImGui::EndTable();
     }
+    ::ImGui::EndDisabled();
+    if (app.busy && ::ImGui::Button("取消当前任务")) app.cancel = true;
 }
 
 void renderHelpTabImpl(AppState& app) {
     static const char* kHelp =
         "【前提】先启动游戏（单机），再点顶部「附加游戏」；改内存需要管理员权限。\n"
         "\n"
-        "【改钱 / 经验】首次：把游戏里显示的金额填到「当前金额」→ 点「直接改钱」自动定位并写入。\n"
+        "【改钱 / 经验】美卡：填写目标金额后直接改钱；欧卡首次需填写当前金额作为定位种子。\n"
         "　　　　　　　之后：直接填目标值再点一次即可。写的是游戏权威存储，无需锁定。\n"
         "【车辆】附加后直接勾选，无需填数值；换车、读档自动跟随当前车辆。\n"
         "【扫描器】任意数值都可扫描；向多个候选地址写入前会要求确认。\n"
-        "【存档】备份 / 还原 / 解密导出；明文存档改数值需先退出游戏。\n"
+        "【存档】备份 / 还原 / 解密导出（导出到 文档\\exports，不覆盖旧文件）/ 复制为新存档；"
+        "写入与复制需先退出对应游戏。\n"
         "\n"
         "【加密存档为什么不能改】ScsC 头部含游戏自己的校验值，强写会损坏存档，\n"
         "因此只做只读解密。要持久化金额请改内存，再让游戏自动存档。\n"
@@ -3476,10 +4062,10 @@ void renderConfirmDialogs(AppState& app) {
             ::ImGui::Text("备份时间：%s", W2U(info->time).c_str());
         }
         DWORD gamePid = 0;
-        const bool gameRunning = findProcess(L"eurotrucks2.exe", &gamePid, nullptr);
+        const bool gameRunning = findProcess(selectedProcessName(), &gamePid, nullptr);
         if (gameRunning) {
             ::ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.35f, 1.0f),
-                                 "欧卡2仍在运行（PID %u），请先退出游戏。", gamePid);
+                                 "%s仍在运行（PID %u），请先退出游戏。", selectedGameDescriptor().shortName, gamePid);
         } else {
             ::ImGui::TextWrapped("程序会先备份当前存档，再覆盖还原。请确认已暂停 Steam 云同步或了解冲突处理方式。");
         }
@@ -3501,6 +4087,9 @@ void renderConfirmDialogs(AppState& app) {
 void renderApp(AppState& app) {
     applyPending(app);
     consumePendingEconomy(app);  // 经济定位线程的结构化结果由本线程统一落地
+    consumePendingCopy(app);
+    consumePendingTransferInspection(app);
+    consumePendingSplit(app);
     // 刷新写入闸门策略快照（pid / 联运策略）：工作线程只读这份原子快照
     updateWriteGatePolicy(app);
     // 发动机后台（换车/新基准/恢复成败/待恢复记录变化）→ 立即持久化。
@@ -3523,15 +4112,35 @@ void renderApp(AppState& app) {
                        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
 
     // ---------------- 顶部现代化 Hero Header 状态栏 ----------------
-    const bool attached = app.mem.isOpen() && app.mem.alive();
-    ::ImGui::BeginChild("##top_hero_panel", ImVec2(0, 72), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+    ::ImGui::BeginChild("##top_hero_panel", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
     
     // 主标题与进程状态指示
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "EURO TRUCK SIMULATOR 2");
+    {
+        const GameId ids[] = {GameId::Ets2, GameId::Ats};
+        for (size_t gi = 0; gi < 2; ++gi) {
+            const GameDescriptor& d = gameDescriptor(ids[gi]);
+            const bool active = (selectedGame() == d.id);
+            if (gi > 0) ::ImGui::SameLine();
+            if (active) {
+                ::ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.95f, 1.0f));
+            }
+            if (::ImGui::Button(d.shortName, ImVec2(72, 24)) && !active) selectGame(app, d.id);
+            if (active) ::ImGui::PopStyleColor();
+        }
+        if (!supportsVerifiedStructures(selectedGame())) {
+            ::ImGui::SameLine();
+            ::ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.25f, 1.0f),
+                                 "｜美卡布局尚未验证：结构化写入已禁用");
+        }
+    }
+    ::ImGui::Spacing();
+    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "欧卡2 / 美卡");
     ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "TRAINER");
+    ::ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "TRAINER ｜ %s",
+                         selectedGameDescriptor().displayName);
 
     ::ImGui::SameLine(460.0f);
+    const bool attached = app.mem.isOpen() && app.mem.alive();
     if (attached) {
         ::ImGui::TextColored(ImVec4(0.20f, 0.88f, 0.50f, 1.0f), "● 游戏已连接运行中");
     } else {
@@ -3542,7 +4151,9 @@ void renderApp(AppState& app) {
         ::ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), " |  ⚠ TruckersMP 联机中");
     } else {
         ::ImGui::TextColored(ImVec4(0.50f, 0.75f, 0.95f, 1.0f),
-                             isConvoyCheckEnabled() ? " |  单机模式" : " |  官方联运可用");
+                             !attached ? " |  联机状态待检测" :
+                             (app.mpBlocks ? " |  写入被联机守卫拦截" :
+                              (isConvoyCheckEnabled() ? " |  未检测到联机" : " |  未检测 Convoy")));
     }
     if (!isAdmin()) {
         ::ImGui::SameLine();
@@ -3557,13 +4168,13 @@ void renderApp(AppState& app) {
     if (::ImGui::Button(" 刷新检测 ", ImVec2(100, 28))) {
         DWORD pid = 0;
         std::wstring exe;
-        if (findProcess(L"eurotrucks2.exe", &pid, &exe)) {
+        if (findProcess(selectedProcessName(), &pid, &exe)) {
             if (!attached) {
                 app.procStatus = fmt("发现 %s (PID %u) —— 点「附加游戏」开始", W2U(exe).c_str(), pid);
                 logLine(app.procStatus);
             }
         } else {
-            app.procStatus = "没有找到 eurotrucks2.exe，请先启动游戏";
+            app.procStatus = fmt("没有找到 %s，请先启动游戏", W2U(selectedProcessName()).c_str());
             logLine(app.procStatus);
         }
     }
@@ -3599,7 +4210,8 @@ void renderApp(AppState& app) {
             renderScannerTabImpl(app);
             ::ImGui::EndTabItem();
         }
-        if (::ImGui::BeginTabItem("  存档管理 / 备份  ")) {
+        if (::ImGui::BeginTabItem("  存档管理 / 备份  ", nullptr, app.activeTab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+            app.activeTab = -1;
             renderSaveTabImpl(app);
             ::ImGui::EndTabItem();
         }
@@ -3625,9 +4237,9 @@ void renderApp(AppState& app) {
         ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "%s  %d%%", app.progressNote.c_str(),
                              (int)(frac * 100.0f + 0.5f));
         ::ImGui::SameLine();
-        if (::ImGui::Button(" 取消扫描 ", ImVec2(90, 22))) {
+        if (::ImGui::Button(" 取消任务 ", ImVec2(90, 22))) {
             app.cancel.store(true);
-            logLine("已请求取消当前扫描……");
+            logLine("已请求取消当前任务……");
         }
     } else {
         std::vector<std::string> lines = logSnapshot();
@@ -3647,7 +4259,12 @@ void renderApp(AppState& app) {
         logClear();
     }
 
+    if (!logFileError().empty()) {
+        ::ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", logFileError().c_str());
+    }
     if (showFullLog) {
+        ::ImGui::TextWrapped("实时会话日志：%s", W2U(logFilePath()).c_str());
+
         ::ImGui::Separator();
         ::ImGui::BeginChild("##log_expanded", ImVec2(0, 56), ImGuiChildFlags_None,
                             ImGuiWindowFlags_HorizontalScrollbar);

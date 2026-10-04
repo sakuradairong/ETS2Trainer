@@ -226,6 +226,30 @@ std::vector<TunerTestItem> runEngineTunerTests() {
         items.push_back({name, ok, detail});
     };
 
+    {
+        const GameId previous=selectedGame(); setSelectedGame(GameId::Ats);
+        {
+            Rig rig;
+            const FakeEngineValues car{556.0f,419.78f,436.46f,650.0f,6500.0f,3800.0f,100.0f};
+            rig.memory->mapEngine(kEngineA,car); rig.resolver->setObject(kEngineA);
+            std::string error;
+            bool ok=rig.tuner.apply(1.25f,true,&error);
+            auto values=rig.memory->read(kEngineA);
+            add("ATS 汽车 DLC 高转速动力写入",ok && closeTo(values.torque,695.0f) && closeTo(values.rpmLimit,7150.0f) && closeTo(values.rpmLimitNeutral,4180.0f),error);
+            rig.tuner.maintenance(&error);
+            add("ATS 高转速动力保持不叠加",closeTo(rig.memory->read(kEngineA).torque,695.0f),error);
+            ok=rig.tuner.release(&error); values=rig.memory->read(kEngineA);
+            add("ATS 汽车原厂动力与转速恢复",ok && closeTo(values.torque,556.0f) && closeTo(values.rpmLimit,6500.0f) && closeTo(values.copyA,419.78f),error);
+            rig.memory->failWritesTo(kEngineA+engine_runtime::kRpmLimitNeutral,true);
+            ok=rig.tuner.apply(1.25f,true,&error); values=rig.memory->read(kEngineA);
+            add("ATS 动力事务失败回滚",!ok && closeTo(values.torque,556.0f) && closeTo(values.rpmLimit,6500.0f),error);
+            rig.memory->failWritesTo(kEngineA+engine_runtime::kRpmLimitNeutral,false);
+            ok=rig.tuner.release(&error); values=rig.memory->read(kEngineA);
+            add("ATS 故障解除后确认恢复",ok && rig.tuner.exportState().empty() && closeTo(values.torque,556.0f) && closeTo(values.rpmLimitNeutral,3800.0f),error);
+        }
+        setSelectedGame(previous);
+    }
+
     // ---------- 1. 倍率反复切换不叠加 ----------
     {
         Rig rig;
@@ -860,7 +884,6 @@ std::vector<TunerTestItem> runEngineTunerTests() {
         AppState app;
         ::strncpy_s(app.moneyTarget, sizeof(app.moneyTarget), "424242", _TRUNCATE);
         ::strncpy_s(app.xpTarget, sizeof(app.xpTarget), "7777", _TRUNCATE);
-        app.antiRollFactor = 2.0f;
         app.workers = 6;
         app.engineStateText = "1;3800.0000;3773.4000;3800.0000;2000.0000;2000.0000;"
                               "4750.0000;4716.7500;4750.0000;2000.0000;2000.0000;1.250;0";
@@ -873,7 +896,6 @@ std::vector<TunerTestItem> runEngineTunerTests() {
         if (ok) {
             ok = std::string(loaded.moneyTarget) == "424242" &&
                  std::string(loaded.xpTarget) == "7777" && loaded.workers == 6 &&
-                 std::fabs(loaded.antiRollFactor - 2.0f) < 1e-4f &&
                  loaded.engineStateText == app.engineStateText;
             if (!ok) detail = "设置往返不一致";
         }

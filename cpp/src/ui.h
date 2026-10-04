@@ -1,10 +1,15 @@
 // ui.h —— 界面层：应用状态 + 渲染入口
 #pragma once
+
+#include "gameplay.h"
 #include "engine.h"
 #include "gameconfig.h"
 #include "gameio.h"
 #include "memory.h"
 #include "saves.h"
+#include "savecopy.h"
+#include "trucktransferio.h"
+#include "profilesplit.h"
 #include "vehicle.h"
 
 #include <algorithm>
@@ -17,6 +22,12 @@
 #include <vector>
 
 namespace ets2 {
+
+struct ProfileSplitRow {
+    SaveSlot source;
+    bool selected = false;
+    char name[512] = {0};
+};
 
 bool validateAttachedSessionReuse(std::string* error);
 
@@ -56,6 +67,19 @@ struct PendingEconomyResult {
     std::string log;                      // 单行日志
 };
 
+struct PendingTransferInspection {
+    bool ready = false, ok = false, target = false;
+    GameId game = GameId::Ets2;
+    uint64_t generation = 0;
+    TransferInventory inventory;
+    std::string error;
+};
+
+struct TruckTransferUiProbe {
+    bool capture = false, clicked = false, noticeVisible = false;
+    float buttonX = 0, buttonY = 0;
+};
+
 struct AppState {
     // ---------- 进程 ----------
     ProcessMemory                 mem;
@@ -70,6 +94,10 @@ struct AppState {
     std::string                   procStatus = "未附加：请先启动游戏，再点「附加游戏」";
     bool                          attached = false;
     std::string                   memInfo;
+    TelemetrySnapshot telemetry;
+    bool telemetryAvailable = false;
+    uint64_t telemetryCheckedAt = 0;
+    std::string telemetryError;
 
     // ---------- 扫描会话 ----------
     std::unique_ptr<ScanSession> moneySession;
@@ -105,19 +133,21 @@ struct AppState {
     bool  damageLock = false;
     bool  autoFuelLock = false;
     bool  autoDamageLock = false;
-    bool  autoAntiRollLock = false;
-    float antiRollFactor = 3.0f;       // 1.0=原厂, 2.0=增强稳定, 3.0=不倒翁推荐, 5.0=绝对防翻
     int   enginePowerOption = 0;   // 0=原厂, 1=1.25×, 2=1.50×, 3=2.00×
     bool  engineRaiseLimit = false;
     std::string engineStatus = "未启用。动力调节直接改写发动机数据，不扫描内存。";
     // 上次运行留下的「写入值 / 原厂基准」，用于防止跨进程重启后把放大值当原厂值
     std::string engineStateText;
+    std::string engineStateEts2;  // 历史 engine_state 仅属于欧卡。
+    std::string engineStateAts;   // 美卡独立恢复凭据。
     std::string moneyStatus = "还没扫描。先在游戏里看一眼现金，填到「当前数值」再扫描。";
     std::string xpStatus = "还没扫描。经验在游戏里是 32 位整数。";
     std::string fuelStatus = "未启用。进入驾驶界面后直接勾选「无限油量」。";
     std::string damageStatus = "未启用。进入驾驶界面后直接勾选「车辆无损」。";
-    std::string antiRollStatus = "未启用。方案B：直接改写物理车辆重心/防倾阻尼，极速急转弯不翻车。";
     std::string scanStatus = "未扫描";
+    // 收藏点按游戏分开保存，切换游戏不会把欧卡2 的收藏带进美卡（反之亦然）。
+    std::string teleportSpotsEts2;
+    std::string teleportSpotsAts;
 
     // ---------- 金钱 / 经验：结构化定位结果 ----------
     uint64_t    locatedMoneyAddress = 0;   // bank 对象 + 0x18
@@ -203,6 +233,31 @@ struct AppState {
     std::string   saveNote = "选中一个存档后，这里会显示它的数值情况。";
     TextValues    slotValues;
     bool          showBackupDialog = false;
+    bool          showCopyDialog = false;
+    SaveCopyRequest copyRequest;
+    char          copyName[512] = {0};
+    SaveCopyResult pendingCopy;
+    bool          pendingCopyReady = false;
+    bool          pendingCopyTruck = false;
+    bool          showTruckTransfer = false;
+    bool          showTruckTransferNotice = false;
+    std::string   truckTransferNotice;
+    TruckTransferUiProbe truckTransferUiProbe;
+    TruckTransferRequest truckTransferRequest;
+    TransferInventory transferSourceInventory, transferTargetInventory;
+    std::vector<SaveSlot> transferTargets;
+    int transferTruckIndex = 0, transferTargetIndex = -1, transferGarageIndex = 0;
+    char transferName[512] = {0};
+    std::string transferNote;
+    bool transferInspectBusy = false, transferTargetReady = false;
+    uint64_t transferInspectionGeneration = 0;
+    PendingTransferInspection pendingTransferInspection;
+    bool showProfileSplit = false;
+    GameId splitGame = GameId::Ets2;
+    std::vector<ProfileSplitRow> splitRows;
+    ProfileSplitResult pendingSplit;
+    bool pendingSplitReady = false;
+    bool splitUiFixture = false;
 
     // ---------- 设置 ----------
     float maxRegionGb = 1.0f;
@@ -240,7 +295,9 @@ void startNextScan(AppState& app, PanelKind kind, ScanMode mode);
 void writePanelValues(AppState& app, PanelKind kind, bool confirmed = false);
 void togglePanelLock(AppState& app, PanelKind kind, bool lock, bool confirmed = false);
 void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled);
-void toggleAutoAntiRollLock(AppState& app, bool enabled, float factor);
+// 切换目标游戏：先停下所有写入线程并恢复现场，再改变选择；不满足条件时拒绝切换。
+bool selectGame(AppState& app, GameId id, const std::wstring& settingsPath = {});
+void startLocateEconomy(AppState& app);
 // 金钱 / 经验的「直接修改（免锁定）」实现位于 ui.cpp 匿名命名空间内：
 // directModifyMoney / directModifyXp / startLocateEconomy / clearLocatedEconomy，
 // 仅供 renderMoneyTab 内部使用。
