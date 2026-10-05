@@ -1674,6 +1674,7 @@ int runGameSelftest(const std::wstring& outPath) {
     for (const auto& item : runEngineTunerTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runEconomyLocateTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runSaveCopyTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runReadableExportTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runTruckTransferTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runProfileSplitTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runBsiiTests()) check(item.name.c_str(), item.ok, item.detail);

@@ -1,6 +1,7 @@
 // saves.cpp —— 存档处理实现
 #include "saves.h"
 #include "savecopy.h"
+#include "bsii.h"
 
 #include "gameplay.h"
 
@@ -598,24 +599,44 @@ bool decryptSave(const std::wstring& path, std::vector<uint8_t>& inner, DecryptI
     return true;
 }
 
-bool exportDecrypted(const SaveSlot& slot, const std::wstring& outPath, DecryptInfo* info,
-                     std::string* err) {
-    std::vector<uint8_t> inner;
-    if (!decryptSave(slot.gameSii, inner, info, err)) {
-        if (err && err->empty()) *err = "读取或解密存档失败";
-        return false;
+namespace {
+
+bool exportCanceled(const std::function<bool()>& canceled, std::string* error) {
+    if (!canceled || !canceled()) return false;
+    if (error) *error = "导出已取消，未发布输出文件";
+    return true;
+}
+
+// 只清理由本次 CREATE_NEW 成功创建的临时文件；名称冲突时不碰其他导出者的文件。
+struct ExportTempFile {
+    std::wstring path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool owned = false;
+
+    explicit ExportTempFile(std::wstring p) : path(std::move(p)) {}
+    void close() {
+        if (handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
     }
-    // 导出采用“先写唯一临时文件、再以不覆盖方式发布”的语义：
-    // 目标已存在（含并发竞态）一律失败且原样保留，绝不覆盖已有导出。
+    ~ExportTempFile() {
+        close();
+        if (owned) ::DeleteFileW(path.c_str());
+    }
+};
+
+// 两种导出共用不覆盖发布流程。取消、写入失败及目标竞态均不留下半成品。
+bool publishExport(const std::wstring& outPath, const uint8_t* data, size_t size,
+                   const std::function<bool()>& canceled, std::string* err) {
+    if (exportCanceled(canceled, err)) return false;
     const size_t slash = outPath.find_last_of(L"\\/");
     if (slash == std::wstring::npos || slash + 1 >= outPath.size()) {
-        if (info) *info = DecryptInfo{};
         if (err) *err = "导出路径无效（缺少文件名）";
         return false;
     }
     const std::wstring dir = outPath.substr(0, slash);
     if (::GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-        if (info) *info = DecryptInfo{};
         if (err) {
             const DWORD attr = ::GetFileAttributesW(outPath.c_str());
             *err = (attr & FILE_ATTRIBUTE_DIRECTORY) ? "导出目标已存在且是目录" : "导出目标已存在，未覆盖";
@@ -623,46 +644,122 @@ bool exportDecrypted(const SaveSlot& slot, const std::wstring& outPath, DecryptI
         return false;
     }
     for (int attempt = 0; attempt < 16; ++attempt) {
-        std::wstring temp = dir + L"\\~ets2export_" + std::to_wstring(::GetCurrentProcessId()) +
+        if (exportCanceled(canceled, err)) return false;
+        ExportTempFile temp(dir + L"\\~ets2export_" + std::to_wstring(::GetCurrentProcessId()) +
                             L"_" + std::to_wstring(::GetTickCount64()) + L"_" +
-                            std::to_wstring(attempt) + L".tmp";
-        HANDLE h = ::CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                                 FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        bool ok = false;
-        do {
-            const uint8_t* ptr = inner.data();
-            size_t remaining = inner.size();
-            bool wrote = true;
-            while (remaining > 0) {
-                DWORD chunk = (remaining > 0x40000000u) ? 0x40000000u : (DWORD)remaining;
-                DWORD written = 0;
-                if (!::WriteFile(h, ptr, chunk, &written, nullptr) || written != chunk) { wrote = false; break; }
-                ptr += written; remaining -= written;
+                            std::to_wstring(attempt) + L".tmp");
+        temp.handle = ::CreateFileW(temp.path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (temp.handle == INVALID_HANDLE_VALUE) continue;
+        temp.owned = true;
+        size_t offset = 0;
+        while (offset < size) {
+            if (exportCanceled(canceled, err)) return false;
+            const DWORD chunk = static_cast<DWORD>((std::min)(size - offset, size_t{1024 * 1024}));
+            DWORD written = 0;
+            if (!::WriteFile(temp.handle, data + offset, chunk, &written, nullptr) || written != chunk) {
+                if (err) *err = "写入导出文件失败";
+                return false;
             }
-            if (!wrote || (!inner.empty() && !::FlushFileBuffers(h))) break;
-            ok = true;
-        } while (false);
-        ::CloseHandle(h);
-        if (!ok) {
-            ::DeleteFileW(temp.c_str());
-            if (info) *info = DecryptInfo{};
-            if (err) *err = "写入导出文件失败";
+            offset += written;
+        }
+        if (size && !::FlushFileBuffers(temp.handle)) {
+            if (err) *err = "刷新导出文件失败";
             return false;
         }
-        // 不覆盖发布：目标若在竞态中被创建，MoveFileExW 失败且临时文件被清理。
-        if (::MoveFileExW(temp.c_str(), outPath.c_str(), MOVEFILE_WRITE_THROUGH)) return true;
-        ::DeleteFileW(temp.c_str());
+        temp.close();
+        if (exportCanceled(canceled, err)) return false;
+        if (::MoveFileExW(temp.path.c_str(), outPath.c_str(), MOVEFILE_WRITE_THROUGH)) {
+            temp.owned = false;
+            return true;
+        }
         if (::GetFileAttributesW(outPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            if (info) *info = DecryptInfo{};
             if (err) *err = "导出目标已存在，未覆盖";
             return false;
         }
         // 与异常目标竞争，换一个临时名重试；用尽后按写入失败处理。
     }
-    if (info) *info = DecryptInfo{};
     if (err) *err = "写入导出文件失败";
     return false;
+}
+
+}  // namespace
+
+bool exportDecrypted(const SaveSlot& slot, const std::wstring& outPath, DecryptInfo* info,
+                     std::string* err, std::function<bool()> canceled) {
+    if (info) *info = DecryptInfo{};
+    if (err) err->clear();
+    if (exportCanceled(canceled, err)) return false;
+    DecryptInfo local;
+    std::vector<uint8_t> inner;
+    if (!decryptSave(slot.gameSii, inner, &local, err)) return false;
+    if (!publishExport(outPath, inner.data(), inner.size(), canceled, err)) return false;
+    if (info) *info = local;
+    return true;
+}
+
+bool exportReadableSii(const SaveSlot& slot, const std::wstring& outPath, ReadableExportInfo* info,
+                       std::string* err, std::function<bool()> canceled, size_t maxOutputBytes) {
+    if (info) *info = ReadableExportInfo{};
+    if (err) err->clear();
+    if (exportCanceled(canceled, err)) return false;
+    const size_t cap = (std::min)(maxOutputBytes, size_t{128u * 1024u * 1024u});
+    if (!cap) {
+        if (err) *err = "可读文本输出上限必须大于零";
+        return false;
+    }
+    ReadableExportInfo local;
+    DecryptInfo dec;
+    std::vector<uint8_t> inner;
+    if (!decryptSave(slot.gameSii, inner, &dec, err, 128u * 1024u * 1024u)) {
+        if (err && err->empty()) *err = "读取或解密存档失败";
+        if (info) *info = ReadableExportInfo{};
+        return false;
+    }
+    if (exportCanceled(canceled, err)) return false;
+    local.innerFormat = dec.innerFormat;
+    local.innerSize = (uint64_t)inner.size();
+    std::string text;
+    if (dec.innerFormat == "text") {
+        if (inner.size() > cap) {
+            if (err) *err = "可读文本超过输出长度上限";
+            return false;
+        }
+        if (!publishExport(outPath, inner.data(), inner.size(), canceled, err)) return false;
+        local.textSize = inner.size();
+        if (info) *info = local;
+        return true;
+    } else if (dec.innerFormat == "bsii") {
+        if (inner.size() >= 8) {
+            uint32_t version = 0;
+            std::memcpy(&version, inner.data() + 4, sizeof(version));
+            if (version != 3) {
+                if (err) *err = "暂不支持 BSII v" + std::to_string(version) + "，目前仅支持 v3";
+                return false;
+            }
+        }
+        BsiiDecodeStats stats;
+        std::string derr;
+        if (!decodeBsiiText(inner, &text, &derr, canceled, cap, &stats)) {
+            if (exportCanceled(canceled, err)) return false;
+            if (err) *err = derr.empty() ? std::string("BSII 文本转换失败")
+                                         : ("BSII 文本转换失败：" + derr);
+            if (info) *info = ReadableExportInfo{};
+            return false;
+        }
+        local.unitCount = stats.unitCount;
+    } else {
+        if (err) *err = "该格式暂不支持可读导出，请使用“解密导出选中”保留原格式";
+        if (info) *info = ReadableExportInfo{};
+        return false;
+    }
+    if (!publishExport(outPath, reinterpret_cast<const uint8_t*>(text.data()), text.size(), canceled, err)) {
+        if (info) *info = ReadableExportInfo{};
+        return false;
+    }
+    local.textSize = (uint64_t)text.size();
+    if (info) *info = local;
+    return true;
 }
 
 // ======================= 路径与存档定位 =======================

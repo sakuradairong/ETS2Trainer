@@ -75,6 +75,12 @@ struct PendingTransferInspection {
     std::string error;
 };
 
+struct PendingSaveExport {
+    bool ready = false;
+    GameId game = GameId::Ets2;
+    std::string note;
+};
+
 struct TruckTransferUiProbe {
     bool capture = false, clicked = false, noticeVisible = false;
     float buttonX = 0, buttonY = 0;
@@ -239,6 +245,7 @@ struct AppState {
     SaveCopyResult pendingCopy;
     bool          pendingCopyReady = false;
     bool          pendingCopyTruck = false;
+    PendingSaveExport pendingExport;
     bool          showTruckTransfer = false;
     bool          showTruckTransferNotice = false;
     std::string   truckTransferNotice;
@@ -369,6 +376,7 @@ void selectSlot(AppState& app, int index);
 void backupSelectedSlot(AppState& app);
 void restoreSelectedBackup(AppState& app);
 void exportSelectedSlot(AppState& app);
+void exportReadableSelectedSlot(AppState& app);
 void applyTextPatch(AppState& app);
 
 }  // namespace ets2

@@ -2,6 +2,7 @@
 #pragma once
 #include "common.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -69,7 +70,22 @@ bool        decryptSave(const std::wstring& path, std::vector<uint8_t>& inner,
 bool        inflateRaw(const uint8_t* in, size_t inSize, std::vector<uint8_t>& out,
                        std::string* err, size_t maxOutputBytes = 0);
 bool        exportDecrypted(const SaveSlot& slot, const std::wstring& outPath,
-                            DecryptInfo* info, std::string* err);
+                            DecryptInfo* info, std::string* err,
+                            std::function<bool()> canceled = {});
+
+// 可读导出：明文 SII 文本原样写出；BSII v3 解密后交给 BSII 文本解码器转成
+// `SiiNunit` 文本。发布语义与 exportDecrypted 一致（唯一临时文件 + 不覆盖），
+// 未知二进制（如 3nK）在写文件前拒绝。
+struct ReadableExportInfo {
+    std::string innerFormat;    // text / bsii
+    uint64_t    innerSize = 0;  // 解密后的字节数
+    uint64_t    textSize = 0;   // 实际写出的可读文本字节数
+    size_t      unitCount = 0;  // BSII 解码得到的 unit 个数
+};
+bool        exportReadableSii(const SaveSlot& slot, const std::wstring& outPath,
+                              ReadableExportInfo* info, std::string* err,
+                              std::function<bool()> canceled = {},
+                              size_t maxOutputBytes = 128u * 1024u * 1024u);
 
 // ---------- 明文存档数值 ----------
 bool readTextValues(const std::wstring& path, TextValues* out, std::string* err);

@@ -194,7 +194,8 @@ void resetProcessState(AppState& app) {
       app.pendingCopyTruck = false;
       app.pendingCopyReady = false; }
     { std::lock_guard<std::mutex> lock(app.resultMutex);
-      app.pendingSplit = {}; app.pendingSplitReady = false; }
+      app.pendingSplit = {}; app.pendingSplitReady = false;
+      app.pendingExport = {}; }
 }
 
 // ---------- 数值类型下拉框 ----------
@@ -1989,12 +1990,34 @@ std::wstring exportTimestamp() {
 
 }  // namespace
 
-void exportSelectedSlot(AppState& app) {
+namespace {
+
+void consumePendingExport(AppState& app) {
+    PendingSaveExport result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if (!app.pendingExport.ready) return;
+        result = std::move(app.pendingExport);
+        app.pendingExport = {};
+    }
+    if (result.game != selectedGame()) return;
+    app.saveNote = std::move(result.note);
+    logLine(app.saveNote);
+}
+
+void startSelectedExport(AppState& app, bool readable) {
+    if (app.busy) {
+        app.saveNote = "已有后台任务在进行，请等待完成或取消后再导出";
+        return;
+    }
     if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) {
         app.saveNote = "请先在列表里选中一个存档";
         return;
     }
-    const SaveSlot& slot = app.slots[(size_t)app.selectedSlot];
+    joinWorker(app);
+    consumePendingExport(app);
+    const SaveSlot slot = app.slots[(size_t)app.selectedSlot];
+    const GameId game = selectedGame();
     const std::wstring exports = documentsDir() + L"\\exports";
     if (!isDirSegment(exports) && !::CreateDirectoryW(exports.c_str(), nullptr)) {
         const DWORD e = ::GetLastError();
@@ -2004,7 +2027,7 @@ void exportSelectedSlot(AppState& app) {
             return;
         }
     }
-    const std::wstring base = L"save_" + sanitizeExportPart(slot.profileName) + L"_" +
+    const std::wstring base = (readable ? L"readable_" : L"save_") + sanitizeExportPart(slot.profileName) + L"_" +
                               sanitizeExportPart(slot.slotName) + L"_" + exportTimestamp();
     std::wstring outPath;
     for (int i = 0; i < 1000; ++i) {
@@ -2016,23 +2039,64 @@ void exportSelectedSlot(AppState& app) {
         logLine(app.saveNote);
         return;
     }
-    DecryptInfo info;
-    std::string err;
-    if (!exportDecrypted(slot, outPath, &info, &err)) {
-        if (err.empty()) err = "未知错误";
-        app.saveNote = "导出失败：" + err;
+    app.cancel = false;
+    app.progressDone = 0;
+    app.progressTotal = 1;
+    app.progressNote = readable ? "导出可读 SII" : "解密导出存档";
+    app.saveNote = readable ? "正在后台解密并转换可读 SII 文本……" : "正在后台解密导出存档……";
+    app.busy = true;
+    try {
+        app.worker = std::thread([&app, slot, outPath, game, readable]() {
+            PendingSaveExport result;
+            result.game = game;
+            result.ready = true;
+            try {
+                const auto canceled = [&app] { return app.cancel.load(); };
+                std::string err;
+                if (readable) {
+                    ReadableExportInfo info;
+                    if (!exportReadableSii(slot, outPath, &info, &err, canceled)) {
+                        result.note = "可读导出失败：" + (err.empty() ? "未知错误" : err);
+                    } else {
+                        result.note = fmt("已导出可读 SII（%s，%s）-> %s。重复导出不会覆盖旧文件",
+                            info.innerFormat == "bsii" ? "BSII v3 已转换为文本" : "SII 文本原样保留",
+                            formatSize(info.textSize).c_str(), W2U(outPath).c_str());
+                    }
+                } else {
+                    DecryptInfo info;
+                    if (!exportDecrypted(slot, outPath, &info, &err, canceled)) {
+                        result.note = "解密导出失败：" + (err.empty() ? "未知错误" : err);
+                    } else {
+                        const char* kind = info.innerFormat == "text" ? "SII 文本" :
+                                           info.innerFormat == "bsii" ? "BSII 二进制，保留原格式" :
+                                           "3nK 二进制，保留原格式";
+                        result.note = fmt("已解密导出（%s，%s）-> %s。重复导出不会覆盖旧文件",
+                            kind, formatSize(info.innerSize).c_str(), W2U(outPath).c_str());
+                    }
+                }
+            } catch (const std::exception& e) {
+                result.note = std::string("导出失败：") + e.what();
+            } catch (...) {
+                result.note = "导出失败：发生未知异常";
+            }
+            {
+                std::lock_guard<std::mutex> lock(app.resultMutex);
+                app.pendingExport = std::move(result);
+            }
+            app.progressDone = 1;
+            app.busy = false;
+        });
+    } catch (const std::exception& e) {
+        app.busy = false;
+        app.saveNote = std::string("无法启动导出任务：") + e.what();
         logLine(app.saveNote);
-        return;
     }
-    const char* kind = "已识别明文";
-    if (info.innerFormat == "text") kind = "SII文本：可用文本编辑器查看";
-    else if (info.innerFormat == "bsii") kind = "BSII二进制：已解密，但未转换为可读文本";
-    else if (info.innerFormat == "3nk") kind = "3nK二进制：已解密，但未转换为可读文本";
-    app.saveNote = fmt("已解密导出（%s，%s）-> %s。%s", kind,
-                       formatSize(info.innerSize).c_str(), W2U(outPath).c_str(),
-                       "重复导出不会覆盖旧文件");
-    logLine(app.saveNote);
 }
+
+}  // namespace
+
+void exportSelectedSlot(AppState& app) { startSelectedExport(app, false); }
+void exportReadableSelectedSlot(AppState& app) { startSelectedExport(app, true); }
 
 void applyTextPatch(AppState& app) {
     // 存档编辑仅在游戏完全退出后允许：避免游戏自动存档覆盖新值、读写文件竞争，
@@ -3768,8 +3832,11 @@ void renderSaveTabImpl(AppState& app) {
     ::ImGui::SameLine();
     if (::ImGui::Button("备份选中存档", ImVec2(120, 0))) backupSelectedSlot(app);
     ::ImGui::SameLine();
-    if (::ImGui::Button("解密导出选中", ImVec2(120, 0))) exportSelectedSlot(app);
+    if (::ImGui::Button("解密导出选中", ImVec2(130, 0))) exportSelectedSlot(app);
+    if (::ImGui::IsItemHovered()) ::ImGui::SetTooltip("保留解密后的格式：BSII / 3nK 仍为二进制。");
     ::ImGui::SameLine();
+    if (::ImGui::Button("导出可读 SII", ImVec2(150, 0))) exportReadableSelectedSlot(app);
+    if (::ImGui::IsItemHovered()) ::ImGui::SetTooltip("自动解密并把 BSII v3 转成可读文本；已是 SII 文本时原样保留。");
     if (::ImGui::Button("打开备份文件夹", ImVec2(130, 0))) {
         std::wstring root = backupRoot();
         ::CreateDirectoryW(root.c_str(), nullptr);
@@ -4090,6 +4157,7 @@ void renderApp(AppState& app) {
     consumePendingCopy(app);
     consumePendingTransferInspection(app);
     consumePendingSplit(app);
+    consumePendingExport(app);
     // 刷新写入闸门策略快照（pid / 联运策略）：工作线程只读这份原子快照
     updateWriteGatePolicy(app);
     // 发动机后台（换车/新基准/恢复成败/待恢复记录变化）→ 立即持久化。

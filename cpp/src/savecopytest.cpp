@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <bcrypt.h>
 #include <cstring>
+#include <atomic>
+#include <thread>
 
 namespace ets2 {
 namespace {
@@ -341,6 +343,186 @@ std::vector<TunerTestItem> runSaveCopyTests() {
         }
         cleanup(); check("隔离夹具清理",!fs::exists(root));
     } catch (const std::exception& e) { check("夹具异常",false,e.what()); try {cleanup();} catch(...) {check("清理失败",false);} }
+    return items;
+}
+
+std::vector<TunerTestItem> runReadableExportTests() {
+    std::vector<TunerTestItem> items;
+    auto check = [&](const char* name, bool ok, const std::string& detail = "") {
+        items.push_back({std::string("可读导出 / ") + name, ok, detail});
+    };
+    fs::path base = fs::absolute(fs::temp_directory_path()).lexically_normal();
+    if (base.filename().empty()) base = base.parent_path();
+    const fs::path root = base / (L"readable_export_fixture_" +
+        std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64()));
+    bool owned = false;
+    auto cleanup = [&] {
+        if (!owned) return;
+        if (fs::absolute(root).lexically_normal().parent_path() != base ||
+            (GetFileAttributesW(root.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("readable export fixture cleanup path mismatch");
+        fs::remove_all(root);
+        owned = false;
+    };
+    try {
+        if (!fs::create_directory(root)) throw std::runtime_error("readable export fixture collision");
+        owned = true;
+        const fs::path exports = root / L"exports";
+        fs::create_directory(exports);
+        std::vector<std::pair<fs::path, std::string>> originals;
+        auto source = [&](const wchar_t* name, const std::string& bytes) {
+            const fs::path path = root / name;
+            put(path, bytes);
+            originals.emplace_back(path, bytes);
+            SaveSlot slot; slot.gameSii = path.wstring();
+            return slot;
+        };
+        // Wire literals are independent of the decoder: garage=1224619291, koln=1349667.
+        std::string binary = "BSII";
+        auto u8 = [&](uint8_t v) { binary.push_back(static_cast<char>(v)); };
+        auto u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) u8(static_cast<uint8_t>(v >> (8 * i))); };
+        auto u64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) u8(static_cast<uint8_t>(v >> (8 * i))); };
+        auto str = [&](const std::string& s) { u32(static_cast<uint32_t>(s.size())); binary += s; };
+        u32(3);
+        u32(0); u8(1); u32(1); str("garage");
+        u32(0x03); str("city");
+        u32(0x04); str("cities");
+        u32(0);
+        u32(1); u8(2); u64(1224619291ull); u64(1349667ull);
+        u64(1349667ull);
+        u32(2); u64(1349667ull); u64(1224619291ull | (1ull << 63));
+        u32(0); u8(0);
+
+        const SaveSlot plain = source(L"text.sii", infoText);
+        const SaveSlot bsii = source(L"binary.sii", binary);
+        ReadableExportInfo ri; std::string err = "STALE";
+        auto out = [&](const wchar_t* name) { return (exports / name).wstring(); };
+        auto clearInfo = [&] {
+            return ri.innerFormat.empty() && !ri.innerSize && !ri.textSize && !ri.unitCount;
+        };
+        auto readable = [&](const SaveSlot& slot, const wchar_t* name) {
+            return exportReadableSii(slot, out(name), &ri, &err);
+        };
+        const bool plainOk = readable(plain, L"text.sii");
+        check("明文逐字节保留且清除旧错误", plainOk && get(out(L"text.sii")) == infoText &&
+            ri.innerFormat == "text" && ri.textSize == infoText.size() && err.empty(), err);
+        const bool binaryOk = readable(bsii, L"binary.sii");
+        const std::string converted = binaryOk ? get(out(L"binary.sii")) : "";
+        check("BSII对象名与标量名称方向正确", binaryOk &&
+            converted.rfind("SiiNunit\n", 0) == 0 &&
+            converted.find("garage : garage.koln {") != std::string::npos &&
+            converted.find("city: koln") != std::string::npos, err);
+        check("BSII数组名称与高位标记正确", binaryOk &&
+            converted.find("cities[0]: koln") != std::string::npos &&
+            converted.find("cities[1]: garage") != std::string::npos, err);
+        check("输出元信息准确", binaryOk && ri.innerFormat == "bsii" &&
+            ri.innerSize == binary.size() && ri.textSize == converted.size() && ri.unitCount == 1);
+        DecryptInfo di;
+        check("原格式导出仍保留BSII字节", exportDecrypted(bsii, out(L"raw.sii"), &di, &err) &&
+            get(out(L"raw.sii")) == binary && di.innerFormat == "bsii", err);
+        const SaveSlot encryptedBinary = source(L"encrypted_binary.sii",
+            [&] { auto b = encryptedInfo(binary); return std::string(b.begin(), b.end()); }());
+        check("加密BSII自动解密转换", readable(encryptedBinary, L"encrypted_binary.sii") &&
+            get(out(L"encrypted_binary.sii")) == converted, err);
+        const SaveSlot encryptedText = source(L"encrypted_text.sii",
+            [&] { auto b = encryptedInfo(infoText); return std::string(b.begin(), b.end()); }());
+        check("加密文本原样导出", readable(encryptedText, L"encrypted_text.sii") &&
+            get(out(L"encrypted_text.sii")) == infoText, err);
+        const auto compressed = zlibStored(binary);
+        const auto encryptedZlib = encryptPayload(compressed, static_cast<uint32_t>(binary.size()), pkcs7(compressed.size()));
+        const SaveSlot zbsii = source(L"zlib_binary.sii", {encryptedZlib.begin(), encryptedZlib.end()});
+        check("加密压缩BSII自动转换", readable(zbsii, L"zlib_binary.sii") &&
+            get(out(L"zlib_binary.sii")) == converted, err);
+        put(out(L"existing.sii"), "sentinel");
+        check("目标已存在不覆盖", !readable(bsii, L"existing.sii") &&
+            get(out(L"existing.sii")) == "sentinel" && clearInfo() && !err.empty(), err);
+        check("目录目标拒绝", !exportReadableSii(bsii, exports.wstring(), &ri, &err) &&
+            fs::is_directory(exports) && clearInfo(), err);
+        check("源等于目标拒绝", !exportReadableSii(bsii, bsii.gameSii, &ri, &err) &&
+            get(bsii.gameSii) == binary && clearInfo(), err);
+        std::string v4 = binary; v4[4] = 4;
+        const SaveSlot unknown = source(L"v4.sii", v4);
+        check("未知BSII版本明确拒绝无输出", !readable(unknown, L"v4.sii") &&
+            !fs::exists(out(L"v4.sii")) && clearInfo() && err.find("v4") != std::string::npos, err);
+        const SaveSlot truncated = source(L"truncated.sii", binary.substr(0, 8));
+        check("截断BSII拒绝无输出", !readable(truncated, L"truncated.sii") &&
+            !fs::exists(out(L"truncated.sii")) && clearInfo(), err);
+        const SaveSlot legacy = source(L"legacy.sii", "3nKlegacy");
+        check("3nK拒绝可读转换", !readable(legacy, L"legacy.sii") &&
+            !fs::exists(out(L"legacy.sii")) && clearInfo(), err);
+        check("3nK仍可原格式导出", exportDecrypted(legacy, out(L"legacy_raw.sii"), &di, &err) &&
+            get(out(L"legacy_raw.sii")) == "3nKlegacy", err);
+        const SaveSlot corrupt = source(L"corrupt.sii", "corrupt save");
+        check("损坏源拒绝无输出", !readable(corrupt, L"corrupt.sii") &&
+            !fs::exists(out(L"corrupt.sii")) && clearInfo(), err);
+        auto badBytes = encryptedInfo(infoText); badBytes.pop_back();
+        const SaveSlot badCrypto = source(L"bad_crypto.sii", {badBytes.begin(), badBytes.end()});
+        check("损坏加密源拒绝无输出", !readable(badCrypto, L"bad_crypto.sii") &&
+            !fs::exists(out(L"bad_crypto.sii")) && clearInfo(), err);
+        check("明文输出超限拒绝", !exportReadableSii(plain, out(L"limit_text.sii"), &ri, &err, {}, infoText.size() - 1) &&
+            !fs::exists(out(L"limit_text.sii")) && clearInfo(), err);
+        check("明文输出边界通过", exportReadableSii(plain, out(L"limit_text_ok.sii"), &ri, &err, {}, infoText.size()), err);
+        check("BSII文本输出超限拒绝", !converted.empty() &&
+            !exportReadableSii(bsii, out(L"limit_bsii.sii"), &ri, &err, {}, converted.size() - 1) &&
+            !fs::exists(out(L"limit_bsii.sii")) && clearInfo(), err);
+        check("BSII文本输出边界通过", !converted.empty() &&
+            exportReadableSii(bsii, out(L"limit_bsii_ok.sii"), &ri, &err, {}, converted.size()), err);
+        check("零输出上限拒绝", !exportReadableSii(plain, out(L"zero_limit.sii"), &ri, &err, {}, 0) &&
+            !fs::exists(out(L"zero_limit.sii")) && clearInfo(), err);
+        SaveSlot absent; absent.gameSii = (root / L"absent.sii").wstring();
+        check("开始前取消不读取源", !exportReadableSii(absent, out(L"cancel_early.sii"), &ri, &err, [] { return true; }) &&
+            !fs::exists(out(L"cancel_early.sii")) && err.find("取消") != std::string::npos && clearInfo(), err);
+        int polls = 0;
+        check("转换期间取消无输出", !exportReadableSii(bsii, out(L"cancel_decode.sii"), &ri, &err,
+            [&] { return ++polls >= 3; }) && polls >= 3 &&
+            !fs::exists(out(L"cancel_decode.sii")) && err.find("取消") != std::string::npos && clearInfo(), err);
+        auto stagedSize = [&] {
+            for (const auto& e : fs::directory_iterator(exports)) {
+                if (e.path().filename().wstring().rfind(L"~ets2export_", 0) != 0) continue;
+                std::error_code ec;
+                const uintmax_t size = fs::file_size(e.path(), ec);
+                if (!ec) return size;
+            }
+            return uintmax_t{0};
+        };
+        std::string large = "SiiNunit\n{\n//"; large.append(3 * 1024 * 1024, 'x'); large += "\n}\n";
+        const SaveSlot big = source(L"large.sii", large);
+        bool sawPartial = false;
+        check("分块写入期间取消清理临时文件", !exportReadableSii(big, out(L"cancel_write.sii"), &ri, &err,
+            [&] { sawPartial = sawPartial || stagedSize() >= 1024 * 1024; return sawPartial; }) &&
+            sawPartial && !fs::exists(out(L"cancel_write.sii")) && clearInfo(), err);
+        bool sawComplete = false;
+        check("发布前取消不生成最终文件", !exportReadableSii(plain, out(L"cancel_publish.sii"), &ri, &err,
+            [&] { sawComplete = sawComplete || stagedSize() == infoText.size(); return sawComplete; }) &&
+            sawComplete && !fs::exists(out(L"cancel_publish.sii")) && clearInfo(), err);
+        check("原格式导出发布前取消", !exportDecrypted(plain, out(L"cancel_raw.sii"), &di, &err,
+            [&] { return stagedSize() == infoText.size(); }) && !fs::exists(out(L"cancel_raw.sii")) && di.innerFormat.empty(), err);
+        check("缺失目标目录不创建且无输出", !exportReadableSii(plain, (root / L"absent_dir" / L"out.sii").wstring(), &ri, &err) &&
+            !fs::exists(root / L"absent_dir") && clearInfo(), err);
+        std::atomic<int> ready{0}; std::atomic<bool> go{false};
+        bool success[2] = {false, false};
+        auto racer = [&](int i) {
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            ReadableExportInfo info; std::string error;
+            success[i] = exportReadableSii(bsii, out(L"race.sii"), &info, &error);
+        };
+        std::thread a(racer, 0), b(racer, 1);
+        while (ready.load() != 2) std::this_thread::yield();
+        go = true; a.join(); b.join();
+        check("并发导出仅一项成功且不覆盖", success[0] != success[1] && get(out(L"race.sii")) == converted);
+        bool unchanged = true;
+        for (const auto& entry : originals) unchanged = unchanged && get(entry.first) == entry.second;
+        check("全部源文件逐字节未改变", unchanged);
+        bool noTemp = true;
+        for (const auto& e : fs::directory_iterator(exports))
+            noTemp = noTemp && e.path().filename().wstring().rfind(L"~ets2export_", 0) != 0;
+        check("取消与失败无临时残留", noTemp);
+        cleanup(); check("隔离夹具清理", !fs::exists(root));
+    } catch (const std::exception& e) {
+        check("夹具异常", false, e.what());
+        try { cleanup(); } catch (const std::exception& ce) { check("清理失败", false, ce.what()); }
+    }
     return items;
 }
 }
