@@ -13,6 +13,7 @@
 #include "saves.h"
 #include "telemetry.h"
 #include "ui.h"
+#include "ui_style.h"
 #include "gameplay.h"
 #include "layout.h"
 
@@ -119,71 +120,14 @@ void cleanupDeviceD3D() {
 void applyDarkTitleBar(HWND hwnd) {
     BOOL dark = TRUE;
     ::DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+    const COLORREF caption = RGB(17, 20, 22), text = RGB(238, 234, 229);
+    // Windows 11 honors these; older Windows versions keep their native caption.
+    ::DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &caption, sizeof(caption));
+    ::DwmSetWindowAttribute(hwnd, 36 /*DWMWA_TEXT_COLOR*/, &text, sizeof(text));
 }
 
 void applyModernStyle() {
-    ::ImGui::StyleColorsDark();
-    ImGuiStyle& style = ::ImGui::GetStyle();
-    style.WindowRounding    = 0.0f;
-    style.ChildRounding     = 6.0f;
-    style.FrameRounding     = 5.0f;
-    style.PopupRounding     = 6.0f;
-    style.ScrollbarRounding = 7.0f;
-    style.GrabRounding      = 5.0f;
-    style.TabRounding       = 6.0f;
-    style.WindowPadding     = ImVec2(14, 12);
-    style.FramePadding      = ImVec2(10, 6);
-    style.ItemSpacing       = ImVec2(10, 8);
-    style.ItemInnerSpacing  = ImVec2(8, 6);
-    style.IndentSpacing     = 20.0f;
-    style.ScrollbarSize     = 13.0f;
-
-    // Deep slate background with refined layered contrast
-    style.Colors[ImGuiCol_WindowBg]             = ImVec4(0.070f, 0.080f, 0.100f, 1.00f);
-    style.Colors[ImGuiCol_ChildBg]              = ImVec4(0.098f, 0.112f, 0.142f, 1.00f);
-    style.Colors[ImGuiCol_PopupBg]              = ImVec4(0.110f, 0.125f, 0.160f, 0.98f);
-    style.Colors[ImGuiCol_Border]               = ImVec4(0.180f, 0.205f, 0.250f, 1.00f);
-    style.Colors[ImGuiCol_BorderShadow]         = ImVec4(0.000f, 0.000f, 0.000f, 0.00f);
-    style.Colors[ImGuiCol_FrameBg]              = ImVec4(0.138f, 0.158f, 0.198f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgHovered]       = ImVec4(0.190f, 0.220f, 0.280f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgActive]        = ImVec4(0.230f, 0.270f, 0.350f, 1.00f);
-    style.Colors[ImGuiCol_TitleBg]              = ImVec4(0.070f, 0.080f, 0.100f, 1.00f);
-    style.Colors[ImGuiCol_TitleBgActive]        = ImVec4(0.090f, 0.105f, 0.135f, 1.00f);
-    style.Colors[ImGuiCol_MenuBarBg]            = ImVec4(0.100f, 0.115f, 0.145f, 1.00f);
-    style.Colors[ImGuiCol_ScrollbarBg]          = ImVec4(0.070f, 0.080f, 0.100f, 0.50f);
-    style.Colors[ImGuiCol_ScrollbarGrab]        = ImVec4(0.200f, 0.230f, 0.290f, 1.00f);
-    style.Colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.270f, 0.320f, 0.400f, 1.00f);
-    style.Colors[ImGuiCol_ScrollbarGrabActive]  = ImVec4(0.160f, 0.460f, 0.860f, 1.00f);
-
-    // Accent colors (Electric Blue / Emerald)
-    style.Colors[ImGuiCol_CheckMark]            = ImVec4(0.220f, 0.820f, 0.520f, 1.00f);
-    style.Colors[ImGuiCol_SliderGrab]           = ImVec4(0.160f, 0.460f, 0.860f, 1.00f);
-    style.Colors[ImGuiCol_SliderGrabActive]     = ImVec4(0.260f, 0.560f, 0.960f, 1.00f);
-    style.Colors[ImGuiCol_Button]               = ImVec4(0.150f, 0.380f, 0.720f, 1.00f);
-    style.Colors[ImGuiCol_ButtonHovered]        = ImVec4(0.200f, 0.480f, 0.880f, 1.00f);
-    style.Colors[ImGuiCol_ButtonActive]         = ImVec4(0.110f, 0.300f, 0.600f, 1.00f);
-    style.Colors[ImGuiCol_Header]               = ImVec4(0.150f, 0.380f, 0.720f, 0.50f);
-    style.Colors[ImGuiCol_HeaderHovered]        = ImVec4(0.200f, 0.480f, 0.880f, 0.75f);
-    style.Colors[ImGuiCol_HeaderActive]         = ImVec4(0.110f, 0.300f, 0.600f, 0.95f);
-    style.Colors[ImGuiCol_Separator]            = ImVec4(0.180f, 0.205f, 0.250f, 1.00f);
-    style.Colors[ImGuiCol_SeparatorHovered]     = ImVec4(0.260f, 0.560f, 0.960f, 0.80f);
-    style.Colors[ImGuiCol_SeparatorActive]      = ImVec4(0.260f, 0.560f, 0.960f, 1.00f);
-
-    // Tabs
-    style.Colors[ImGuiCol_Tab]                  = ImVec4(0.110f, 0.125f, 0.160f, 1.00f);
-    style.Colors[ImGuiCol_TabHovered]           = ImVec4(0.200f, 0.440f, 0.820f, 0.85f);
-    style.Colors[ImGuiCol_TabSelected]          = ImVec4(0.150f, 0.380f, 0.720f, 1.00f);
-    style.Colors[ImGuiCol_TabSelectedOverline]  = ImVec4(0.350f, 0.720f, 0.980f, 1.00f);
-    style.Colors[ImGuiCol_TabDimmed]            = ImVec4(0.085f, 0.095f, 0.120f, 1.00f);
-    style.Colors[ImGuiCol_TabDimmedSelected]    = ImVec4(0.130f, 0.280f, 0.520f, 1.00f);
-
-    // Tables
-    style.Colors[ImGuiCol_TableHeaderBg]        = ImVec4(0.130f, 0.150f, 0.190f, 1.00f);
-    style.Colors[ImGuiCol_TableBorderStrong]    = ImVec4(0.180f, 0.205f, 0.250f, 1.00f);
-    style.Colors[ImGuiCol_TableBorderLight]     = ImVec4(0.140f, 0.160f, 0.200f, 1.00f);
-    style.Colors[ImGuiCol_TableRowBg]           = ImVec4(0.095f, 0.108f, 0.135f, 0.70f);
-    style.Colors[ImGuiCol_TableRowBgAlt]        = ImVec4(0.115f, 0.130f, 0.165f, 0.70f);
-    style.Colors[ImGuiCol_TextSelectedBg]       = ImVec4(0.150f, 0.380f, 0.720f, 0.40f);
+    ui::applyStyle();
 }
 
 LRESULT WINAPI wndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {

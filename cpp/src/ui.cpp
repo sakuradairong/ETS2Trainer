@@ -1,5 +1,6 @@
 // ui.cpp —— ImGui 界面实现
 #include "ui.h"
+#include "ui_style.h"
 
 #include "economy.h"
 #include "layout.h"
@@ -122,6 +123,7 @@ const char* panelName(PanelKind kind) {
 }
 
 void resetProcessState(AppState& app) {
+    app.engineDraftSourceOption = -1;
     if (app.engineTuner) {
         // 分离前尽力写回原值，然后才放弃内存引用（避免再访问失效的 ProcessMemory）。
         app.engineTuner->restoreAndDetach();
@@ -2156,55 +2158,55 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
                         ImGuiWindowFlags_None);
 
     // Card Header Bar
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ %s", title);
+    ui::textf(ui::accent, "◆ %s", title);
     if (lockVar && *lockVar) {
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 锁定保持中 ]");
+        ui::next(220);
+        ui::textf(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 锁定保持中 ]");
     }
     ::ImGui::Separator();
     ::ImGui::Spacing();
 
     // 步骤 1: 扫描定位
-    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 扫描");
-    ::ImGui::SameLine(220.0f);
-    ::ImGui::TextUnformatted("类型");
-    ::ImGui::SameLine();
+    ui::textf(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 扫描");
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "类型");
+    ui::next(220);
     typeCombo("##type", ptype);
     if (vtypeInfo(*ptype).isFloat) {
-        ::ImGui::SameLine();
-        ::ImGui::TextUnformatted("容差");
-        ::ImGui::SameLine();
+        ui::next(220);
+        ::ImGui::TextWrapped("%s", "容差");
+        ui::next(220);
         ::ImGui::SetNextItemWidth(70);
         ::ImGui::InputText("##tol", toleranceFor(app, kind), 16, ImGuiInputTextFlags_CharsDecimal);
     }
 
-    ::ImGui::TextUnformatted("游戏当前值");
-    ::ImGui::SameLine(100.0f);
+    ::ImGui::TextWrapped("%s", "游戏当前值");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(170);
     ::ImGui::InputTextWithHint("##current", "当前数值", current, 32, ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 首次扫描 ", ImVec2(120, 26))) startFirstScan(app, kind);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button(" 变动后收窄 ", ImVec2(120, 26))) startNextScan(app, kind, ScanMode::Exact);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button(" 未变收窄 ", ImVec2(110, 26))) startNextScan(app, kind, ScanMode::Unchanged);
     ::ImGui::EndDisabled();
 
     ::ImGui::Spacing();
 
     // 步骤 2: 修改生效
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "② 写入 / 锁定");
-    ::ImGui::TextUnformatted("目标修改值");
-    ::ImGui::SameLine(100.0f);
+    ui::textf(ui::accent, "② 写入 / 锁定");
+    ::ImGui::TextWrapped("%s", "目标修改值");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(170);
     ::ImGui::InputTextWithHint("##target", "目标数值", target, 32, ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button(" 写入修改(立即生效) ", ImVec2(170, 26))) writePanelValues(app, kind);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Checkbox("锁定此数值", lockVar)) togglePanelLock(app, kind, *lockVar);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("解除锁定", ImVec2(80, 26))) {
         *lockVar = false;
         togglePanelLock(app, kind, false);
@@ -2213,8 +2215,8 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
 
     // 快速预设按钮
     if (kind == PanelKind::Money) {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
-        ::ImGui::SameLine();
+        ui::textf(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
+        ui::next(220);
         if (::ImGui::Button("+100万")) {
             double cur = 0;
             parseNumber(target, false, &cur);
@@ -2224,32 +2226,32 @@ void renderValuePanel(AppState& app, PanelKind kind, const char* title, const ch
             ::snprintf(buf, sizeof(buf), "%.0f", cur);
             ::strncpy_s(target, 32, buf, _TRUNCATE);
         }
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("1,000 万")) ::strncpy_s(target, 32, "10000000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("5,000 万")) ::strncpy_s(target, 32, "50000000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("1 亿")) ::strncpy_s(target, 32, "100000000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("9.99 亿(上限)")) ::strncpy_s(target, 32, "999999999", _TRUNCATE);
     } else if (kind == PanelKind::Xp) {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
-        ::ImGui::SameLine();
+        ui::textf(ImVec4(0.55f, 0.60f, 0.72f, 1.0f), "预设");
+        ui::next(220);
         if (::ImGui::Button("5,000 (约10级)")) ::strncpy_s(target, 32, "5000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("50,000 (约35级)")) ::strncpy_s(target, 32, "50000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("150,000 (满级技能)")) ::strncpy_s(target, 32, "150000", _TRUNCATE);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("1,000,000 (百万经验)")) ::strncpy_s(target, 32, "1000000", _TRUNCATE);
     }
 
     ::ImGui::Spacing();
     const std::string& st = statusFor(app, kind);
     if (!st.empty()) {
-        ::ImGui::TextColored(ImVec4(0.40f, 0.78f, 0.95f, 1.0f), "状态：%s", st.c_str());
+        ui::textf(ui::accent, "状态：%s", st.c_str());
     } else {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "提示：%s", hint);
+        ui::textf(ui::muted, "提示：%s", hint);
     }
     ::ImGui::EndChild();
     ::ImGui::PopID();
@@ -2847,116 +2849,96 @@ void renderMoneyTab(AppState& app) {
                          &app.xpType, app.xpCurrent, app.xpTarget, &app.xpLock);
         return;
     }
-    // ---------------- 主流程：直接修改（免锁定） ----------------
-    ::ImGui::BeginChild("##locate_economy", ImVec2(0, 0),
-                        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 直接修改（推荐 · 写完即生效，无需锁定）");
-    ::ImGui::Separator();
-    ::ImGui::Spacing();
-    ::ImGui::TextWrapped("程序定位游戏自己的权威存储（bank.money_account / economy.experience_points）"
-                         "后一次性写入。美卡自动识别银行对象，无需填写当前金额。游戏界面、收支结算、自动存档读的都是这两个字段，"
-                         "所以写完不会被改回去，也不需要「锁定」。");
-    ::ImGui::Spacing();
-
-    // 第一次使用的引导输入：定位需要用当前金额做一次种子扫描。
-    // 定位期间禁用输入：工作线程只使用启动前复制的快照，界面缓冲区不能同时被编辑。
     const bool inputsLocked = app.busy.load();
     if (!app.locatedMoneyAddress && selectedGame() == GameId::Ets2) {
-        ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f), "① 当前金额（仅首次定位需要）");
-        ::ImGui::SameLine(220.0f);
-        ::ImGui::SetNextItemWidth(170);
+        ui::beginCard("##economy_seed", "首次定位");
+        ui::text(ui::muted, "填写游戏里显示的当前金额，随后应用目标资金或经验。首次定位约需 10–25 秒。");
         ::ImGui::BeginDisabled(inputsLocked);
-        ::ImGui::InputTextWithHint("##current", "游戏里显示的金额", app.moneyCurrent, 32,
-                                   ImGuiInputTextFlags_CharsDecimal);
+        ::ImGui::SetNextItemWidth(std::min(340.0f, ::ImGui::GetContentRegionAvail().x));
+        ::ImGui::InputTextWithHint("##current", "游戏当前金额", app.moneyCurrent, 32,
+            ImGuiInputTextFlags_CharsDecimal);
         ::ImGui::EndDisabled();
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "定位用它做种子，约 10~25 秒");
+        ui::endCard();
+        ::ImGui::Spacing();
     }
-
-    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
-                         app.locatedMoneyAddress ? "② 金额" : "② 金额（定位后可反复直接改）");
-    ::ImGui::SameLine(220.0f);
-    ::ImGui::SetNextItemWidth(170);
-    ::ImGui::BeginDisabled(inputsLocked);
-    ::ImGui::InputTextWithHint("##target_money", "目标金额", app.moneyTarget, 32,
-                               ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::EndDisabled();
-    ::ImGui::SameLine();
-    ::ImGui::BeginDisabled(app.busy.load());
-    if (::ImGui::Button(" 直接改钱 ", ImVec2(120, 28))) directModifyMoney(app);
-    ::ImGui::EndDisabled();
-
-    // 快速预设（同样会改输入缓冲区，定位期间一并禁用）
-    ::ImGui::SameLine();
-    ::ImGui::BeginDisabled(inputsLocked);
-    if (::ImGui::Button("+100万")) {
-        double cur = 0;
-        parseNumber(app.moneyTarget, false, &cur);
-        if (cur <= 0) parseNumber(app.moneyCurrent, false, &cur);
-        cur += 1000000.0;
-        char buf[32];
-        ::snprintf(buf, sizeof(buf), "%.0f", cur);
-        ::strncpy_s(app.moneyTarget, 32, buf, _TRUNCATE);
+    const int columns = ::ImGui::GetContentRegionAvail().x >= 760 ? 2 : 1;
+    if (::ImGui::BeginTable("##economy_cards", columns, ImGuiTableFlags_SizingStretchSame)) {
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##money_card", "账户资金");
+        ui::heading(app.locatedMoneyAddress ? formatInt(app.locatedMoneyValue).c_str() : "—", 30);
+        ::ImGui::TextDisabled(app.locatedMoneyAddress ? "已定位金额" : "等待定位");
+        ::ImGui::Spacing();
+        ::ImGui::TextUnformatted("目标金额");
+        ::ImGui::BeginDisabled(inputsLocked);
+        ::ImGui::SetNextItemWidth(-1);
+        ::ImGui::InputTextWithHint("##target_money", "输入目标金额", app.moneyTarget, 32,
+            ImGuiInputTextFlags_CharsDecimal);
+        if (ui::primaryButton("应用目标金额")) directModifyMoney(app);
+        ::ImGui::Spacing();
+        if (::ImGui::Button("+100万")) {
+            double cur = 0;
+            parseNumber(app.moneyTarget, false, &cur);
+            if (cur <= 0) parseNumber(app.moneyCurrent, false, &cur);
+            char buf[32];
+            ::snprintf(buf, sizeof(buf), "%.0f", cur + 1000000.0);
+            ::strncpy_s(app.moneyTarget, 32, buf, _TRUNCATE);
+        }
+        ui::nextButton("1,000 万");
+        if (::ImGui::Button("1,000 万")) ::strncpy_s(app.moneyTarget, 32, "10000000", _TRUNCATE);
+        ui::nextButton("5,000 万");
+        if (::ImGui::Button("5,000 万")) ::strncpy_s(app.moneyTarget, 32, "50000000", _TRUNCATE);
+        ui::nextButton("1 亿");
+        if (::ImGui::Button("1 亿")) ::strncpy_s(app.moneyTarget, 32, "100000000", _TRUNCATE);
+        ui::nextButton("9.99 亿");
+        if (::ImGui::Button("9.99 亿")) ::strncpy_s(app.moneyTarget, 32, "999999999", _TRUNCATE);
+        ::ImGui::EndDisabled();
+        ui::endCard();
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##xp_card", "驾驶经验");
+        ui::heading(app.locatedXpAddress ? formatInt(app.locatedXpValue).c_str() : "—", 30);
+        ::ImGui::TextDisabled("XP / 随资金一并定位");
+        ::ImGui::Spacing();
+        ::ImGui::TextUnformatted("目标经验");
+        ::ImGui::BeginDisabled(app.busy.load());
+        ::ImGui::SetNextItemWidth(-1);
+        ::ImGui::InputTextWithHint("##target_xp", "输入目标经验", app.xpTarget, 32,
+            ImGuiInputTextFlags_CharsDecimal);
+        if (ui::primaryButton("应用目标经验")) directModifyXp(app);
+        ::ImGui::Spacing();
+        if (::ImGui::Button("5,000 / 约10级")) ::strncpy_s(app.xpTarget, 32, "5000", _TRUNCATE);
+        ui::nextButton("50,000 / 约35级");
+        if (::ImGui::Button("50,000 / 约35级")) ::strncpy_s(app.xpTarget, 32, "50000", _TRUNCATE);
+        ui::nextButton("150,000 / 满级技能");
+        if (::ImGui::Button("150,000 / 满级技能")) ::strncpy_s(app.xpTarget, 32, "150000", _TRUNCATE);
+        ui::nextButton("1,000,000");
+        if (::ImGui::Button("1,000,000")) ::strncpy_s(app.xpTarget, 32, "1000000", _TRUNCATE);
+        ::ImGui::EndDisabled();
+        ui::endCard();
+        ::ImGui::EndTable();
     }
-    ::ImGui::SameLine();
-    if (::ImGui::Button("1,000 万")) ::strncpy_s(app.moneyTarget, 32, "10000000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("5,000 万")) ::strncpy_s(app.moneyTarget, 32, "50000000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("1 亿")) ::strncpy_s(app.moneyTarget, 32, "100000000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("9.99 亿")) ::strncpy_s(app.moneyTarget, 32, "999999999", _TRUNCATE);
-    ::ImGui::EndDisabled();
-
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.30f, 1.0f),
-                         app.locatedXpAddress ? "③ 经验" : "③ 经验（随金额一并定位）");
-    ::ImGui::SameLine(220.0f);
-    ::ImGui::SetNextItemWidth(170);
-    ::ImGui::BeginDisabled(inputsLocked);
-    ::ImGui::InputTextWithHint("##target_xp", "目标经验", app.xpTarget, 32,
-                               ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::EndDisabled();
-    ::ImGui::SameLine();
-    ::ImGui::BeginDisabled(app.busy.load());
-    if (::ImGui::Button(" 直接改经验 ", ImVec2(130, 28))) directModifyXp(app);
-    ::ImGui::EndDisabled();
-    ::ImGui::SameLine();
-    ::ImGui::BeginDisabled(inputsLocked);
-    if (::ImGui::Button("5,000 (约10级)")) ::strncpy_s(app.xpTarget, 32, "5000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("50,000 (约35级)")) ::strncpy_s(app.xpTarget, 32, "50000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("150,000 (满级技能)")) ::strncpy_s(app.xpTarget, 32, "150000", _TRUNCATE);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("1,000,000")) ::strncpy_s(app.xpTarget, 32, "1000000", _TRUNCATE);
-    ::ImGui::EndDisabled();
-
-    ::ImGui::Spacing();
-    ::ImGui::Separator();
-    ::ImGui::Spacing();
-
+    ui::beginCard("##locate_economy", "定位与操作状态");
     const bool hasMoney = app.locatedMoneyAddress != 0;
     const bool hasXp = app.locatedXpAddress != 0;
     if (hasMoney) {
-        ::ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
+        ui::textf(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
                              "金钱 0x%llX = %s", (unsigned long long)app.locatedMoneyAddress,
                              formatInt(app.locatedMoneyValue).c_str());
         if (!app.locatedMoneyDetail.empty()) {
-            ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "%s",
+            ui::textf(ui::muted, "%s",
                                  app.locatedMoneyDetail.c_str());
         }
     }
     if (hasXp) {
-        ::ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
+        ui::textf(ImVec4(0.40f, 0.85f, 0.55f, 1.0f),
                              "经验 0x%llX = %s", (unsigned long long)app.locatedXpAddress,
                              formatInt(app.locatedXpValue).c_str());
         if (!app.locatedXpDetail.empty()) {
-            ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "%s",
+            ui::textf(ui::muted, "%s",
                                  app.locatedXpDetail.c_str());
         }
     }
-    ::ImGui::TextColored(ImVec4(0.40f, 0.78f, 0.95f, 1.0f), "%s", app.locateStatus.c_str());
+    ui::textf(ui::accent, "%s", app.locateStatus.c_str());
 
     // 可选保险：锁定（一般不需要）。直接写权威地址后游戏不会改回去；
     // 只有想「钉死」数值不受游戏内收支影响时才用。
@@ -2976,11 +2958,11 @@ void renderMoneyTab(AppState& app) {
             }
             app.locateStatus = "已解除金钱/经验锁定（直接写入的数值不受影响）。";
         }
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
+        ui::textf(ui::muted,
                              "锁定 = 每 0.25 秒把数值写回一次，用来抵消游戏内真实的收支变化。"
                              "只是可选项，直接修改本身不需要它。");
         if (app.freezer && app.freezer->blocked() > 0) {
-            ::ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f),
+            ui::textf(ImVec4(0.95f, 0.40f, 0.40f, 1.0f),
                                  "锁定写入已被联机闸门拦截 %llu 次：%s（解锁条目仍保留，"
                                  "退出联机后自动恢复写入）",
                                  (unsigned long long)app.freezer->blocked(),
@@ -2998,7 +2980,7 @@ void renderMoneyTab(AppState& app) {
         ::ImGui::SameLine();
         if (::ImGui::Button(" 清除定位结果 ", ImVec2(140, 26))) clearLocatedEconomy(app);
         ::ImGui::EndDisabled();
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f),
+        ui::textf(ui::muted,
                              "定位地址绑定当前进程：换存档、读档或重启游戏后，直接写入前会自动"
                              "重新校验结构，失效时会提示重新定位。");
     }
@@ -3022,19 +3004,59 @@ void renderMoneyTab(AppState& app) {
 }
 
 void renderVehicleTabImpl(AppState& app) {
-    if (!supportsVerifiedStructures(selectedGame())) {
-        ::ImGui::TextWrapped("美卡车辆固定内存功能尚未适配；当前仅显示只读遥测。手动扫描不会使用欧卡偏移。");
-        if (::GetTickCount64() - app.telemetryCheckedAt >= 1000) {
-            app.telemetryCheckedAt = ::GetTickCount64();
-            app.telemetryAvailable = readTelemetry(&app.telemetry, &app.telemetryError);
+    const bool attached = app.mem.isOpen() && app.mem.alive();
+    if (attached && ::GetTickCount64() - app.telemetryCheckedAt >= 1000) {
+        app.telemetryCheckedAt = ::GetTickCount64();
+        app.telemetryAvailable = readTelemetry(&app.telemetry, &app.telemetryError);
+    }
+    const bool telemetry = attached && app.telemetryAvailable && app.telemetry.sdkActive;
+    if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock)) {
+        const auto status = app.vehicleLocker->status();
+        if (app.autoFuelLock) app.fuelStatus = status;
+        if (app.autoDamageLock) app.damageStatus = status;
+    }
+    if (app.engineTuner) {
+        const auto status = app.engineTuner->status();
+        if (app.engineTuner->active()) app.engineStatus = status;
+        else if (app.enginePowerOption != 0) {
+            app.enginePowerOption = 0;
+            app.engineRaiseLimit = false;
+            app.engineStateText = app.engineTuner->exportState();
+            app.engineStatus = status;
         }
-        if (app.telemetryAvailable) {
-            ::ImGui::Text("油量：%.2f / %.2f L", app.telemetry.fuel, app.telemetry.fuelCapacity);
-            ::ImGui::Text("速度：%.1f km/h ｜ 遥测 revision %u", app.telemetry.speed * 3.6f, app.telemetry.pluginRevision);
-            ::ImGui::Text("发动机 / 变速箱 / 车厢 / 底盘 / 车轮磨损：%.2f%% / %.2f%% / %.2f%% / %.2f%% / %.2f%%",
-                app.telemetry.wear[0] * 100.0f, app.telemetry.wear[1] * 100.0f,
-                app.telemetry.wear[2] * 100.0f, app.telemetry.wear[3] * 100.0f, app.telemetry.wear[4] * 100.0f);
-        } else ::ImGui::TextWrapped("遥测：%s", app.telemetryError.c_str());
+    }
+    if (app.engineDraftSourceOption != app.enginePowerOption ||
+        app.engineDraftSourceRaiseLimit != app.engineRaiseLimit ||
+        app.engineDraftPid != app.pid || app.engineDraftGame != selectedGame()) {
+        app.engineDraftOption = app.engineDraftSourceOption = app.enginePowerOption;
+        app.engineDraftRaiseLimit = app.engineDraftSourceRaiseLimit = app.engineRaiseLimit;
+        app.engineDraftPid = app.pid;
+        app.engineDraftGame = selectedGame();
+    }
+
+    ui::beginCard("##vehicle_metrics");
+    if (::ImGui::BeginTable("##metrics", 3, ImGuiTableFlags_SizingStretchSame)) {
+        ::ImGui::TableNextColumn();
+        ::ImGui::TextDisabled("剩余燃油");
+        ui::heading(telemetry ? fmt("%.0f L", app.telemetry.fuel).c_str() : "—", 29);
+        ::ImGui::TextDisabled(telemetry ? fmt("油箱容量 %.0f L", app.telemetry.fuelCapacity).c_str() : "等待游戏遥测");
+        if (telemetry && app.telemetry.fuelCapacity > 0)
+            ::ImGui::ProgressBar(std::clamp(app.telemetry.fuel / app.telemetry.fuelCapacity, 0.0f, 1.0f), ImVec2(-1, 4), "");
+        ::ImGui::TableNextColumn();
+        ::ImGui::TextDisabled("最大部件磨损");
+        const float wear = *std::max_element(app.telemetry.wear.begin(), app.telemetry.wear.end());
+        ui::heading(telemetry ? fmt("%.1f%%", wear * 100).c_str() : "—", 29);
+        ::ImGui::TextDisabled(telemetry ? "发动机 / 变速箱 / 车身 / 车轮" : "未读取到有效车辆状态");
+        ::ImGui::TableNextColumn();
+        ::ImGui::TextDisabled("当前动力倍率");
+        ui::heading(fmt("%.2f ×", kEngineScales[std::clamp(app.enginePowerOption, 0, 3)]).c_str(), 29);
+        ::ImGui::TextDisabled(app.enginePowerOption == 0 ? "原厂基准" : "后台保持中");
+        ::ImGui::EndTable();
+    }
+    ui::endCard();
+    ::ImGui::Spacing();
+    if (!supportsVerifiedStructures(selectedGame())) {
+        ui::text(ui::accent, structuralWriteBlockReason().c_str());
         if (::ImGui::CollapsingHeader("手动油量和损伤扫描")) {
             renderValuePanel(app, PanelKind::Fuel, "油量（手动扫描）", "扫描后根据游戏变化继续收窄。",
                 &app.fuelType, app.fuelCurrent, app.fuelTarget, &app.fuelLock);
@@ -3043,109 +3065,34 @@ void renderVehicleTabImpl(AppState& app) {
         }
         return;
     }
-    if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock)) {
-        const std::string liveStatus = app.vehicleLocker->status();
-        if (app.autoFuelLock) app.fuelStatus = liveStatus;
-        if (app.autoDamageLock) app.damageStatus = liveStatus;
-    }
-
-    // --- 一键车辆状态锁定 Card ---
-    ::ImGui::BeginChild("##auto_vehicle", ImVec2(0, 0),
-                        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 车辆状态保持");
-    ::ImGui::Separator();
-    ::ImGui::Spacing();
-
-    bool fuel = app.autoFuelLock;
-    if (::ImGui::Checkbox("无限油量", &fuel)) {
-        toggleAutoVehicleLock(app, true, fuel);
-    }
-    ::ImGui::SameLine(380.0f);
-    if (app.autoFuelLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 已锁定 ]");
-    } else {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
-    }
-
-    bool damage = app.autoDamageLock;
-    if (::ImGui::Checkbox("车辆无损", &damage)) {
-        toggleAutoVehicleLock(app, false, damage);
-    }
-    ::ImGui::SameLine(380.0f);
-    if (app.autoDamageLock) {
-        ::ImGui::TextColored(ImVec4(0.22f, 0.85f, 0.52f, 1.0f), "[ 已锁定 ]");
-    } else {
-        ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "[ 未开启 ]");
-    }
-
-    ::ImGui::Spacing();
-    if (::ImGui::Button(" 全部开启 ")) {
-        if (!app.autoFuelLock) toggleAutoVehicleLock(app, true, true);
-        if (!app.autoDamageLock) toggleAutoVehicleLock(app, false, true);
-    }
-    ::ImGui::SameLine();
-    if (::ImGui::Button(" 全部关闭 ")) {
-        if (app.autoFuelLock) toggleAutoVehicleLock(app, true, false);
-        if (app.autoDamageLock) toggleAutoVehicleLock(app, false, false);
-    }
-    ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "油量：%s", app.fuelStatus.c_str());
-    ::ImGui::TextColored(ImVec4(0.60f, 0.65f, 0.75f, 1.0f), "损伤：%s", app.damageStatus.c_str());
-    ::ImGui::EndChild();
-
-    ::ImGui::Spacing();
-
-    // --- 发动机动力调校 Card ---
-    ::ImGui::BeginChild("##engine_power", ImVec2(0, 0),
-                        ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "◆ 发动机动力");
-    ::ImGui::Separator();
-    ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1.0f), "%s", multiplayerSummary().c_str());
-    if (!app.mpDetail.empty()) {
-        ::ImGui::TextColored(app.mpBlocks ? ImVec4(0.95f, 0.40f, 0.40f, 1.0f)
-                                          : ImVec4(0.40f, 0.80f, 0.60f, 1.0f),
-                             "联机保护状态：%s", app.mpDetail.c_str());
-    }
-    ::ImGui::Spacing();
-
-    ::ImGui::TextUnformatted("倍率");
-    ::ImGui::SameLine();
-    static const char* kPowerPills[] = {"原厂", "1.25×", "1.50×", "2.00×"};
-    for (int i = 0; i < 4; ++i) {
-        if (i > 0) ::ImGui::SameLine();
-        const bool active = (app.enginePowerOption == i);
-        if (active) {
-            ::ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.95f, 1.0f));
+    const int columns = ::ImGui::GetContentRegionAvail().x >= 820 ? 2 : 1;
+    if (::ImGui::BeginTable("##vehicle_controls", columns, ImGuiTableFlags_SizingStretchSame)) {
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##engine_power", "动力调校");
+        ::ImGui::TextDisabled("目标倍率 / 应用后生效");
+        ui::heading(fmt("%.2f ×", kEngineScales[std::clamp(app.engineDraftOption, 0, 3)]).c_str(), 36);
+        ::ImGui::SetNextItemWidth(-1);
+        ::ImGui::SliderInt("##power_draft", &app.engineDraftOption, 0, 3, "", ImGuiSliderFlags_NoInput);
+        static const char* presets[] = {"原厂", "1.25×", "1.50×", "2.00×"};
+        for (int i = 0; i < 4; ++i) {
+            if (i) ui::nextButton(presets[i]);
+            if (ui::choice(presets[i], app.engineDraftOption == i)) app.engineDraftOption = i;
         }
-        if (::ImGui::Button(kPowerPills[i])) {
-            applyEnginePower(app, i, app.engineRaiseLimit);
+        ::ImGui::Spacing();
+        ::ImGui::Checkbox("转速上限 +10%", &app.engineDraftRaiseLimit);
+        ::ImGui::Spacing();
+        if (ui::primaryButton("应用调校")) {
+            applyEnginePower(app, app.engineDraftOption, app.engineDraftRaiseLimit);
+            app.engineDraftSourceOption = -1;
         }
-        if (active) {
-            ::ImGui::PopStyleColor();
+        ui::nextButton("恢复原厂");
+        if (::ImGui::Button("恢复原厂")) {
+            applyEnginePower(app, 0, false);
+            app.engineDraftSourceOption = -1;
         }
-    }
-
-    ::ImGui::Spacing();
-    bool raise = app.engineRaiseLimit;
-    if (::ImGui::Checkbox("转速上限 +10%", &raise)) {
-        applyEnginePower(app, app.enginePowerOption, raise);
-    }
-    ::ImGui::SameLine(380.0f);
-    if (::ImGui::Button(" ↩ 恢复原厂 ")) {
-        applyEnginePower(app, 0, false);
-    }
-
-    if (app.engineTuner) {
-        const std::string live = app.engineTuner->status();
-        if (app.engineTuner->active()) {
-            app.engineStatus = live;
-        } else if (app.enginePowerOption != 0) {
-            app.enginePowerOption = 0;
-            app.engineRaiseLimit = false;
-            app.engineStateText = app.engineTuner->exportState();
-            app.engineStatus = live;
-        }
+        ::ImGui::Spacing();
+        ui::text(ui::muted, app.engineStatus.c_str());
+        if (app.engineTuner) {
         // 如实区分恢复记录状态：修改仍存在 / 尚未核对 / 对象已明确失效 / 已确认恢复
         const char* recordState = "已确认恢复（无待恢复记录）";
         ImVec4 recordColor(0.45f, 0.85f, 0.60f, 1.0f);
@@ -3159,48 +3106,77 @@ void renderVehicleTabImpl(AppState& app) {
             recordState = "对象已明确失效（数值与本程序记录不符，记录已丢弃且未写入）";
             recordColor = ImVec4(0.95f, 0.45f, 0.45f, 1.0f);
         }
-        ::ImGui::TextColored(recordColor, "恢复记录：%s", recordState);
+        ui::text(recordColor, recordState);
     }
-    ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.40f, 0.78f, 0.95f, 1.0f), "当前状态：%s", app.engineStatus.c_str());
-    ::ImGui::EndChild();
 
+        ui::endCard();
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##auto_vehicle", "行驶辅助");
+        bool fuel = app.autoFuelLock;
+        if (::ImGui::Checkbox("无限油量", &fuel)) toggleAutoVehicleLock(app, true, fuel);
+        ui::text(ui::muted, app.fuelStatus.c_str());
+        ::ImGui::Spacing();
+        ::ImGui::Separator();
+        ::ImGui::Spacing();
+        bool damage = app.autoDamageLock;
+        if (::ImGui::Checkbox("车辆无损", &damage)) toggleAutoVehicleLock(app, false, damage);
+        ui::text(ui::muted, app.damageStatus.c_str());
+        ::ImGui::Spacing();
+        if (::ImGui::Button("全部开启")) {
+            if (!app.autoFuelLock) toggleAutoVehicleLock(app, true, true);
+            if (!app.autoDamageLock) toggleAutoVehicleLock(app, false, true);
+        }
+        ui::nextButton("全部关闭");
+        if (::ImGui::Button("全部关闭")) {
+            if (app.autoFuelLock) toggleAutoVehicleLock(app, true, false);
+            if (app.autoDamageLock) toggleAutoVehicleLock(app, false, false);
+        }
+        ::ImGui::Spacing();
+        ::ImGui::Separator();
+        ui::text(ui::muted, multiplayerSummary().c_str());
+        if (!app.mpDetail.empty()) ui::text(app.mpBlocks ? ui::accent : ui::muted, app.mpDetail.c_str());
+        if (!telemetry && attached) {
+            if (::ImGui::CollapsingHeader("遥测状态")) ui::text(ui::muted, app.telemetryError.c_str());
+        }
+        ui::endCard();
+        ::ImGui::EndTable();
+    }
     ::ImGui::Spacing();
     if (::ImGui::CollapsingHeader("高级：手动扫描（兼容性排查用）")) {
         ::ImGui::TextWrapped("全内存扫描会明显增加游戏内存压力，建议先存档。");
-        ::ImGui::Spacing();
         renderValuePanel(app, PanelKind::Fuel, "手动油量扫描", "仅供兼容性排查。",
-                         &app.fuelType, app.fuelCurrent, app.fuelTarget, &app.fuelLock);
+            &app.fuelType, app.fuelCurrent, app.fuelTarget, &app.fuelLock);
         ::ImGui::Spacing();
         renderValuePanel(app, PanelKind::Damage, "手动损坏扫描", "仅供兼容性排查。",
-                         &app.damageType, app.damageCurrent, app.damageTarget, &app.damageLock);
+            &app.damageType, app.damageCurrent, app.damageTarget, &app.damageLock);
     }
 }
 
 void renderScannerTabImpl(AppState& app) {
-    ::ImGui::TextUnformatted("类型");
-    ::ImGui::SameLine();
+    ui::beginCard("##scanner_workspace", "数值扫描与结果");
+    ::ImGui::TextWrapped("%s", "类型");
+    ui::next(220);
     typeCombo("##stype", &app.scanType);
     if (vtypeInfo(app.scanType).isFloat) {
-        ::ImGui::SameLine();
-        ::ImGui::TextUnformatted("  容差");
-        ::ImGui::SameLine();
+        ui::next(220);
+        ::ImGui::TextWrapped("%s", "  容差");
+        ui::next(220);
         ::ImGui::SetNextItemWidth(80);
         ::ImGui::InputText("##stolerance", app.scanTolerance, sizeof(app.scanTolerance),
                            ImGuiInputTextFlags_CharsDecimal);
     }
-    ::ImGui::SameLine();
-    ::ImGui::TextUnformatted("  数值");
-    ::ImGui::SameLine();
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "  数值");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(160);
     ::ImGui::InputText("##svalue", app.scanValue, 32, ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::BeginDisabled(app.busy.load());
-    if (::ImGui::Button("首次扫描", ImVec2(110, 0))) startFirstScan(app, PanelKind::Scanner);
+    if (ui::primaryButton("首次扫描", ImVec2(110, 0))) startFirstScan(app, PanelKind::Scanner);
     ::ImGui::EndDisabled();
-    ::ImGui::SameLine();
-    ::ImGui::TextUnformatted("对齐");
-    ::ImGui::SameLine();
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "对齐");
+    ui::next(220);
     {
         int alignIndex = 2;
         for (int i = 0; i < 4; ++i) {
@@ -3211,29 +3187,29 @@ void renderScannerTabImpl(AppState& app) {
             app.scanAlign = 1 << alignIndex;
         }
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::Checkbox("含超大内存区(慢很多)", &app.scanIncludeBig);
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("再次扫描：");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "再次扫描：");
+    ui::next(220);
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button("等于新数值", ImVec2(100, 0))) {
         startNextScan(app, PanelKind::Scanner, ScanMode::Exact);
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("数值变了", ImVec2(90, 0))) {
         startNextScan(app, PanelKind::Scanner, ScanMode::Changed);
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("数值没变", ImVec2(90, 0))) {
         startNextScan(app, PanelKind::Scanner, ScanMode::Unchanged);
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("变大了", ImVec2(80, 0))) {
         startNextScan(app, PanelKind::Scanner, ScanMode::Increased);
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("变小了", ImVec2(80, 0))) {
         startNextScan(app, PanelKind::Scanner, ScanMode::Decreased);
     }
@@ -3241,11 +3217,11 @@ void renderScannerTabImpl(AppState& app) {
 
     // --- 扫描器：写入行与结果表格 ---
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("写入值");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "写入值");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(160);
     ::ImGui::InputText("##snvalue", app.scanNewValue, 32, ImGuiInputTextFlags_CharsDecimal);
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::BeginDisabled(app.busy.load());
     if (::ImGui::Button("写入选中行", ImVec2(120, 0))) {
         ScanSession* session = app.scanSession.get();
@@ -3268,7 +3244,7 @@ void renderScannerTabImpl(AppState& app) {
             app.scanStatus = "请先扫描、选中行，并填写写入值";
         }
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("锁定选中行", ImVec2(120, 0))) {
         ScanSession* session = app.scanSession.get();
         double value = 0;
@@ -3286,7 +3262,7 @@ void renderScannerTabImpl(AppState& app) {
             app.scanStatus = "请先扫描、选中行，并填写要锁定的数值";
         }
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("选中行全选/清空", ImVec2(150, 0))) {
         ScanSession* session = app.scanSession.get();
         if (session) {
@@ -3299,7 +3275,7 @@ void renderScannerTabImpl(AppState& app) {
         }
     }
     ::ImGui::EndDisabled();
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("全部解锁", ImVec2(100, 0))) {
         if (app.freezer) app.freezer->clear();
         app.moneyLock = false;
@@ -3309,8 +3285,8 @@ void renderScannerTabImpl(AppState& app) {
         app.scanStatus = "已解除全部锁定";
         logLine(app.scanStatus);
     }
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.scanStatus.c_str());
+    ui::next(220);
+    ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.scanStatus.c_str());
 
     ::ImGui::Spacing();
     ScanSession* session = app.scanSession.get();
@@ -3350,6 +3326,7 @@ void renderScannerTabImpl(AppState& app) {
         ::ImGui::Text("共 %llu 处候选地址（表格显示前 500 处）",
                       (unsigned long long)session->count());
     }
+    ui::endCard();
 }
 
 // ==========================================================================
@@ -3438,16 +3415,16 @@ namespace {
 
 void renderTeleportSection(AppState& app) {
     if (!::ImGui::CollapsingHeader("地图传送（控制台 goto）", ImGuiTreeNodeFlags_DefaultOpen)) return;
-    ::ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.45f, 1.0f),
+    ui::textf(ImVec4(1.0f, 0.85f, 0.45f, 1.0f),
                          "传送只移动相机；调好高度后按 Ctrl+F9 把卡车落到该处。");
     ::ImGui::Spacing();
 
     if (::ImGui::Button("读取城市列表（解密存档）", ImVec2(200, 0))) loadMapCities(app);
-    ::ImGui::SameLine();
+    ui::next(220);
     ::ImGui::SetNextItemWidth(140);
     ::ImGui::InputTextWithHint("##cityfilter", "筛选城市名", app.cityFilter, sizeof(app.cityFilter));
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "共 %d 个城市",
+    ui::next(220);
+    ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "共 %d 个城市",
                          (int)app.mapCities.size());
 
     if (!app.mapCities.empty()) {
@@ -3473,7 +3450,7 @@ void renderTeleportSection(AppState& app) {
             }
             ::ImGui::EndCombo();
         }
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("传送到该城市", ImVec2(130, 0))) {
             if (app.mapCitySelected >= 0 && app.mapCitySelected < (int)app.mapCities.size()) {
                 teleportTo(app, app.mapCities[(size_t)app.mapCitySelected]);
@@ -3482,34 +3459,34 @@ void renderTeleportSection(AppState& app) {
     }
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("城市名");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "城市名");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(160);
     ::ImGui::InputTextWithHint("##cityinput", "例：berlin / calais", app.cityInput,
                                sizeof(app.cityInput));
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("传送（城市）", ImVec2(110, 0))) teleportTo(app, app.cityInput);
 
-    ::ImGui::SameLine(430.0f);
-    ::ImGui::TextUnformatted("坐标");
-    ::ImGui::SameLine();
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "坐标");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(180);
     ::ImGui::InputTextWithHint("##coords", "例：366.0;46.7;617.2", app.coordInput,
                                sizeof(app.coordInput));
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("传送（坐标）", ImVec2(110, 0))) teleportTo(app, app.coordInput);
 
     ::ImGui::Spacing();
     if (::ImGui::Button("导航起点", ImVec2(90, 0))) teleportTo(app, "nav_start");
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("导航终点", ImVec2(90, 0))) teleportTo(app, "nav_end");
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("下一个导航点", ImVec2(110, 0))) teleportTo(app, "nav_next");
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("上一个导航点", ImVec2(110, 0))) teleportTo(app, "nav_prev");
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("返回上一位置", ImVec2(110, 0))) teleportTo(app, "back");
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("瞬移车辆到相机处 (Ctrl+F9)", ImVec2(220, 0))) {
         DWORD pid = app.pid;
         if (!pid) {
@@ -3535,22 +3512,22 @@ void renderTeleportSection(AppState& app) {
     }
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("收藏点");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "收藏点");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(120);
     ::ImGui::InputTextWithHint("##spotname", "名字", app.spotName, sizeof(app.spotName));
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("收藏当前目标", ImVec2(120, 0))) saveTeleportSpot(app);
     for (int i = 0; i < (int)app.teleportSpots.size(); ++i) {
         ::ImGui::PushID(i);
         if (::ImGui::Button("传送", ImVec2(60, 0))) teleportTo(app, app.teleportSpots[(size_t)i].second);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("删除", ImVec2(60, 0))) {
             removeTeleportSpot(app, i);
             ::ImGui::PopID();
             break;
         }
-        ::ImGui::SameLine();
+        ui::next(220);
         ::ImGui::TextUnformatted(fmt("%s → %s", app.teleportSpots[(size_t)i].first.c_str(),
                                      app.teleportSpots[(size_t)i].second.c_str()).c_str());
         ::ImGui::PopID();
@@ -3625,28 +3602,28 @@ void renderConvoySection(AppState& app) {
         saveSettings(app);
     }
     if (!app.checkConvoy) {
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "（检测已关闭）");
+        ui::next(220);
+        ui::textf(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "（检测已关闭）");
     }
     ::ImGui::Spacing();
 
     if (::ImGui::Button("刷新联机状态", ImVec2(130, 0))) refreshConvoy(app);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("读取玩家列表", ImVec2(130, 0))) {
         app.convoy = readConvoySession();
         app.convoyNote = app.convoy.note;
     }
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(app.mpBlocks ? ImVec4(1.0f, 0.6f, 0.6f, 1.0f)
+    ui::next(220);
+    ui::textf(app.mpBlocks ? ImVec4(1.0f, 0.6f, 0.6f, 1.0f)
                                       : ImVec4(0.6f, 0.9f, 0.6f, 1.0f),
                          "%s", app.mpDetail.empty() ? "还没检测联机状态" : app.mpDetail.c_str());
 
     if (app.convoy.active) {
-        ::ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "%s（开始于 %s）",
+        ui::textf(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "%s（开始于 %s）",
                              app.convoy.note.c_str(),
                              app.convoy.startedAt.empty() ? "未知" : app.convoy.startedAt.c_str());
         if (app.convoy.players.empty()) {
-            ::ImGui::TextUnformatted("（还没有解析到玩家，可能刚进会话）");
+            ::ImGui::TextWrapped("%s", "（还没有解析到玩家，可能刚进会话）");
         } else {
             for (const auto& player : app.convoy.players) {
                 ::ImGui::BulletText("%s  (client %d)%s", player.name.c_str(), player.clientId,
@@ -3654,7 +3631,7 @@ void renderConvoySection(AppState& app) {
             }
         }
     } else {
-        ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.convoyNote.c_str());
+        ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.convoyNote.c_str());
     }
 
     if (app.checkConvoy) {
@@ -3669,10 +3646,10 @@ void renderConvoySection(AppState& app) {
     }
     ::ImGui::Spacing();
     const std::string gate = multiplayerGateForSafeFeature(app);
-    ::ImGui::TextColored(gate.empty() ? ImVec4(0.6f, 0.9f, 0.6f, 1.0f)
+    ui::textf(gate.empty() ? ImVec4(0.6f, 0.9f, 0.6f, 1.0f)
                                       : ImVec4(1.0f, 0.75f, 0.5f, 1.0f),
                          "安全功能当前：%s", gate.empty() ? "可用" : gate.c_str());
-    ::ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+    ui::textf(ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
                          "写入功能：%s",
                          app.mpBlocks ? "联机中已禁用" : (app.checkConvoy ? "可用（单机）" : "可用（联运检测已关闭）"));
 }
@@ -3680,8 +3657,17 @@ void renderConvoySection(AppState& app) {
 void renderFlyModeSection(AppState& app);
 
 void renderConsoleTabImpl(AppState& app) {
-    ::ImGui::TextUnformatted("控制台按键");
-    ::ImGui::SameLine();
+    ui::beginCard("##travel_teleport", "快捷传送");
+    renderTeleportSection(app);
+    ui::endCard();
+    ::ImGui::Spacing();
+    ui::beginCard("##travel_camera", "自由相机");
+    renderFlyModeSection(app);
+    ui::endCard();
+    ::ImGui::Spacing();
+    ui::beginCard("##travel_console", "游戏控制台");
+    ::ImGui::TextWrapped("%s", "控制台按键");
+    ui::next(220);
     const auto& options = consoleKeyOptions();
     int currentOption = 0;
     for (size_t i = 0; i < options.size(); ++i) {
@@ -3700,23 +3686,23 @@ void renderConsoleTabImpl(AppState& app) {
         }
         ::ImGui::EndCombo();
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("从 controls.sii 自动识别")) detectConsoleKey(app);
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("检测/开启控制台(config.cfg)")) checkConsoleConfig(app);
     if (!app.consoleNote.empty()) {
-        ::ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.55f, 1.0f), "%s", app.consoleNote.c_str());
+        ui::textf(ImVec4(0.85f, 0.85f, 0.55f, 1.0f), "%s", app.consoleNote.c_str());
     }
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("命令");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "命令");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(-140);
     ::ImGui::InputText("##cmd", app.consoleCmd, sizeof(app.consoleCmd));
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("发送到游戏", ImVec2(120, 0))) sendConsole(app, app.consoleCmd);
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("常用命令");
+    ::ImGui::TextWrapped("%s", "常用命令");
     struct Preset {
         const char* label;
         const char* command;
@@ -3729,7 +3715,7 @@ void renderConsoleTabImpl(AppState& app) {
         {"清空交通", "g_traffic 0"},        {"恢复交通", "g_traffic 1"},
         {"显示 FPS", "g_fps 1"},            {"关闭 FPS", "g_fps 0"},
     };
-    const int perRow = 6;
+    const int perRow = std::max(1, (int)((::ImGui::GetContentRegionAvail().x + 12) / 122));
     for (int i = 0; i < (int)(sizeof(kPresets) / sizeof(kPresets[0])); ++i) {
         if (i % perRow) ::ImGui::SameLine();
         if (::ImGui::Button(kPresets[i].label, ImVec2(110, 0))) {
@@ -3737,30 +3723,32 @@ void renderConsoleTabImpl(AppState& app) {
         }
     }
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.85f, 0.55f, 0.55f, 1.0f),
+    ui::textf(ImVec4(0.85f, 0.55f, 0.55f, 1.0f),
                          "发送会切换游戏窗口到前台，驾驶中请先停车。");
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+    ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
                          "需要 config.cfg：uset g_console \"1\" 与 uset g_developer \"1\"。");
 
     ::ImGui::Spacing();
     ::ImGui::Separator();
     ::ImGui::Spacing();
+    ui::endCard();
+    ::ImGui::Spacing();
+    ui::beginCard("##travel_multiplayer", "联机状态与保护");
     renderConvoySection(app);
-    renderFlyModeSection(app);
-    renderTeleportSection(app);
+    ui::endCard();
 }
 
 void renderFlyModeSection(AppState& app) {
     if (::ImGui::CollapsingHeader("飞行模式（自由相机）", ImGuiTreeNodeFlags_DefaultOpen)) {
         if (::ImGui::Button("检查 config.cfg", ImVec2(140, 0))) refreshFlyMode(app);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("从 controls.sii 识别相机按键", ImVec2(220, 0))) detectCameraKeys(app);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("写入飞行模式设置", ImVec2(160, 0))) enableFlyMode(app);
         ::ImGui::Spacing();
         ::ImGui::TextWrapped("%s", app.flyNote.c_str());
         if (app.cameraLoaded) {
-            ::ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
+            ui::textf(ImVec4(0.7f, 0.85f, 1.0f, 1.0f),
                                  "相机按键：开关 %s · 前进 %s · 后退 %s · 左 %s · 右 %s · 上升 %s · "
                                  "下降 %s",
                                  keyLabel(app.camera.toggle).c_str(),
@@ -3772,21 +3760,21 @@ void renderFlyModeSection(AppState& app) {
                                  keyLabel(app.camera.down).c_str());
         }
         ::ImGui::Spacing();
-        ::ImGui::TextUnformatted("飞行速度 g_flyspeed");
-        ::ImGui::SameLine();
+        ::ImGui::TextWrapped("%s", "飞行速度 g_flyspeed");
+        ui::next(220);
         ::ImGui::SetNextItemWidth(90);
         ::ImGui::InputText("##flyspeed", app.flySpeed, sizeof(app.flySpeed),
                            ImGuiInputTextFlags_CharsDecimal);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("立即应用", ImVec2(90, 0))) setFlySpeed(app, app.flySpeed);
         static const char* kSpeeds[] = {"50", "100", "300", "1000", "3000"};
         for (const char* speed : kSpeeds) {
-            ::ImGui::SameLine();
+            ui::next(220);
             if (::ImGui::Button(speed, ImVec2(60, 0))) setFlySpeed(app, speed);
         }
         ::ImGui::Spacing();
         if (::ImGui::Button("切换自由相机（进入/退出视角）", ImVec2(220, 0))) toggleFreeCamera(app);
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("瞬移车辆到当前自由相机位置 (Ctrl+F9)", ImVec2(260, 0))) {
             DWORD pid = app.pid;
             if (!pid) {
@@ -3810,7 +3798,7 @@ void renderFlyModeSection(AppState& app) {
                 }
             }
         }
-        ::ImGui::SameLine();
+        ui::next(220);
         if (::ImGui::Button("切回第一人称驾驶室 (按1)", ImVec2(180, 0))) {
             DWORD pid = app.pid;
             if (!pid) {
@@ -3826,15 +3814,59 @@ void renderFlyModeSection(AppState& app) {
 
 void renderSaveTabImpl(AppState& app) {
     ::ImGui::BeginDisabled(app.busy);
-    ::ImGui::TextUnformatted("本地与 Steam 云存档；复制卡车支持自动解密和转换，明文存档可改现金 / 经验（需先退出游戏）。");
+    if (::ImGui::Button("刷新存档列表")) refreshSaves(app);
+    ui::next(300);
+    ::ImGui::TextDisabled("本地 / Steam 云存档  ·  %d 个", (int)app.slots.size());
     ::ImGui::Spacing();
-    if (::ImGui::Button("刷新存档列表", ImVec2(120, 0))) refreshSaves(app);
-    ::ImGui::SameLine();
-    if (::ImGui::Button("备份选中存档", ImVec2(120, 0))) backupSelectedSlot(app);
-    ::ImGui::SameLine();
+    const int columns = ::ImGui::GetContentRegionAvail().x >= 880 ? 2 : 1;
+    if (::ImGui::BeginTable("##save_workspace", columns, ImGuiTableFlags_SizingStretchProp)) {
+        if (columns == 2) {
+            ::ImGui::TableSetupColumn("library", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ::ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+        }
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##save_library", "我的存档");
+        ::ImGui::BeginChild("##slots", ImVec2(0, 322));
+        if (app.slots.empty()) ui::text(ui::muted, "还没有找到存档。可刷新列表，或确认当前选择的游戏。");
+        for (int i = 0; i < (int)app.slots.size(); ++i) {
+            const auto& slot = app.slots[(size_t)i];
+            ::ImGui::PushID(i);
+            const ImVec2 pos = ::ImGui::GetCursorScreenPos();
+            const float width = ::ImGui::GetContentRegionAvail().x;
+            if (::ImGui::Selectable("##slot", app.selectedSlot == i, ImGuiSelectableFlags_None, ImVec2(0, 62)))
+                selectSlot(app, i);
+            const bool hovered = ::ImGui::IsItemHovered();
+            auto* draw = ::ImGui::GetWindowDrawList();
+            draw->PushClipRect(pos, ImVec2(pos.x + width, pos.y + 62), true);
+            const std::string name = slot.displayName.empty() ? W2U(slot.slotName) : slot.displayName;
+            draw->AddText(ImVec2(pos.x + 10, pos.y + 6), ::ImGui::GetColorU32(app.selectedSlot == i ? ui::accent : ui::foreground), name.c_str());
+            const std::string detail = W2U(slot.profileName) + " / " + (slot.cloud ? "Steam 云" : "本地") + " / " + localTimeString(slot.mtime);
+            ::ImGui::PushFont(nullptr, 14);
+            draw->AddText(ImVec2(pos.x + 10, pos.y + 33), ::ImGui::GetColorU32(ui::muted), detail.c_str());
+            ::ImGui::PopFont();
+            draw->PopClipRect();
+            if (hovered) ::ImGui::SetTooltip("%s\n%s\n%s / %s", name.c_str(), detail.c_str(), slot.formatText.c_str(), formatSize(slot.size).c_str());
+            ::ImGui::PopID();
+        }
+        ::ImGui::EndChild();
+        ui::endCard();
+        ::ImGui::TableNextColumn();
+        ui::beginCard("##save_selection", "存档详情与操作");
+        if (app.selectedSlot >= 0 && app.selectedSlot < (int)app.slots.size()) {
+            const auto& slot = app.slots[(size_t)app.selectedSlot];
+            ui::text(ui::accent, slot.displayName.empty() ? W2U(slot.slotName).c_str() : slot.displayName.c_str());
+            ui::textf(ui::muted, "档案：%s / 槽位：%s", W2U(slot.profileName).c_str(), W2U(slot.slotName).c_str());
+            ui::textf(ui::muted, "%s  ·  %s  ·  %s", slot.cloud ? "Steam 云" : "本地", slot.formatText.c_str(), formatSize(slot.size).c_str());
+            ::ImGui::Spacing();
+        } else {
+            ui::text(ui::muted, "选择一个存档，查看详情、备份或导出。");
+            ::ImGui::Spacing();
+        }
+    if (ui::primaryButton("备份选中存档")) backupSelectedSlot(app);
+    ui::next(210);
     if (::ImGui::Button("解密导出选中", ImVec2(130, 0))) exportSelectedSlot(app);
     if (::ImGui::IsItemHovered()) ::ImGui::SetTooltip("保留解密后的格式：BSII / 3nK 仍为二进制。");
-    ::ImGui::SameLine();
+    ui::next(210);
     if (::ImGui::Button("导出可读 SII", ImVec2(150, 0))) exportReadableSelectedSlot(app);
     if (::ImGui::IsItemHovered()) ::ImGui::SetTooltip("自动解密并把 BSII v3 转成可读文本；已是 SII 文本时原样保留。");
     if (::ImGui::Button("打开备份文件夹", ImVec2(130, 0))) {
@@ -3842,7 +3874,7 @@ void renderSaveTabImpl(AppState& app) {
         ::CreateDirectoryW(root.c_str(), nullptr);
         ::ShellExecuteW(nullptr, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
-    ::ImGui::SameLine();
+    ui::next(210);
     if (::ImGui::Button("打开导出文件夹", ImVec2(130, 0))) {
         const std::wstring exports = documentsDir() + L"\\exports";
         if (!isDirSegment(exports)) ::CreateDirectoryW(exports.c_str(), nullptr);
@@ -3856,7 +3888,7 @@ void renderSaveTabImpl(AppState& app) {
         }
     }
 
-    ::ImGui::SameLine();
+    ui::next(210);
     if (::ImGui::Button("复制为新存档")) {
         if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) app.saveNote = "请先选择源存档";
         else {
@@ -3884,7 +3916,7 @@ void renderSaveTabImpl(AppState& app) {
         ::ImGui::BeginDisabled(!valid);
         if (::ImGui::Button("开始复制")) { startSaveCopy(app); ::ImGui::CloseCurrentPopup(); }
         ::ImGui::EndDisabled();
-        ::ImGui::SameLine();
+        ui::next(210);
         if (::ImGui::Button("取消")) ::ImGui::CloseCurrentPopup();
         ::ImGui::EndPopup();
     }
@@ -3901,60 +3933,25 @@ void renderSaveTabImpl(AppState& app) {
     }
     if(app.busy && ::ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ::ImGui::SetTooltip("当前任务正在处理中，请完成或取消后再复制卡车。");
-    ::ImGui::SameLine();
-    ::ImGui::TextDisabled("直接选择现有存档；退出对应游戏后使用");
+    ui::next(210);
+    ui::text(ui::muted, "直接选择现有存档；退出对应游戏后使用");
     ::ImGui::EndDisabled();
     renderTruckTransferDialog(app);
     ::ImGui::BeginDisabled(app.busy);
     ::ImGui::Spacing();
     if (::ImGui::Button("拆分为独立档案")) openProfileSplit(app);
-    ::ImGui::SameLine();
-    ::ImGui::TextDisabled("同一档案的多个存档 → 各自独立的本地档案");
+    ui::next(210);
+    ui::text(ui::muted, "同一档案的多个存档 → 各自独立的本地档案");
     renderProfileSplitDialog(app);
-    ::ImGui::TextWrapped("%s",app.saveNote.c_str());
-    if (::ImGui::BeginTable("##slots", 7,
-                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
-                            ImVec2(0, 230))) {
-        ::ImGui::TableSetupColumn("修改时间", ImGuiTableColumnFlags_WidthFixed, 150);
-        ::ImGui::TableSetupColumn("档案", ImGuiTableColumnFlags_WidthFixed, 120);
-        ::ImGui::TableSetupColumn("存档位", ImGuiTableColumnFlags_WidthFixed, 130);
-        ::ImGui::TableSetupColumn("位置", ImGuiTableColumnFlags_WidthFixed, 70);
-        ::ImGui::TableSetupColumn("格式", ImGuiTableColumnFlags_WidthFixed, 110);
-        ::ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 90);
-        ::ImGui::TableSetupColumn("存档名称", ImGuiTableColumnFlags_WidthStretch);
-        ::ImGui::TableHeadersRow();
-        for (int i = 0; i < (int)app.slots.size(); ++i) {
-            const SaveSlot& slot = app.slots[(size_t)i];
-            ::ImGui::TableNextRow();
-            ::ImGui::TableSetColumnIndex(0);
-            ::ImGui::PushID(i);
-            bool selected = (i == app.selectedSlot);
-            if (::ImGui::Selectable(localTimeString(slot.mtime).c_str(), selected,
-                                    ImGuiSelectableFlags_SpanAllColumns)) {
-                selectSlot(app, i);
-            }
-            ::ImGui::PopID();
-            ::ImGui::TableSetColumnIndex(1);
-            ::ImGui::TextUnformatted(W2U(slot.profileName).c_str());
-            ::ImGui::TableSetColumnIndex(2);
-            ::ImGui::TextUnformatted(W2U(slot.slotName).c_str());
-            ::ImGui::TableSetColumnIndex(3);
-            ::ImGui::TextUnformatted(slot.cloud ? "Steam云" : "本地");
-            ::ImGui::TableSetColumnIndex(4);
-            ::ImGui::TextUnformatted(slot.formatText.c_str());
-            ::ImGui::TableSetColumnIndex(5);
-            ::ImGui::TextUnformatted(formatSize(slot.size).c_str());
-            ::ImGui::TableSetColumnIndex(6);
-            ::ImGui::TextUnformatted(slot.displayName.empty() ? "—" : slot.displayName.c_str());
-        }
+
+        ui::endCard();
         ::ImGui::EndTable();
     }
-
+    ui::text(ui::muted, app.saveNote.c_str());
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("明文存档数值修改");
+    ui::beginCard("##save_edit", "明文存档数值修改");
     ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "（写入前自动备份）");
+    ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "（写入前自动备份）");
     ::ImGui::TextUnformatted("现金");
     ::ImGui::SameLine();
     ::ImGui::SetNextItemWidth(150);
@@ -3969,11 +3966,13 @@ void renderSaveTabImpl(AppState& app) {
     if (::ImGui::Button("写入明文存档", ImVec2(130, 0))) applyTextPatch(app);
 
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("备份列表");
+    ui::endCard();
+    ::ImGui::Spacing();
+    ui::beginCard("##backup_card", "备份列表");
     ::ImGui::SameLine();
     if (::ImGui::Button("还原选中备份", ImVec2(120, 0))) restoreSelectedBackup(app);
     if (::ImGui::BeginTable("##backups", 4,
-                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                            ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg |
                                 ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
                             ImVec2(0, 150))) {
         ::ImGui::TableSetupColumn("备份时间", ImGuiTableColumnFlags_WidthFixed, 160);
@@ -4001,6 +4000,7 @@ void renderSaveTabImpl(AppState& app) {
         }
         ::ImGui::EndTable();
     }
+    ui::endCard();
     ::ImGui::EndDisabled();
     if (app.busy && ::ImGui::Button("取消当前任务")) app.cancel = true;
 }
@@ -4011,21 +4011,22 @@ void renderHelpTabImpl(AppState& app) {
         "\n"
         "【改钱 / 经验】美卡：填写目标金额后直接改钱；欧卡首次需填写当前金额作为定位种子。\n"
         "　　　　　　　之后：直接填目标值再点一次即可。写的是游戏权威存储，无需锁定。\n"
-        "【车辆】附加后直接勾选，无需填数值；换车、读档自动跟随当前车辆。\n"
+        "【车辆】无限油量和车辆无损直接勾选；动力预设与滑块只设置目标，点击「应用调校」才生效。\n"
+        "　　　　点击「恢复原厂」还原动力；换车、读档自动跟随当前车辆。\n"
         "【扫描器】任意数值都可扫描；向多个候选地址写入前会要求确认。\n"
-        "【存档】备份 / 还原 / 解密导出（导出到 文档\\exports，不覆盖旧文件）/ 复制为新存档；"
-        "写入与复制需先退出对应游戏。\n"
+        "【存档】备份 / 还原 / 解密导出 / 导出可读 SII / 复制为新存档 / 跨存档复制卡车 / 拆分独立档案。\n"
+        "　　　　导出到当前游戏文档目录的 exports，不覆盖旧文件；写入、复制与拆分需先退出对应游戏。\n"
         "\n"
-        "【加密存档为什么不能改】ScsC 头部含游戏自己的校验值，强写会损坏存档，\n"
-        "因此只做只读解密。要持久化金额请改内存，再让游戏自动存档。\n"
+        "【加密存档】解密与可读 SII 转换另存为导出文件；卡车复制生成新存档槽，保留原始存档。\n"
+        "　　　　　　金额与经验可在内存中修改，再由游戏自动存档。\n"
         "\n"
-        "【安全】只在单机使用；TruckersMP 与官方联运中会拒绝写入。\n"
+        "【安全】只在单机使用；TruckersMP 写入保护始终启用，Convoy 写入保护按检测设置生效。\n"
         "　　　　本工具不修改游戏 exe，也不注入代码，只做内存与存档文件读写。";
-    ::ImGui::TextWrapped("%s", kHelp);
+    ui::beginCard("##settings_preferences", "工作区设置");
     ::ImGui::Spacing();
     ::ImGui::Separator();
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "全局游戏热键（无需切屏）：");
+    ui::textf(ui::accent, "全局游戏热键（无需切屏）：");
     bool hk = app.hotkeysEnabled;
     if (::ImGui::Checkbox("启用游戏内全局热键", &hk)) {
         app.hotkeysEnabled = hk;
@@ -4036,15 +4037,15 @@ void renderHelpTabImpl(AppState& app) {
     ::ImGui::Spacing();
     ::ImGui::Separator();
     ::ImGui::Spacing();
-    ::ImGui::TextUnformatted("扫描时跳过超过");
-    ::ImGui::SameLine();
+    ::ImGui::TextWrapped("%s", "扫描时跳过超过");
+    ui::next(220);
     ::ImGui::SetNextItemWidth(90);
     ::ImGui::DragFloat("##maxgb", &app.maxRegionGb, 0.1f, 0.0f, 64.0f, "%.1f GB");
-    ::ImGui::SameLine();
-    ::ImGui::TextUnformatted("的内存区（0 = 不跳过）");
-    ::ImGui::SameLine();
-    ::ImGui::TextUnformatted("   线程数");
-    ::ImGui::SameLine();
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "的内存区（0 = 不跳过）");
+    ui::next(220);
+    ::ImGui::TextWrapped("%s", "   线程数");
+    ui::next(220);
     {
         int idx = 0;
         static const int kChoices[] = {1, 2, 4, 6, 8};
@@ -4056,16 +4057,21 @@ void renderHelpTabImpl(AppState& app) {
             app.workers = kChoices[idx];
         }
     }
-    ::ImGui::SameLine();
+    ui::next(220);
     if (::ImGui::Button("保存设置")) {
         saveSettings(app);
         logLine("设置已保存到 settings.ini");
     }
     ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.procStatus.c_str());
+    ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.procStatus.c_str());
     if (!app.memInfo.empty()) {
-        ::ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.memInfo.c_str());
+        ui::textf(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", app.memInfo.c_str());
     }
+    ui::endCard();
+    ::ImGui::Spacing();
+    ui::beginCard("##settings_manual", "使用说明");
+    ::ImGui::TextWrapped("%s", kHelp);
+    ui::endCard();
 }
 
 void renderConfirmDialogs(AppState& app) {
@@ -4081,7 +4087,7 @@ void renderConfirmDialogs(AppState& app) {
                              : PanelKind::Money;
         ScanSession* session = sessionFor(app, kind);
         const size_t count = session ? session->count() : 0;
-        ::ImGui::TextColored(ImVec4(0.95f, 0.50f, 0.35f, 1.0f),
+        ui::textf(ImVec4(0.95f, 0.50f, 0.35f, 1.0f),
                              "当前仍有 %llu 个候选地址。",
                              (unsigned long long)count);
         ::ImGui::TextWrapped("批量修改可能把无关的游戏数据一起改掉。建议取消并继续收窄，直到只剩 1 个地址。");
@@ -4131,7 +4137,7 @@ void renderConfirmDialogs(AppState& app) {
         DWORD gamePid = 0;
         const bool gameRunning = findProcess(selectedProcessName(), &gamePid, nullptr);
         if (gameRunning) {
-            ::ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.35f, 1.0f),
+            ui::textf(ImVec4(0.95f, 0.40f, 0.35f, 1.0f),
                                  "%s仍在运行（PID %u），请先退出游戏。", selectedGameDescriptor().shortName, gamePid);
         } else {
             ::ImGui::TextWrapped("程序会先备份当前存档，再覆盖还原。请确认已暂停 Steam 云同步或了解冲突处理方式。");
@@ -4172,68 +4178,46 @@ void renderApp(AppState& app) {
         }
     }
     ImGuiIO& io = ::ImGui::GetIO();
+    static bool showFullLog = false;
+    const bool attached = app.mem.isOpen() && app.mem.alive();
     ::ImGui::SetNextWindowPos(ImVec2(0, 0));
     ::ImGui::SetNextWindowSize(io.DisplaySize);
+    ::ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ::ImGui::Begin("##main", nullptr,
-                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
-                       ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus |
-                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoScrollbar);
+    ::ImGui::PopStyleVar();
 
-    // ---------------- 顶部现代化 Hero Header 状态栏 ----------------
-    ::ImGui::BeginChild("##top_hero_panel", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
-    
-    // 主标题与进程状态指示
-    {
-        const GameId ids[] = {GameId::Ets2, GameId::Ats};
-        for (size_t gi = 0; gi < 2; ++gi) {
-            const GameDescriptor& d = gameDescriptor(ids[gi]);
-            const bool active = (selectedGame() == d.id);
-            if (gi > 0) ::ImGui::SameLine();
-            if (active) {
-                ::ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.95f, 1.0f));
-            }
-            if (::ImGui::Button(d.shortName, ImVec2(72, 24)) && !active) selectGame(app, d.id);
-            if (active) ::ImGui::PopStyleColor();
-        }
-        if (!supportsVerifiedStructures(selectedGame())) {
-            ::ImGui::SameLine();
-            ::ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.25f, 1.0f),
-                                 "｜美卡布局尚未验证：结构化写入已禁用");
-        }
+    ::ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0);
+    ::ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 16));
+    ::ImGui::BeginChild("##cockpit_header", ImVec2(0, 126),
+        ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+    ::ImGui::BeginGroup();
+    ::ImGui::PushStyleColor(ImGuiCol_Text, ui::accent);
+    ui::heading("TRUCK TOOLS", 23);
+    ::ImGui::PopStyleColor();
+    ::ImGui::TextDisabled("欧卡2 / 美卡修改器");
+    ::ImGui::EndGroup();
+    ::ImGui::SameLine(260);
+    ::ImGui::BeginGroup();
+    ::ImGui::TextDisabled("目标游戏");
+    for (const GameId id : {GameId::Ets2, GameId::Ats}) {
+        if (id == GameId::Ats) ::ImGui::SameLine();
+        const auto& game = gameDescriptor(id);
+        if (ui::choice(game.shortName, selectedGame() == id, ImVec2(80, 34)) && selectedGame() != id)
+            selectGame(app, id);
     }
-    ::ImGui::Spacing();
-    ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "欧卡2 / 美卡");
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.85f, 0.88f, 0.94f, 1.0f), "TRAINER ｜ %s",
-                         selectedGameDescriptor().displayName);
-
-    ::ImGui::SameLine(460.0f);
-    const bool attached = app.mem.isOpen() && app.mem.alive();
+    ::ImGui::EndGroup();
+    ::ImGui::SameLine(std::max(470.0f, ::ImGui::GetWindowWidth() - 345.0f));
+    ::ImGui::BeginGroup();
+    ui::textf(attached ? ui::success : ui::muted,
+        attached ? "已连接游戏" : "尚未连接游戏");
     if (attached) {
-        ::ImGui::TextColored(ImVec4(0.20f, 0.88f, 0.50f, 1.0f), "● 游戏已连接运行中");
-    } else {
-        ::ImGui::TextColored(ImVec4(0.95f, 0.40f, 0.40f, 1.0f), "○ 目标游戏未附加");
-    }
+        if (::ImGui::Button("断开连接", ImVec2(110, 34))) detachGame(app);
+    } else if (ui::primaryButton("附加游戏", ImVec2(110, 34))) attachGame(app);
     ::ImGui::SameLine();
-    if (!app.mpHits.empty()) {
-        ::ImGui::TextColored(ImVec4(1.00f, 0.35f, 0.35f, 1.0f), " |  ⚠ TruckersMP 联机中");
-    } else {
-        ::ImGui::TextColored(ImVec4(0.50f, 0.75f, 0.95f, 1.0f),
-                             !attached ? " |  联机状态待检测" :
-                             (app.mpBlocks ? " |  写入被联机守卫拦截" :
-                              (isConvoyCheckEnabled() ? " |  未检测到联机" : " |  未检测 Convoy")));
-    }
-    if (!isAdmin()) {
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.25f, 1.0f), " [非管理员权限]");
-    }
-
-    ::ImGui::Spacing();
-
-    // 快捷按钮条与详情
-    if (::ImGui::Button(" 附加游戏 ", ImVec2(105, 28))) attachGame(app);
-    ::ImGui::SameLine();
-    if (::ImGui::Button(" 刷新检测 ", ImVec2(100, 28))) {
+    if (::ImGui::Button("刷新检测", ImVec2(100, 34))) {
         DWORD pid = 0;
         std::wstring exe;
         if (findProcess(selectedProcessName(), &pid, &exe)) {
@@ -4246,104 +4230,127 @@ void renderApp(AppState& app) {
             logLine(app.procStatus);
         }
     }
-    ::ImGui::SameLine();
-    if (::ImGui::Button(" 断开分离 ", ImVec2(90, 28))) detachGame(app);
-    ::ImGui::SameLine();
-    ::ImGui::TextColored(ImVec4(0.65f, 0.70f, 0.80f, 1.0f), "%s", app.procStatus.c_str());
-    if (!app.memInfo.empty()) {
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.48f, 0.52f, 0.62f, 1.0f), " (%s)", app.memInfo.c_str());
-    }
-
-    ::ImGui::EndChild();
+    ::ImGui::EndGroup();
     ::ImGui::Spacing();
-
-    // ---------------- 标签页（独立滚动，避免小屏/高 DPI 下裁切底部操作）----------------
-    ::ImGui::BeginChild("##tab_content", ImVec2(0, -145), ImGuiChildFlags_None,
-                        ImGuiWindowFlags_AlwaysVerticalScrollbar);
-    if (::ImGui::BeginTabBar("##tabs")) {
-        if (::ImGui::BeginTabItem("  实时改钱 / 经验  ")) {
-            renderMoneyTab(app);
-            ::ImGui::EndTabItem();
-        }
-        if (::ImGui::BeginTabItem("  车辆 (油量/无损/动力)  ")) {
-            renderVehicleTabImpl(app);
-            ::ImGui::EndTabItem();
-        }
-        if (::ImGui::BeginTabItem("  快捷传送 / 自由相机 / 控制台  ")) {
-            renderConsoleTabImpl(app);
-            ::ImGui::EndTabItem();
-        }
-        if (::ImGui::BeginTabItem("  全内存扫描器  ")) {
-            renderScannerTabImpl(app);
-            ::ImGui::EndTabItem();
-        }
-        if (::ImGui::BeginTabItem("  存档管理 / 备份  ", nullptr, app.activeTab == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
-            app.activeTab = -1;
-            renderSaveTabImpl(app);
-            ::ImGui::EndTabItem();
-        }
-        if (::ImGui::BeginTabItem("  说明与设置  ")) {
-            renderHelpTabImpl(app);
-            ::ImGui::EndTabItem();
-        }
-        ::ImGui::EndTabBar();
+    const char* guard = !attached ? "联机状态待检测" :
+        (!app.mpHits.empty() ? "TruckersMP 联机中" :
+         (app.mpBlocks ? "联机保护：写入受限" :
+          (isConvoyCheckEnabled() ? "未检测到联机" : "未检测 Convoy")));
+    ui::textf(app.mpBlocks ? ui::accent : ui::muted, "%s  /  %s", guard,
+        isAdmin() ? "管理员权限" : "普通权限");
+    if (::ImGui::IsItemHovered())
+        ::ImGui::SetTooltip("%s\n%s", app.procStatus.c_str(), app.memInfo.c_str());
+    if (!supportsVerifiedStructures(selectedGame())) {
+        ui::next(330);
+        ui::textf(ui::accent, "当前版本未验证，结构化写入已禁用");
     }
     ::ImGui::EndChild();
-    ::ImGui::Spacing();
+    ::ImGui::PopStyleVar(2);
 
-    // ---------------- 底部运行与日志状态栏 ----------------
-    ::ImGui::BeginChild("##bottom_bar", ImVec2(0, 0), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
-    
-    // 进度条行
-    if (app.busy.load()) {
-        uint64_t done = app.progressDone.load();
-        uint64_t total = app.progressTotal.load();
-        float frac = total ? (float)((double)done / (double)total) : 0.0f;
-        ::ImGui::ProgressBar(frac, ImVec2(280, 20));
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "%s  %d%%", app.progressNote.c_str(),
-                             (int)(frac * 100.0f + 0.5f));
-        ::ImGui::SameLine();
-        if (::ImGui::Button(" 取消任务 ", ImVec2(90, 22))) {
-            app.cancel.store(true);
-            logLine("已请求取消当前任务……");
-        }
-    } else {
-        std::vector<std::string> lines = logSnapshot();
-        std::string latest = lines.empty() ? "系统就绪。" : lines.back();
-        ::ImGui::TextColored(ImVec4(0.38f, 0.78f, 1.00f, 1.0f), "最新日志：");
-        ::ImGui::SameLine();
-        ::ImGui::TextColored(ImVec4(0.80f, 0.85f, 0.90f, 1.0f), "%s", latest.c_str());
+    const float footerHeight = showFullLog ? 192.0f : 64.0f;
+    const float bodyHeight = std::max(180.0f, ::ImGui::GetContentRegionAvail().y - footerHeight - 10.0f);
+    ::ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    ::ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0);
+    ::ImGui::PushStyleColor(ImGuiCol_ChildBg, ui::background);
+    ::ImGui::BeginChild("##workspace", ImVec2(0, bodyHeight), ImGuiChildFlags_None,
+        ImGuiWindowFlags_NoScrollbar);
+    ::ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 20));
+    ::ImGui::BeginChild("##navigation", ImVec2(182, 0),
+        ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar);
+    ::ImGui::PopStyleVar();
+    ::ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(10, 7));
+    ::ImGui::TextDisabled("WORKSPACE");
+    ::ImGui::Dummy(ImVec2(0, 12));
+    const int order[] = {1, 0, 2, 4, 3, 5};
+    const char* labels[] = {"资金与经验", "车辆调校", "传送与相机", "内存扫描", "存档与备份", "设置与说明"};
+    const char* subtitles[] = {"资金与成长，清晰可控。", "每一程，都在掌控之中。",
+        "去想去的地方，换一个视角。", "从数值变化中，找到目标。",
+        "保存每一次出发，也为改变留条退路。", "让工具适应你的习惯。"};
+    const char* sections[] = {"ECONOMY", "VEHICLE CONTROL", "WORLD & CAMERA", "MEMORY SCANNER", "SAVE LIBRARY", "PREFERENCES"};
+    if (app.activeTab < 0 || app.activeTab > 5) app.activeTab = 1;
+    for (const int page : order) {
+        ::ImGui::PushID(page);
+        ::ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
+        ::ImGui::PushStyleColor(ImGuiCol_Text, ui::muted);
+        if (ui::choice(labels[page], app.activeTab == page, ImVec2(-1, 44))) app.activeTab = page;
+        ::ImGui::PopStyleColor(2);
+        ::ImGui::PopID();
     }
-
-    ::ImGui::SameLine(io.DisplaySize.x - 220);
-    static bool showFullLog = false;
-    if (::ImGui::SmallButton(showFullLog ? "隐藏详细日志 ▲" : "查看详细日志 ▼")) {
-        showFullLog = !showFullLog;
+    if (::ImGui::GetContentRegionAvail().y > 60) {
+        ::ImGui::SetCursorPosY(::ImGui::GetWindowHeight() - 67);
+        ::ImGui::TextDisabled(selectedGame() == GameId::Ets2 ? "EUROPEAN ROADS" : "AMERICAN ROADS");
+        ::ImGui::TextDisabled("为下一程，做好准备。");
     }
+    ::ImGui::PopStyleVar();
+    ::ImGui::EndChild();
     ::ImGui::SameLine();
-    if (::ImGui::SmallButton("清空日志")) {
-        logClear();
+    ::ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24, 20));
+    // Each game/workspace owns its scroll position and widget focus.
+    ::ImGui::PushID(gameKey(selectedGame()));
+    ::ImGui::PushID(app.activeTab);
+    ::ImGui::BeginChild("##page_content", ImVec2(0, 0), ImGuiChildFlags_AlwaysUseWindowPadding);
+    ::ImGui::PopStyleVar();
+    ::ImGui::PopStyleColor();
+    ::ImGui::PopStyleVar(2);
+    ui::textf(ui::accent, "%s", sections[app.activeTab]);
+    ui::heading(labels[app.activeTab], 28);
+    ui::text(ui::muted, subtitles[app.activeTab]);
+    ::ImGui::Dummy(ImVec2(0, 10));
+    switch (app.activeTab) {
+        case 0: renderMoneyTab(app); break;
+        case 1: renderVehicleTabImpl(app); break;
+        case 2: renderConsoleTabImpl(app); break;
+        case 3: renderScannerTabImpl(app); break;
+        case 4: renderSaveTabImpl(app); break;
+        case 5: renderHelpTabImpl(app); break;
     }
+    ::ImGui::EndChild();
+    ::ImGui::PopID();
+    ::ImGui::PopID();
+    ::ImGui::EndChild();
 
-    if (!logFileError().empty()) {
-        ::ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f), "%s", logFileError().c_str());
+    ::ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 0);
+    ::ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20, 12));
+    ::ImGui::BeginChild("##session_footer", ImVec2(0, 0), ImGuiChildFlags_Borders);
+    ::ImGui::PopStyleVar(2);
+    if (::ImGui::BeginTable("##footer_columns", 2, ImGuiTableFlags_SizingStretchProp)) {
+        ::ImGui::TableSetupColumn("status", ImGuiTableColumnFlags_WidthStretch);
+        ::ImGui::TableSetupColumn("actions", ImGuiTableColumnFlags_WidthFixed, 225);
+        ::ImGui::TableNextColumn();
+        if (app.busy.load()) {
+            const uint64_t done = app.progressDone.load(), total = app.progressTotal.load();
+            const float fraction = total ? std::clamp(float(double(done) / double(total)), 0.0f, 1.0f) : 0;
+            ::ImGui::ProgressBar(fraction, ImVec2(150, 18));
+            ui::next(180);
+            ::ImGui::TextUnformatted(app.progressNote.c_str());
+        } else {
+            const auto lines = logSnapshot();
+            const std::string latest = lines.empty() ? app.procStatus : lines.back();
+            // A clipped single-line summary keeps the footer stable; hover exposes the whole entry.
+            ::ImGui::TextUnformatted(latest.c_str());
+            if (::ImGui::IsItemHovered()) ::ImGui::SetTooltip("%s", latest.c_str());
+        }
+        ::ImGui::TableNextColumn();
+        if (app.busy.load()) {
+            if (::ImGui::SmallButton("取消任务")) { app.cancel.store(true); logLine("已请求取消当前任务……"); }
+            ::ImGui::SameLine();
+        }
+        if (::ImGui::SmallButton(showFullLog ? "收起日志" : "运行日志")) showFullLog = !showFullLog;
+        ::ImGui::SameLine();
+        if (::ImGui::SmallButton("清空")) logClear();
+        ::ImGui::EndTable();
     }
+    if (!logFileError().empty()) ui::text(ImVec4(1, .4f, .3f, 1), logFileError().c_str());
     if (showFullLog) {
-        ::ImGui::TextWrapped("实时会话日志：%s", W2U(logFilePath()).c_str());
-
-        ::ImGui::Separator();
-        ::ImGui::BeginChild("##log_expanded", ImVec2(0, 56), ImGuiChildFlags_None,
-                            ImGuiWindowFlags_HorizontalScrollbar);
-        std::vector<std::string> lines = logSnapshot();
-        for (const auto& line : lines) {
-            ::ImGui::TextUnformatted(line.c_str());
-        }
-        ::ImGui::SetScrollHereY(1.0f);
+        ui::text(ui::muted, W2U(logFilePath()).c_str());
+        ::ImGui::BeginChild("##log_expanded", ImVec2(0, 0), ImGuiChildFlags_None,
+            ImGuiWindowFlags_HorizontalScrollbar);
+        const auto lines = logSnapshot();
+        const bool follow = ::ImGui::GetScrollY() >= ::ImGui::GetScrollMaxY();
+        for (const auto& line : lines) ::ImGui::TextUnformatted(line.c_str());
+        if (follow) ::ImGui::SetScrollHereY(1);
         ::ImGui::EndChild();
     }
-
     ::ImGui::EndChild();
     renderConfirmDialogs(app);
     ::ImGui::End();

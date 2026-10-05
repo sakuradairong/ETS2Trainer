@@ -5,6 +5,7 @@ rem    build.bat            full build, output ..\ETS2Trainer.exe
 rem    build.bat check      compile only, no linking
 rem    build.bat test       build non-elevated test exe (for self tests)
 rem    build.bat readable   build ..\ETS2Trainer_readable_export.exe
+rem    build.bat cockpit    build ..\ETS2Trainer_cockpit.exe
 rem    build.bat clean      remove build dir and exe
 rem  NOTE keep this file ASCII only (cmd parses it with the OEM page)
 rem  NOTE do not put %VCVARS% inside "( )" blocks: the (x86) paren would
@@ -35,6 +36,7 @@ if /i "%~1"=="test" goto testbuild
 set "OUTPUT=..\ETS2Trainer.exe"
 if /i "%~1"=="next" set "OUTPUT=..\ETS2Trainer_next.exe"
 if /i "%~1"=="readable" set "OUTPUT=..\ETS2Trainer_readable_export.exe"
+if /i "%~1"=="cockpit" set "OUTPUT=..\ETS2Trainer_cockpit.exe"
 
 del /q build\*.obj >nul 2>&1
 echo [build] 1/2 compiling with /MP ...

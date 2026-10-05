@@ -141,6 +141,13 @@ struct AppState {
     bool  autoDamageLock = false;
     int   enginePowerOption = 0;   // 0=原厂, 1=1.25×, 2=1.50×, 3=2.00×
     bool  engineRaiseLimit = false;
+    // Unapplied UI draft; selection never writes to the game until Apply is pressed.
+    int   engineDraftOption = 0;
+    bool  engineDraftRaiseLimit = false;
+    int   engineDraftSourceOption = -1;
+    bool  engineDraftSourceRaiseLimit = false;
+    DWORD engineDraftPid = 0;
+    GameId engineDraftGame = GameId::Ets2;
     std::string engineStatus = "未启用。动力调节直接改写发动机数据，不扫描内存。";
     // 上次运行留下的「写入值 / 原厂基准」，用于防止跨进程重启后把放大值当原厂值
     std::string engineStateText;
@@ -279,7 +286,7 @@ struct AppState {
     uint64_t lastEngineSaveTick = 0;
 
     // ---------- 界面 ----------
-    int   activeTab = 0;
+    int   activeTab = 1;  // Persistent workspace selection; vehicle cockpit by default.
     bool  requestExit = false;
 };
 
