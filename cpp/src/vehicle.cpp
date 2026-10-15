@@ -1,4 +1,4 @@
-// vehicle.cpp —— ETS2 1.61.1.1 固定入口；运行时只沿 4 级指针链读取几十字节
+// vehicle.cpp —— 按已核对版本选择固定入口与燃油校正偏移，再用遥测交叉验证。
 #include "vehicle.h"
 
 #include "gameio.h"
@@ -18,7 +18,6 @@ namespace {
 constexpr uint64_t kRootToDriver = 0x31B0;
 constexpr uint64_t kDriverToContext = 0x18;
 constexpr uint64_t kContextToTruck = 0x1F8;
-constexpr uint64_t kContextFuelCorrection = 0x1158;
 
 constexpr uint64_t kTruckFuelCapacity = 0x190;
 constexpr uint64_t kTruckFuelRatio = 0x1B8;
@@ -116,8 +115,10 @@ bool VehicleLocker::bind(ProcessMemory* memory, DWORD pid, std::string* error) {
 
 bool VehicleLocker::locateRootGlobal(std::string* error) {
     uint64_t base = 0;
-    if (!verifyGameLayout(*memory_, &base, error)) return false;
-    const auto& profile = layoutProfile(selectedGame());
+    const LayoutProfile* matched=nullptr;
+    if (!verifyGameLayout(*memory_, &base, error, &matched)) return false;
+    const auto& profile = *matched;
+    fuelCorrectionOffset_=profile.fuelCorrectionOffset;
     int32_t displacement = 0;
     ::memcpy(&displacement, profile.rootInstruction.data() + 3, sizeof(displacement));
     rootGlobal_ = base + profile.rootRva + 7 + static_cast<int64_t>(displacement);
@@ -165,7 +166,7 @@ bool VehicleLocker::resolveAndValidate(VehicleAddresses* addresses,
     std::array<float, 8> wearParts{};
     if (!readFloat(*memory_, truck + kTruckFuelCapacity, &capacity) ||
         !readFloat(*memory_, truck + kTruckFuelRatio, &ratio) ||
-        !readFloat(*memory_, context + kContextFuelCorrection, &correction) ||
+        !readFloat(*memory_, context + fuelCorrectionOffset_, &correction) ||
         !readFloat(*memory_, truck + kTruckEngineWear, &wearParts[0]) ||
         !readFloat(*memory_, truck + kTruckEnginePermanent, &wearParts[1]) ||
         !readFloat(*memory_, truck + kTruckTransmissionWear, &wearParts[2]) ||
@@ -190,7 +191,7 @@ bool VehicleLocker::resolveAndValidate(VehicleAddresses* addresses,
     }
 
     found.fuel = truck + kTruckFuelRatio;
-    found.fuelCorrection = context + kContextFuelCorrection;
+    found.fuelCorrection = context + fuelCorrectionOffset_;
     found.damageFields = {
         truck + kTruckEngineWear,        truck + kTruckEnginePermanent,
         truck + kTruckTransmissionWear,  truck + kTruckTransmissionPermanent,
@@ -306,7 +307,7 @@ bool VehicleLocker::applyTransactional(const VehicleAddresses& addresses, bool f
     return true;
 }
 
-bool VehicleLocker::setFuelEnabled(bool enabled, std::string* error) {
+bool VehicleLocker::setFuelEnabled(bool enabled, std::string* error, bool electric) {
     if (enabled) {
         if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
             if (error) *error = reason;
@@ -314,7 +315,7 @@ bool VehicleLocker::setFuelEnabled(bool enabled, std::string* error) {
         }
     }
     const VehicleCommandState current = commands();
-    applyCommand(enabled, current.damage);
+    applyCommand(enabled, current.damage, electric);
     if (!enabled) {
         std::lock_guard<std::mutex> writeLock(writeMutex_);
         setStatus(comboStatusText());
@@ -336,10 +337,12 @@ bool VehicleLocker::setFuelEnabled(bool enabled, std::string* error) {
     if (result.action != CycleAction::Applied) {
         applyCommand(false, current.damage);
         if (error && error->empty()) *error = result.note;
-        setStatus("无限油量启用失败：" + (error ? *error : std::string("写入被拒绝")));
+        setStatus(std::string(electric ? "无限电量启用失败：" : "无限油量启用失败：") +
+                  (error ? *error : std::string("写入被拒绝")));
         return false;
     }
-    setStatus(fmt("无限油量已锁定（%.1f / %.1f L）", telemetry.fuel, telemetry.fuelCapacity));
+    setStatus(electric ? "无限电量已锁定（100%）" :
+              fmt("无限油量已锁定（%.1f / %.1f L）", telemetry.fuel, telemetry.fuelCapacity));
     ensureThread();
     return true;
 }
@@ -352,27 +355,27 @@ bool VehicleLocker::setDamageEnabled(bool enabled, std::string* error) {
         }
     }
     const VehicleCommandState current = commands();
-    applyCommand(current.fuel, enabled);
+    applyCommand(current.fuel, enabled, current.electric);
     if (!enabled) {
         std::lock_guard<std::mutex> writeLock(writeMutex_);
         setStatus(comboStatusText());
         return true;
     }
     if (!memory_ || !memory_->isOpen()) {
-        applyCommand(current.fuel, false);
+        applyCommand(current.fuel, false, current.electric);
         if (error) *error = "游戏进程尚未附加";
         return false;
     }
     VehicleAddresses addresses;
     TelemetrySnapshot telemetry;
     if (!resolveAndValidate(&addresses, &telemetry, error)) {
-        applyCommand(current.fuel, false);
+        applyCommand(current.fuel, false, current.electric);
         return false;
     }
     std::lock_guard<std::mutex> writeLock(writeMutex_);
     const CycleResult result = runCycleLocked(addresses, true, error);
     if (result.action != CycleAction::Applied) {
-        applyCommand(current.fuel, false);
+        applyCommand(current.fuel, false, current.electric);
         if (error && error->empty()) *error = result.note;
         setStatus("车辆无损启用失败：" + (error ? *error : std::string("写入被拒绝")));
         return false;
@@ -386,10 +389,11 @@ bool VehicleLocker::setDamageEnabled(bool enabled, std::string* error) {
 // ===========================================================================
 // 统一命令状态 / 单写者周期
 // ===========================================================================
-void VehicleLocker::applyCommand(bool fuel, bool damage) {
+void VehicleLocker::applyCommand(bool fuel, bool damage, bool electric) {
     std::lock_guard<std::mutex> lock(commandMutex_);
     command_.fuel = fuel;
     command_.damage = damage;
+    command_.electric = fuel && electric;
     ++command_.sequence;
 }
 
@@ -416,6 +420,11 @@ void VehicleLocker::setGuardIntervalMs(uint64_t milliseconds) {
     guardIntervalMs_ = milliseconds;
 }
 
+void VehicleLocker::setFuelWriteGuard(WriteGuard guard) {
+    std::lock_guard<std::mutex> lock(guardMutex_);
+    fuelGuard_ = std::move(guard);
+}
+
 void VehicleLocker::setCycleHookAfterSnapshot(std::function<void()> hook) {
     cycleHookAfterSnapshot_ = std::move(hook);
 }
@@ -424,22 +433,26 @@ void VehicleLocker::setRollbackHookForTesting(std::function<void()> hook) {
     rollbackHookForTesting_ = std::move(hook);
 }
 
-bool VehicleLocker::bindForTesting(ProcessMemory* memory, uint64_t rootGlobal) {
+bool VehicleLocker::bindForTesting(ProcessMemory* memory, uint64_t rootGlobal,uint64_t fuelCorrectionOffset) {
     stop();
     memory_ = memory;
     pid_ = 0;
     rootGlobal_ = rootGlobal;
+    fuelCorrectionOffset_=fuelCorrectionOffset;
     if (!memory_ || !memory_->isOpen()) return false;
     return true;
 }
 
-void VehicleLocker::setCommandsForTesting(bool fuel, bool damage) {
-    applyCommand(fuel, damage);
+void VehicleLocker::setCommandsForTesting(bool fuel, bool damage, bool electric) {
+    applyCommand(fuel, damage, electric);
+}
+bool VehicleLocker::probeForTesting(VehicleAddresses* addresses,std::string* error) {
+    return !pid_&&resolveAndValidate(addresses,nullptr,error,false);
 }
 
-std::string VehicleLocker::guardReason() {
+std::string VehicleLocker::guardReason(const VehicleCommandState& state) {
     const uint64_t now = ::GetTickCount64();
-    const uint64_t sequence = commandSequence();
+    const uint64_t sequence = state.sequence;
     const bool sequenceChanged = sequence != guardCheckedSequence_;
     if (!sequenceChanged && now - guardCheckedAt_ < guardIntervalMs_) return std::string();
     guardCheckedAt_ = now;
@@ -448,7 +461,8 @@ std::string VehicleLocker::guardReason() {
     WriteGuard guardSnapshot;
     {
         std::lock_guard<std::mutex> lock(guardMutex_);
-        guardSnapshot = guard_;
+        // Mixed fuel/damage commands always use the strict guard.
+        guardSnapshot = state.fuel && !state.damage && fuelGuard_ ? fuelGuard_ : guard_;
     }
     if (!guardSnapshot) return std::string();
     return guardSnapshot();
@@ -466,7 +480,7 @@ VehicleLocker::CycleResult VehicleLocker::runCycleLocked(const VehicleAddresses&
     if (commandSequence() != state.sequence) return {CycleAction::SkippedStale, "状态已变化，本轮不写入"};
     if (!state.fuel && !state.damage) return {CycleAction::Idle, "车辆锁定已关闭"};
     std::string blocked = structuralWriteBlockReason();
-    if (blocked.empty()) blocked = guardReason();
+    if (blocked.empty()) blocked = guardReason(state);
     if (commandSequence() != state.sequence) return {CycleAction::SkippedStale, "闸门检查期间状态已变化"};
     if (!blocked.empty()) {
         applyCommand(false, false);
@@ -527,13 +541,15 @@ void VehicleLocker::stop() {
     memory_ = nullptr;
     pid_ = 0;
     rootGlobal_ = 0;
+    fuelCorrectionOffset_=0x1158;
     setStatus("未启用");
 }
 
 std::string VehicleLocker::comboStatusText() const {
     std::vector<std::string> items;
-    if (fuelEnabled()) items.push_back("无限油量");
-    if (damageEnabled()) items.push_back("无损");
+    const auto state = commands();
+    if (state.fuel) items.push_back(state.electric ? "无限电量" : "无限油量");
+    if (state.damage) items.push_back("无损");
     if (items.empty()) return "车辆锁定已关闭";
     std::string text;
     for (size_t i = 0; i < items.size(); ++i) {

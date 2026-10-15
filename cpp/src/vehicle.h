@@ -15,6 +15,8 @@ struct VehicleAddresses {
 };
 struct VehicleCommandState {
     bool fuel = false, damage = false;
+    // Electric and fuel locks share one energy field and one writer.
+    bool electric = false;
     uint64_t sequence = 0;
 };
 class VehicleLocker {
@@ -23,9 +25,10 @@ public:
     ~VehicleLocker() { stop(); }
     bool bind(ProcessMemory*, DWORD, std::string*);
     bool probe(VehicleAddresses*, TelemetrySnapshot*, std::string*);
-    bool setFuelEnabled(bool, std::string*);
+    bool setFuelEnabled(bool, std::string*, bool electric = false);
     bool setDamageEnabled(bool, std::string*);
     void setWriteGuard(WriteGuard);
+    void setFuelWriteGuard(WriteGuard);
     void setGuardIntervalMs(uint64_t);
     void stop();
     bool fuelEnabled() const;
@@ -38,18 +41,19 @@ public:
     void setCycleHookAfterSnapshot(std::function<void()>);
     void setRollbackHookForTesting(std::function<void()>);
     void setBeforeFieldWriteHookForTesting(std::function<void(size_t)> hook) { beforeFieldWrite_ = std::move(hook); }
-    bool bindForTesting(ProcessMemory*, uint64_t);
-    void setCommandsForTesting(bool fuel, bool damage);
+    bool bindForTesting(ProcessMemory*, uint64_t, uint64_t fuelCorrectionOffset = 0x1158);
+    bool probeForTesting(VehicleAddresses*,std::string*);
+    void setCommandsForTesting(bool fuel, bool damage, bool electric = false);
     VehicleCommandState commands() const;
 private:
     bool locateRootGlobal(std::string*);
     bool resolveChainOnly(VehicleAddresses*, std::string*) const;
     bool resolveAndValidate(VehicleAddresses*, TelemetrySnapshot*, std::string*, bool requireTelemetry = true) const;
-    void applyCommand(bool fuel, bool damage);
+    void applyCommand(bool fuel, bool damage, bool electric = false);
     uint64_t commandSequence() const;
     bool applyTransactional(const VehicleAddresses&, bool fuel, bool damage, uint64_t sequence, std::string*);
     CycleResult runCycleLocked(const VehicleAddresses&, bool, std::string*);
-    std::string guardReason();
+    std::string guardReason(const VehicleCommandState&);
     void ensureThread();
     void run();
     void setStatus(const std::string&);
@@ -57,11 +61,13 @@ private:
     ProcessMemory* memory_ = nullptr;
     DWORD pid_ = 0;
     uint64_t rootGlobal_ = 0;
+    uint64_t fuelCorrectionOffset_ = 0x1158;
     mutable std::mutex commandMutex_;
     VehicleCommandState command_;
     std::mutex writeMutex_;
     mutable std::mutex guardMutex_;
     WriteGuard guard_;
+    WriteGuard fuelGuard_;
     uint64_t guardCheckedAt_ = 0, guardCheckedSequence_ = 0, guardIntervalMs_ = 5000;
     std::function<void()> cycleHookAfterSnapshot_, rollbackHookForTesting_;
     std::function<void(size_t)> beforeFieldWrite_;

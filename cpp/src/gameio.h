@@ -52,6 +52,11 @@ struct MultiplayerStatus {
         if (kind == MultiplayerKind::TruckersMp || kind == MultiplayerKind::Unknown) return true;
         return isConvoyCheckEnabled() && kind == MultiplayerKind::Convoy;
     }
+
+    // Only the automatic fuel locker may use this TruckersMP exception.
+    bool blocksFuelWrite() const {
+        return kind != MultiplayerKind::TruckersMp && blocksWrite();
+    }
 };
 
 //: 综合联机检测：TruckersMP 模块/进程 + 官方 Convoy（game.log.txt 的 [MP] 会话记录，受 isConvoyCheckEnabled 控制）。
