@@ -5,7 +5,15 @@
 #include "engine.h"
 #include "enginetest.h"
 #include "savecopytest.h"
+#include "saveprofilestest.h"
+#include "saveprofilesuitest.h"
 #include "trucktransfertest.h"
+#include "fleettest.h"
+#include "fueltanktest.h"
+#include "fueltankassetstest.h"
+#include "fueltank.h"
+#include "homeaccessorytest.h"
+#include "trailerswaptest.h"
 #include "profilesplittest.h"
 #include "bsiitest.h"
 #include "gameio.h"
@@ -379,6 +387,10 @@ int runLiveTest(const std::wstring& outPath) {
         if (!game.verifiedLayouts) {
             note("固定布局检查跳过：美卡尚未验证，不尝试欧卡偏移。通用扫描/存档/控制台仍可用。");
         } else if (opened && telemetryOk) {
+            uint64_t imageBase=0;const LayoutProfile* profile=nullptr;
+            if(verifyGameLayout(memory,&imageBase,&error,&profile))
+                note(fmt("已匹配版本 %s；燃油校正字段 context+0x%llX",profile->version,
+                    static_cast<unsigned long long>(profile->fuelCorrectionOffset)));
             VehicleLocker vehicle;
             VehicleAddresses addresses;
             layoutOk = vehicle.bind(&memory, pid, &error) && vehicle.probe(&addresses, &telemetry, &error);
@@ -1236,6 +1248,18 @@ int runParseTest() {
 // 自检：无界面；只对自身进程读写，对存档只读（明文测试在临时副本上进行）
 // 离线合成回归：不探测真实进程/存档/配置/备份环境，只验证游戏选择与路由契约。
 // 用 --gametest 运行；报告写到 exe 同目录的 gametest_report.txt。
+int runFixtureSuite(const std::vector<TunerTestItem>& items,const std::wstring& outPath) {
+    std::string report;int passed=0,failed=0;
+    for(const auto& item:items) {
+        report+=fmt("[%s] %s%s\n",item.ok ? "PASS" : "FAIL",item.name.c_str(),
+                    item.detail.empty() ? "" : ("  "+item.detail).c_str());
+        if(item.ok) ++passed;else ++failed;
+    }
+    report+=fmt("共 %d 项通过，%d 项失败\n",passed,failed);
+    const bool saved=writeFileBytes(outPath,{report.begin(),report.end()});
+    return saved && failed==0 ? 0 : 1;
+}
+
 int runGameSelftest(const std::wstring& outPath) {
     std::string report;
     int passed = 0, failed = 0;
@@ -1249,6 +1273,24 @@ int runGameSelftest(const std::wstring& outPath) {
         }
     };
 
+    // Fuel permission is separate from every other memory writer.
+    {
+        const bool previousConvoyCheck = isConvoyCheckEnabled();
+        for (bool convoyCheck : {false, true}) {
+            setConvoyCheckEnabled(convoyCheck);
+            const MultiplayerStatus tmp{MultiplayerKind::TruckersMp, "TMP"};
+            const MultiplayerStatus unknown{MultiplayerKind::Unknown, "unknown"};
+            const MultiplayerStatus convoy{MultiplayerKind::Convoy, "convoy"};
+            const MultiplayerStatus single{MultiplayerKind::None, "single"};
+            const std::string mode = convoyCheck ? "Convoy on" : "Convoy off";
+            check("TruckersMP 仅油量放行", tmp.blocksWrite() && !tmp.blocksFuelWrite(), mode);
+            check("无法确认时油量仍拒绝", unknown.blocksWrite() && unknown.blocksFuelWrite(), mode);
+            check("油量保留 Convoy 策略", convoy.blocksWrite() == convoyCheck &&
+                  convoy.blocksFuelWrite() == convoyCheck, mode);
+            check("单机油量与通用写入放行", !single.blocksWrite() && !single.blocksFuelWrite(), mode);
+        }
+        setConvoyCheckEnabled(previousConvoyCheck);
+    }
     // 1. 选择 → 进程名 / 遥测编号 / 路径
     setSelectedGame(GameId::Ets2);
     check("默认选择=欧卡2", selectedGame() == GameId::Ets2, "");
@@ -1268,6 +1310,23 @@ int runGameSelftest(const std::wstring& outPath) {
     check("美卡拒绝被修改的代码", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp, atsProfile.imageSize, wrongBytes), "");
     check("美卡拒绝错误版本", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp+1, atsProfile.imageSize, atsProfile.rootInstruction), "");
     check("美卡拒绝欧卡签名", !layoutFingerprintMatches(atsProfile, atsProfile.timestamp, atsProfile.imageSize, layoutProfile(GameId::Ets2).rootInstruction), "");
+    const auto& etsProfiles=layoutProfiles(GameId::Ets2);
+    check("欧卡保留旧版并加入 1.61.1.9",etsProfiles.size()==2&&std::string(etsProfiles[0].version)=="1.61.1.1"&&
+        std::string(etsProfiles[1].version)=="1.61.1.9","");
+    const auto& etsNew=etsProfiles.at(1);
+    check("欧卡新版正确指纹通过",layoutFingerprintMatches(etsNew,0x6ACDF049,0x398B000,etsNew.rootInstruction),"");
+    check("欧卡新版拒绝不同构建",!layoutFingerprintMatches(etsNew,etsNew.timestamp+1,etsNew.imageSize,etsNew.rootInstruction)&&
+        !layoutFingerprintMatches(etsNew,etsNew.timestamp,etsNew.imageSize+0x1000,etsNew.rootInstruction),"");
+    auto badEts=etsNew.rootInstruction;badEts[3]^=1;
+    check("欧卡新版拒绝入口指令变化",!layoutFingerprintMatches(etsNew,etsNew.timestamp,etsNew.imageSize,badEts),"");
+    auto badFormula=etsNew.fuelFormulaInstruction;badFormula[12]=0x58;
+    check("欧卡新版校验燃油公式并拒绝旧校正偏移",layoutFuelFormulaMatches(etsNew,etsNew.fuelFormulaInstruction)&&
+        !layoutFuelFormulaMatches(etsNew,badFormula)&&etsNew.fuelCorrectionOffset==0x1180&&
+        etsProfiles.front().fuelCorrectionOffset==0x1158,"");
+    {
+        ProcessMemory closed;uint64_t base=123;const LayoutProfile* matched=&etsNew;std::string error;
+        check("布局失败清除旧映像及匹配结果",!verifyGameLayout(closed,&base,&error,&matched)&&base==0&&matched==nullptr,error);
+    }
 
     // 2. 结构化写入 fail-closed：动力调校 / 固定油量与无损 / 现金写入
     {
@@ -1398,7 +1457,7 @@ int runGameSelftest(const std::wstring& outPath) {
         check(selectionLockedFromCli() ? "命令行选择不被设置覆盖" : "settings 读取 game=ats",
               selectedGame() == (selectionLockedFromCli() ? beforeLoad : GameId::Ats), "");
         check("settings 忽略历史 anti_roll_factor",
-              !loaded.autoFuelLock && !loaded.autoDamageLock, "");
+              !loaded.autoFuelLock && !loaded.autoElectricLock && !loaded.autoDamageLock, "");
         ::DeleteFileW(tmp.c_str());
     }
 
@@ -1520,6 +1579,29 @@ int runGameSelftest(const std::wstring& outPath) {
         const bool opened = memory.open(::GetCurrentProcessId(), "gametest", &error);
         check("车辆离线测试打开自身进程", opened, error);
         if (opened) {
+            {
+                std::vector<uint8_t> root(0x31B8),driver(0x20),context(0x1200),truck(0x200);
+                const auto address=[](const auto& bytes){return reinterpret_cast<uint64_t>(bytes.data());};
+                const auto put=[](auto& bytes,size_t at,const auto value){::memcpy(bytes.data()+at,&value,sizeof(value));};
+                const uint64_t rootPointer=address(root);
+                put(root,0x31B0,address(driver));put(driver,0x18,address(context));put(context,0x1F8,address(truck));
+                put(truck,0x190,1000.f);put(truck,0x1B8,0.5f);
+                put(context,0x1158,425.f);put(context,0x1180,0.01f);
+                VehicleLocker fixture;VehicleAddresses fields;
+                fixture.bindForTesting(&memory,reinterpret_cast<uint64_t>(&rootPointer),etsNew.fuelCorrectionOffset);
+                const bool probed=fixture.probeForTesting(&fields,&error);
+                check("新版车辆解析忽略旧偏移异常值",probed&&fields.fuelCorrection==address(context)+0x1180,error);
+                fixture.setCommandsForTesting(true,false);
+                const auto applied=probed?fixture.runMaintenanceCycle(fields,false,&error):VehicleLocker::CycleResult{};
+                float sentinel=0,newCorrection=1,ratio=0;
+                ::memcpy(&sentinel,context.data()+0x1158,4);::memcpy(&newCorrection,context.data()+0x1180,4);
+                ::memcpy(&ratio,truck.data()+0x1B8,4);
+                check("新版燃油事务只写自身新校正字段且保留旧字段",applied.action==VehicleLocker::CycleAction::Applied&&
+                    ratio==1&&newCorrection==0&&sentinel==425,error);
+                put(context,0x1158,0.02f);put(context,0x1180,425.f);
+                fixture.bindForTesting(&memory,reinterpret_cast<uint64_t>(&rootPointer));
+                check("旧版车辆仍读取旧校正字段",fixture.probeForTesting(&fields,&error)&&fields.fuelCorrection==address(context)+0x1158,error);
+            }
             float fuel = 0.5f, correction = 0.05f, damage = 0.3f, sentinel = 7.0f;
             VehicleAddresses a;
             a.fuel = (uint64_t)(uintptr_t)&fuel;
@@ -1552,6 +1634,83 @@ int runGameSelftest(const std::wstring& outPath) {
             result = locker.runMaintenanceCycle(a, false, &error);
             check("车辆写入守卫保留", result.action == VehicleLocker::CycleAction::Blocked &&
                   fuel == 0.5f && damage == 0.3f, error);
+
+            MultiplayerStatus status{MultiplayerKind::TruckersMp, "TMP"};
+            locker.setWriteGuard([&] { return status.blocksWrite() ? status.detail : std::string(); });
+            locker.setFuelWriteGuard([&] { return status.blocksFuelWrite() ? status.detail : std::string(); });
+            locker.setCommandsForTesting(true, false);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("TruckersMP 后台仅写油量", result.action == VehicleLocker::CycleAction::Applied &&
+                  fuel == 1.0f && correction == 0.0f && damage == 0.3f && sentinel == 7.0f, error);
+            fuel = 0.5f; correction = 0.05f;
+            // Retain a long guard interval: changing to damage must recheck immediately.
+            locker.setGuardIntervalMs(60000);
+            locker.setCommandsForTesting(true, true);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("TruckersMP 混合锁定不能绕过无损守卫", result.action == VehicleLocker::CycleAction::Blocked &&
+                  fuel == 0.5f && correction == 0.05f && damage == 0.3f, error);
+            locker.setCommandsForTesting(false, true);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("TruckersMP 独立无损仍拒绝", result.action == VehicleLocker::CycleAction::Blocked &&
+                  damage == 0.3f, error);
+            status = {MultiplayerKind::Unknown, "unknown"};
+            locker.setCommandsForTesting(true, false);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("后台无法确认时油量不写入", result.action == VehicleLocker::CycleAction::Blocked &&
+                  fuel == 0.5f && correction == 0.05f && damage == 0.3f, error);
+            // Without a fuel-specific guard, fuel must fall back to the strict guard.
+            status = {MultiplayerKind::TruckersMp, "TMP"};
+            locker.setFuelWriteGuard({});
+            locker.setCommandsForTesting(true, false);
+            result = locker.runMaintenanceCycle(a, false, &error);
+            check("油量缺少专用守卫时保留通用保护", result.action == VehicleLocker::CycleAction::Blocked &&
+                  fuel == 0.5f && damage == 0.3f, error);
+
+            // Exercise the electric mode through the same guarded, single writer.
+            AppState energyApp;
+            energyApp.vehicleLocker = std::make_unique<VehicleLocker>();
+            auto& energy = *energyApp.vehicleLocker;
+            energy.bindForTesting(&memory, 0);
+            energy.setGuardIntervalMs(0);
+            energy.setWriteGuard([&] { return status.blocksWrite() ? status.detail : std::string(); });
+            energy.setFuelWriteGuard([&] { return status.blocksFuelWrite() ? status.detail : std::string(); });
+            energy.setCommandsForTesting(true, false, true);
+            result = energy.runMaintenanceCycle(a, false, &error);
+            syncAutoVehicleLocks(energyApp);
+            check("TruckersMP 电量单写者锁满且不改损伤", result.action == VehicleLocker::CycleAction::Applied &&
+                  fuel == 1.0f && correction == 0.0f && damage == 0.3f &&
+                  energyApp.autoElectricLock && !energyApp.autoFuelLock &&
+                  result.note.find("无限电量") != std::string::npos, result.note);
+            const auto electricSequence = energy.commands().sequence;
+            energy.setCommandsForTesting(true, false);
+            syncAutoVehicleLocks(energyApp);
+            check("电量切换油量互斥并废弃旧周期", energyApp.autoFuelLock && !energyApp.autoElectricLock &&
+                  !energy.commands().electric && energy.commands().sequence > electricSequence, "");
+            energy.setCommandsForTesting(true, false, true);
+            syncAutoVehicleLocks(energyApp);
+            toggleAutoVehicleLock(energyApp, true, false, true);
+            check("关闭电量停止共享能量锁", !energy.commands().fuel && !energy.commands().electric &&
+                  !energyApp.autoElectricLock && !energyApp.autoFuelLock && fuel == 1.0f, "");
+            fuel = 0.5f; correction = 0.05f;
+            energy.setCommandsForTesting(true, true, true);
+            result = energy.runMaintenanceCycle(a, false, &error);
+            syncAutoVehicleLocks(energyApp);
+            check("电量无损混合锁定仍拒绝且界面同步关闭", result.action == VehicleLocker::CycleAction::Blocked &&
+                  fuel == 0.5f && correction == 0.05f && damage == 0.3f &&
+                  !energyApp.autoElectricLock && !energyApp.autoFuelLock && !energyApp.autoDamageLock, "");
+            status = {MultiplayerKind::Unknown, "unknown"};
+            energy.setCommandsForTesting(true, false, true);
+            result = energy.runMaintenanceCycle(a, false, &error);
+            syncAutoVehicleLocks(energyApp);
+            check("无法确认时电量拒写且开关关闭", result.action == VehicleLocker::CycleAction::Blocked &&
+                  !energyApp.autoElectricLock && fuel == 0.5f && correction == 0.05f, "");
+            energy.setCommandsForTesting(true, false, true);
+            syncAutoVehicleLocks(energyApp);
+            detachGame(energyApp);
+            check("分离游戏清空电量模式和界面状态", !energy.commands().fuel && !energy.commands().electric &&
+                  !energyApp.autoElectricLock && !energyApp.autoFuelLock &&
+                  energyApp.electricStatus.find("已停止") != std::string::npos, "");
+            locker.setGuardIntervalMs(0);
             locker.setWriteGuard({});
             setSelectedGame(GameId::Ats);
             locker.setCommandsForTesting(true, true);
@@ -1620,6 +1779,21 @@ int runGameSelftest(const std::wstring& outPath) {
     for (const auto& item : runSaveCopyTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runReadableExportTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runTruckTransferTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runFleetTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runFuelTankTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runFuelTankAssetTests()) check(item.name.c_str(), item.ok, item.detail);
+    {
+        FleetRequest request;request.game=GameId::Ats;
+        const auto wrongGame=fleetToNewSave(request);
+        check("fleet-production-rejects-ats",!wrongGame.ok && wrongGame.slotDir.empty() &&
+              wrongGame.error.find("仅支持欧卡2")!=std::string::npos,wrongGame.error);
+        request.game=GameId::Ets2;
+        const auto canceled=fleetToNewSave(request,[]{return true;});
+        check("fleet-production-cancel-before-files",!canceled.ok && canceled.slotDir.empty() &&
+              canceled.error.find("取消")!=std::string::npos,canceled.error);
+    }
+    for (const auto& item : runHomeAccessoryTests()) check(item.name.c_str(), item.ok, item.detail);
+    for (const auto& item : runTrailerSwapTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runProfileSplitTests()) check(item.name.c_str(), item.ok, item.detail);
     for (const auto& item : runBsiiTests()) check(item.name.c_str(), item.ok, item.detail);
     setSelectedGame(GameId::Ets2);   // 恢复默认，避免影响后续运行
@@ -2291,6 +2465,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     if (cmdLine.find(L"--gametest") != std::wstring::npos) {
         return runGameSelftest(applicationDir() + L"\\gametest_report.txt");
     }
+    if(cmdLine.find(L"--homepreset-test")!=std::wstring::npos) {
+        setSelectedGame(GameId::Ets2);
+        return runFixtureSuite(runHomeAccessoryTests(),applicationDir()+L"\\homepreset_test_report.txt");
+    }
+    if(cmdLine.find(L"--savecopytest")!=std::wstring::npos) {
+        setSelectedGame(GameId::Ets2);
+        return runFixtureSuite(runSaveCopyTests(),applicationDir()+L"\\savecopy_test_report.txt");
+    }
+    if(cmdLine.find(L"--saveprofiles-test")!=std::wstring::npos) {
+        setSelectedGame(GameId::Ets2);
+        return runFixtureSuite(runSaveProfileTests(),applicationDir()+L"\\saveprofiles_test_report.txt");
+    }
+    if(cmdLine.find(L"--trailerswap-test")!=std::wstring::npos) {
+        setSelectedGame(GameId::Ets2);
+        return runFixtureSuite(runTrailerSwapTests(),applicationDir()+L"\\trailerswap_test_report.txt");
+    }
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
@@ -2371,9 +2561,75 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     bool done = false;
     bool smokeTest = cmdLine.find(L"--smoketest") != std::wstring::npos;
     const bool saveCopyUiSmoke = smokeTest && cmdLine.find(L"--savecopy-ui") != std::wstring::npos;
+    const bool saveProfilesUiSmoke = smokeTest && cmdLine.find(L"--saveprofiles-ui") != std::wstring::npos;
     const bool truckTransferUiSmoke = smokeTest && cmdLine.find(L"--trucktransfer-ui") != std::wstring::npos;
+    const bool fleetUiSmoke = smokeTest && cmdLine.find(L"--fleet-ui") != std::wstring::npos;
     const bool truckTransferClickUiSmoke = smokeTest && cmdLine.find(L"--trucktransfer-click-ui") != std::wstring::npos;
     const bool profileSplitUiSmoke = smokeTest && cmdLine.find(L"--profilesplit-ui") != std::wstring::npos;
+    const bool homeUiSmoke = smokeTest && cmdLine.find(L"--home-ui") != std::wstring::npos;
+    const bool homePresetUiSmoke = smokeTest && cmdLine.find(L"--home-preset-ui") != std::wstring::npos;
+    const bool electricTankUiSmoke = smokeTest && cmdLine.find(L"--electric-tank-ui") != std::wstring::npos;
+    const bool fuelTankUiSmoke = electricTankUiSmoke || (smokeTest && cmdLine.find(L"--fuel-tank-ui") != std::wstring::npos);
+    bool fuelTankUiChecks=true;
+    const bool trailerSwapUiSmoke = smokeTest && cmdLine.find(L"--trailerswap-ui") != std::wstring::npos;
+    if(homeUiSmoke || homePresetUiSmoke || fuelTankUiSmoke) {
+        app.activeTab=4;
+        app.homeRequest.game=GameId::Ets2;
+        app.homeRequest.source.slotDir=L"ui-home-fixture-not-a-save";
+        app.homeRequest.source.profileName=L"界面测试档案";
+        app.homeRequest.source.displayName="Home 配件测试";
+        HomeAccessoryEntry entry;
+        entry.truckId="_nameless.1";entry.truckLabel="scania.s";
+        entry.unitId="_nameless.2";entry.type="vehicle_addon_accessory";
+        entry.dataPath="/def/vehicle/truck/scania.s/accessory/old.sii";
+        if(homePresetUiSmoke) {entry.truckLabel="scania.s_2016";app.homePresetMode=1;}
+        if(fuelTankUiSmoke) {
+            entry.truckLabel="volvo.fh_2024";entry.type="vehicle_accessory";
+            entry.dataPath="/def/vehicle/truck/volvo.fh_2024/chassis/6x4.sii";
+            if(electricTankUiSmoke){entry.truckLabel="scania.s_2024e";entry.dataPath="/def/vehicle/truck/scania.s_2024e/chassis/4x2.sii";}
+            app.homePresetMode=2;app.tankCapacity=5000;
+        }
+        app.homeInventory.entries={entry};app.homeAccessoryIndex=0;
+        if(fuelTankUiSmoke) {
+            HomeAccessoryEntry engine;engine.truckId=entry.truckId;engine.truckLabel=entry.truckLabel;
+            engine.unitId="_nameless.3";engine.type="vehicle_accessory";
+            engine.dataPath=electricTankUiSmoke?"/def/vehicle/truck/scania.s_2024e/engine/450kw.sii":"/def/vehicle/truck/volvo.fh_2024/engine/d17a780.sii";
+            app.homeInventory.entries.push_back(engine);
+        }
+        ::strcpy_s(app.homePath,"/def/vehicle/truck/scania.s/accessory/new.sii");
+        ::strcpy_s(app.homeName,"Home 配件副本");
+        app.homePreview=true;app.showHomeAccessories=true;
+        app.homeNote="界面冒烟：模拟配件替换预览，不执行存档写入。";
+    }
+    if(trailerSwapUiSmoke) {
+        app.activeTab=4;
+        app.trailerSwapRequest.game=selectedGame();
+        app.trailerSwapRequest.source.slotDir=L"ui-trailer-fixture-not-a-save";
+        app.trailerSwapRequest.source.profileName=L"界面测试档案";
+        app.trailerSwapRequest.source.displayName="测试档案 / 自动存档（驾驶）";
+        TrailerSwapInventory inv;
+        inv.hasCurrent=true;
+        inv.truckLabel="scania.s";
+        inv.currentId="_nameless.240.00e8.0b48";
+        inv.currentLabel="scs.chemtank.single_3.paint";
+        inv.currentPlate="GS 56 87 · denmark";
+        inv.onJob=true; inv.onlineJob=true; inv.jobCargo="cargo.hchemicals";
+        auto add=[&](const char* id,const char* label,bool owned,bool current,float mass,
+                     const char* plate,bool blocked=false,const char* reason=""){
+            TrailerSwapEntry e;e.id=id;e.label=label;e.owned=owned;e.current=current;
+            e.cargoMass=mass;e.plate=plate;e.blocked=blocked;e.blockReason=reason;
+            inv.entries.push_back(e);
+        };
+        add("_nameless.240.00e8.0b48","scs.chemtank.single_3.paint",false,true,25000.f,"GS 56 87 · denmark");
+        add("_nameless.241.2f40.0cf8","scs.box.single_4.dryvan",true,false,0.f,"苏A·32906 · china");
+        add("_nameless.241.2f40.9e18","tmp.caravan.default.default",true,false,0.f,"苏A·11111 · china");
+        add("_nameless.241.31aa.4128","scs.box.single_4.dryvan",true,false,0.f,"",true,"双挂车组（带副车），暂不支持整体切换");
+        app.trailerSwapInventory=std::move(inv);
+        app.trailerSwapIndex=1;
+        ::strcpy_s(app.trailerSwapName,"测试档案 换挂车");
+        app.trailerSwapNote="界面冒烟：模拟读取到的 4 辆挂车（1 辆双挂不可选），不执行存档写入。";
+        app.showTrailerSwap=true;
+    }
     if (profileSplitUiSmoke) {
         app.activeTab = 4; app.splitGame = selectedGame(); app.splitUiFixture = true;
         for (const char* name : {"TMP", "ProMods", "联运"}) {
@@ -2413,6 +2669,33 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         ::strcpy_s(app.copyName, "中文副本 \"测试\"");
         app.showCopyDialog = true;
     }
+    if (saveProfilesUiSmoke) {
+        app.activeTab = 4;
+        app.saveNote = "界面冒烟：合成三组档案槽位，验证按档案分组与切换清空旧选择。";
+    }
+    if(fleetUiSmoke) {
+        app.activeTab=4;app.fleetRequest.game=selectedGame();
+        app.fleetRequest.source.slotDir=L"ui-fixture-not-a-save";
+        app.fleetRequest.source.label="车队界面测试 / 未写入存档";
+        app.fleetInventory.snapshot="ui-fixture";
+        app.fleetInventory.trucks={{"_nameless.1","volvo.fh_2024",50}};
+        app.fleetInventory.truckCaches={{"_nameless.1",true,4,12339.f,1.0835f,2,"合成的同配置司机参考"},
+            {"_nameless.2",true,4,12339.f,1.0835f,2,"合成的闲置卡车参数"}};
+        app.fleetInventory.idleTrucks={{"garage.berlin","_nameless.2",1}};
+        app.fleetIdleSelected={false};
+        FleetEmployee fixtureEmployee;fixtureEmployee.id="driver.8";fixtureEmployee.garageId="garage.berlin";
+        fixtureEmployee.truckId="_nameless.1";fixtureEmployee.cacheRepairable=true;
+        fixtureEmployee.cacheNote="合成的默认参数待修复";fixtureEmployee.profit={1000,700,300,2};
+        app.fleetInventory.employees={fixtureEmployee};app.fleetInventory.profit=fixtureEmployee.profit;
+        app.fleetInventory.availableDrivers={{"driver.42",6501},{"driver.43",3000},{"driver.44",1000}};
+        app.fleetInventory.garages={{"garage.berlin","berlin",3,1,1,2,true},{"garage.koln","koln",5,0,0,5,true},
+            {"garage.oslo","oslo",0,0,0,0,false}};
+        app.fleetCounts={1,2,0};app.fleetGarageCapacity={0,0,0};app.fleetTruckIndex=0;
+        ::strcpy_s(app.fleetName,"车队扩充界面测试");
+        app.fleetNote="合成车库、司机和模板：验证预览、清空及自动分配，不执行写入。";
+        app.showFleet=true;app.fleetUiProbe.capture=true;
+    }
+    bool fleetUiChecks=true;
     uint64_t startTick = ::GetTickCount64();
     int frames = 0;
     int smokeResult = 0;
@@ -2433,6 +2716,69 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             input.AddMousePosEvent(app.truckTransferUiProbe.buttonX,app.truckTransferUiProbe.buttonY);
             input.AddMouseButtonEvent(0,frames==2);
         }
+        if(saveProfilesUiSmoke) saveProfilesSmokeRequest(app,frames);
+        if(fuelTankUiSmoke) {
+            if(frames==5)fuelTankUiChecks &= app.homeDialogVisible&&app.homePreviewVisible&&app.homeApplyEnabled&&
+                fuelTankIsElectric(app.homeInventory.entries[0].dataPath)==electricTankUiSmoke;
+            if(frames==6)app.tankCapacity=600;
+            if(frames==9)fuelTankUiChecks &= !app.homePreviewVisible&&!app.homeApplyEnabled;
+            if(frames==10)app.tankCapacity=3000;
+            if(frames==13)fuelTankUiChecks &= app.homePreviewVisible&&app.homeApplyEnabled;
+            if(frames==15)app.homeInventory.entries[1].dataPath=electricTankUiSmoke?
+                "/def/vehicle/truck/volvo.fh_2024/engine/d17a780.sii":"/def/vehicle/truck/scania.s_2024e/engine/450kw.sii";
+            if(frames==18)fuelTankUiChecks &= !app.homePreviewVisible&&!app.homeApplyEnabled;
+            if(frames==19)app.homeInventory.entries[1].dataPath=electricTankUiSmoke?
+                "/def/vehicle/truck/scania.s_2024e/engine/450kw.sii":"/def/vehicle/truck/volvo.fh_2024/engine/d17a780.sii";
+            if(frames==22)fuelTankUiChecks &= app.homePreviewVisible&&app.homeApplyEnabled;
+        }
+        if(fleetUiSmoke) {
+            const auto& p=app.fleetUiProbe;
+            auto verify=[&](bool ok) {
+                fleetUiChecks &= ok;
+                if(!ok)logLine(fmt("车队交互检查 frame=%d preview=%d apply=%d hires=%d repairs=%d history=%d plan_existing=%zu plan_repairs=%zu plan_garages=%zu",
+                    frames,p.preview,p.apply,p.total,p.repairs,p.historySeen,app.fleetRequest.expansion.existingTruckIds.size(),
+                    app.fleetRequest.expansion.repairDriverIds.size(),app.fleetRequest.expansion.allocations.size()));
+            };
+            if(frames==5) verify(p.preview && p.apply && p.total==3);
+            if(frames==9) verify(!p.preview && !p.apply && p.total==0);
+            if(frames==13) verify(!p.preview && !p.apply && p.total==3);
+            if(frames==31) verify(p.preview && p.apply && p.total==0 && p.repairs==1 &&
+                app.fleetRequest.expansion.repairDriverIds.size()==1 && app.fleetRequest.expansion.allocations.empty());
+            if(frames==45) verify(p.preview && p.apply && p.total==1 && p.repairs==0 &&
+                app.fleetRequest.expansion.existingTruckIds.size()==1 && app.fleetRequest.expansion.allocations.empty());
+            if(frames==53) verify(p.historySeen && p.preview && p.apply);
+            if(frames==69) verify(p.preview && p.apply && p.total==0 && p.garageChanges==1 &&
+                app.fleetRequest.expansion.garageChanges.size()==1 && app.fleetRequest.expansion.allocations.empty());
+            if(frames==77) verify(p.preview && p.apply && p.total==3 && p.garageChanges==1 &&
+                app.fleetRequest.expansion.garageChanges[0].garageId=="garage.oslo" &&
+                app.fleetRequest.expansion.garageChanges[0].targetSlots==5 &&
+                app.fleetRequest.expansion.allocations.size()==1 && app.fleetRequest.expansion.allocations[0].garageId=="garage.oslo");
+            // ImGui tabs use AllowOverlap: hover for a frame before their press-on-click.
+            if(frames==45 || frames==49) {
+                auto& io=::ImGui::GetIO();io.AddFocusEvent(true);
+                io.AddMousePosEvent(frames==45?p.historyX:p.manageX,frames==45?p.historyY:p.manageY);
+            }
+            if(frames==2 || frames==3 || frames==6 || frames==7 ||
+               frames==10 || frames==11 || frames==16 || frames==17 || frames==20 || frames==21 ||
+               frames==24 || frames==25 || frames==28 || frames==29 || frames==34 || frames==35 ||
+               frames==38 || frames==39 || frames==42 || frames==43 || frames==46 || frames==47 ||
+               frames==50 || frames==51 || frames==54 || frames==55 || frames==58 || frames==59 ||
+               frames==62 || frames==63 || frames==66 || frames==67 || frames==70 || frames==71 || frames==74 || frames==75) {
+                auto& io=::ImGui::GetIO();io.AddFocusEvent(true);
+                const int clickFrame=frames-frames%2;
+                float x=p.previewX,y=p.previewY;
+                if(clickFrame==6||clickFrame==20||clickFrame==34||clickFrame==54){x=p.clearX;y=p.clearY;}
+                if(clickFrame==10||clickFrame==70){x=p.autoX;y=p.autoY;}
+                if(clickFrame==24){x=p.repairX;y=p.repairY;}
+                if(clickFrame==38){x=p.idleX;y=p.idleY;}
+                if(clickFrame==46){x=p.historyX;y=p.historyY;}
+                if(clickFrame==50){x=p.manageX;y=p.manageY;}
+                if(clickFrame==58){x=p.unownedX;y=p.unownedY;}
+                if(clickFrame==62){x=p.purchaseX;y=p.purchaseY;}
+                io.AddMousePosEvent(x,y);
+                io.AddMouseButtonEvent(0,frames%2==0);
+            }
+        }
         ::ImGui::NewFrame();
         handleGlobalHotkeys(app);
         renderApp(app);
@@ -2445,7 +2791,17 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         g_swapChain->Present(1, 0);  // 垂直同步，避免白烧显卡
         ++frames;
 
-        if (smokeTest && frames >= 30) {
+        if (smokeTest && frames >= (fleetUiSmoke?80:30)) {
+            if(homeUiSmoke || homePresetUiSmoke || fuelTankUiSmoke) {
+                const bool ok=app.homeDialogVisible && app.homePreviewVisible && app.homeApplyEnabled &&
+                              !app.worker.joinable() && (!fuelTankUiSmoke || fuelTankUiChecks);
+                smokeResult=ok ? 0 : 1;
+                logLine(fmt("[ %s ] Home 配件界面：dialog=%d preview=%d apply=%d worker_started=%d mode=%d；未写入存档",
+                            ok ? "PASS" : "FAIL",app.homeDialogVisible,app.homePreviewVisible,
+                            app.homeApplyEnabled,app.worker.joinable(),app.homePresetMode));
+                if(fuelTankUiSmoke)logLine(fmt("永久%s界面：5000 %s 预览、600 容量禁用、3000 恢复、发动机类型不匹配禁用=%d；未安装 Mod 或写入存档",
+                    electricTankUiSmoke?"电池":"油箱",electricTankUiSmoke?"kWh":"L",fuelTankUiChecks));
+            }
             if(truckTransferClickUiSmoke) {
                 const auto& probe=app.truckTransferUiProbe;
                 const bool ok=probe.clicked && probe.noticeVisible && !app.truckTransferNotice.empty() && !app.worker.joinable();
@@ -2455,6 +2811,22 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
                 logLine("车辆复制点击提示："+app.truckTransferNotice);
             }
             if (profileSplitUiSmoke) logLine("档案拆分界面冒烟：三个存档的选择、独立档案命名与提示已渲染；未创建档案。");
+            if(trailerSwapUiSmoke) {
+                const bool ok=app.trailerSwapDialogVisible && app.trailerSwapIndex>=0 &&
+                              !app.worker.joinable() && app.trailerSwapInventory.entries.size()==4;
+                smokeResult=ok ? 0 : 1;
+                logLine(fmt("[ %s ] 更换挂车界面：dialog=%d 选择项=%d 挂车数=%d worker_started=%d；未写入存档",
+                            ok ? "PASS" : "FAIL",app.trailerSwapDialogVisible,app.trailerSwapIndex,
+                            (int)app.trailerSwapInventory.entries.size(),app.worker.joinable()));
+            }
+            if (saveProfilesUiSmoke) saveProfilesSmokeReport(app,smokeResult);
+            if(fleetUiSmoke) {
+                const auto& p=app.fleetUiProbe;
+                const bool ok=fleetUiChecks && p.dialog && p.preview && p.apply && p.total==3 && p.garageChanges==1 && p.historySeen && !app.worker.joinable();
+                if(!ok)smokeResult=1;
+                logLine(fmt("[ %s ] 车队界面：dialog=%d preview=%d apply=%d total=%d interaction_checks=%d worker=%d；未写入存档",
+                            ok?"PASS":"FAIL",p.dialog,p.preview,p.apply,p.total,fleetUiChecks,app.worker.joinable()));
+            }
             if (truckTransferUiSmoke) logLine("车辆导入界面冒烟：源卡车、目标存档、空车库与名称弹窗已渲染；未执行导入。");
             if (saveCopyUiSmoke) logLine("存档复制界面冒烟：列表与复制名称弹窗已渲染；未执行复制。");
             logLine(fmt("冒烟测试：窗口创建成功，已渲染 %d 帧（hwnd=0x%llX, 窗口 %ux%u）", frames,

@@ -6,6 +6,9 @@
 
 # ---------- 构建产物 ----------
 cpp/build/
+/build/
+__pycache__/
+*.pyc
 *.obj
 *.pdb
 *.ilk
@@ -31,6 +34,10 @@ tools/scs_extractor_1_55.zip
 tools/scs_extractor_1_55/
 # 游戏 mod（第三方素材，仅本地使用）
 mods/
+cpp/assets/home_presets/
+# Local exploratory model/screenshot helpers; not part of the supported toolchain.
+tools/pmg_shift.py
+tools/screenshot.ps1
 
 # ---------- 随工程附带的 Dear ImGui ----------
 # 只保留编译所需源码；文档/示例/杂项体积大且与构建无关

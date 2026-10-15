@@ -7,6 +7,7 @@
 #include "gameio.h"
 #include "memory.h"
 #include "saves.h"
+#include "saveprofiles.h"
 #include "savecopy.h"
 #include "trucktransferio.h"
 #include "profilesplit.h"
@@ -74,6 +75,16 @@ struct PendingTransferInspection {
     TransferInventory inventory;
     std::string error;
 };
+struct FleetUiProbe {
+    bool capture = false, dialog = false, preview = false, apply = false;
+    float autoX=0, autoY=0, clearX=0, clearY=0, previewX=0, previewY=0;
+    int total = 0;
+    int repairs = 0;
+    bool historySeen = false;
+    float repairX=0,repairY=0,idleX=0,idleY=0,historyX=0,historyY=0,manageX=0,manageY=0;
+    float unownedX=0,unownedY=0,purchaseX=0,purchaseY=0;
+    int garageChanges = 0;
+};
 
 struct PendingSaveExport {
     bool ready = false;
@@ -84,6 +95,11 @@ struct PendingSaveExport {
 struct TruckTransferUiProbe {
     bool capture = false, clicked = false, noticeVisible = false;
     float buttonX = 0, buttonY = 0;
+};
+
+struct SaveProfileUiProbe {
+    bool capture = false;
+    float rowX[3] = {}, rowY[3] = {};
 };
 
 struct AppState {
@@ -138,6 +154,7 @@ struct AppState {
     bool  fuelLock = false;
     bool  damageLock = false;
     bool  autoFuelLock = false;
+    bool  autoElectricLock = false;
     bool  autoDamageLock = false;
     int   enginePowerOption = 0;   // 0=原厂, 1=1.25×, 2=1.50×, 3=2.00×
     bool  engineRaiseLimit = false;
@@ -156,6 +173,7 @@ struct AppState {
     std::string moneyStatus = "还没扫描。先在游戏里看一眼现金，填到「当前数值」再扫描。";
     std::string xpStatus = "还没扫描。经验在游戏里是 32 位整数。";
     std::string fuelStatus = "未启用。进入驾驶界面后直接勾选「无限油量」。";
+    std::string electricStatus = "未启用。驾驶电动车时勾选「无限电量」。";
     std::string damageStatus = "未启用。进入驾驶界面后直接勾选「车辆无损」。";
     std::string scanStatus = "未扫描";
     // 收藏点按游戏分开保存，切换游戏不会把欧卡2 的收藏带进美卡（反之亦然）。
@@ -237,6 +255,10 @@ struct AppState {
 
     // ---------- 存档 ----------
     std::vector<SaveSlot>   slots;
+    std::vector<SaveProfileGroup> saveProfiles;
+    int selectedSaveProfile = -1;
+    int visibleSaveSlotCount = 0;
+    SaveProfileUiProbe saveProfileUiProbe;
     std::vector<BackupInfo> backups;
     int           selectedSlot = -1;
     int           selectedBackup = -1;
@@ -252,6 +274,8 @@ struct AppState {
     SaveCopyResult pendingCopy;
     bool          pendingCopyReady = false;
     bool          pendingCopyTruck = false;
+    bool          pendingCopyHome = false;
+    bool          pendingCopyTrailer = false;
     PendingSaveExport pendingExport;
     bool          showTruckTransfer = false;
     bool          showTruckTransferNotice = false;
@@ -266,6 +290,42 @@ struct AppState {
     bool transferInspectBusy = false, transferTargetReady = false;
     uint64_t transferInspectionGeneration = 0;
     PendingTransferInspection pendingTransferInspection;
+    bool showFleet = false, fleetInspectBusy = false, fleetPreview = false;
+    uint64_t fleetGeneration = 0;
+    FleetRequest fleetRequest;
+    FleetInventory fleetInventory;
+    PendingFleetInspection pendingFleet;
+    std::vector<int> fleetCounts;
+    std::vector<bool> fleetIdleSelected;
+    bool fleetRepairCaches = false;
+    std::vector<int> fleetGarageCapacity;
+    bool fleetUnownedOnly = false;
+    int fleetTruckIndex = 0;
+    char fleetName[512] = {0}, fleetSearch[128] = {0};
+    std::string fleetNote;
+    bool pendingCopyFleet = false;
+    FleetUiProbe fleetUiProbe;
+    bool showHomeAccessories = false;
+    bool homeInspectBusy = false, homePreview = false;
+    bool homeDialogVisible = false, homePreviewVisible = false, homeApplyEnabled = false;
+    uint64_t homeInspectionGeneration = 0;
+    HomeAccessoryRequest homeRequest;
+    HomeAccessoryInventory homeInventory;
+    PendingHomeAccessoryInspection pendingHomeInspection;
+    int homeTruckIndex = 0, homeAccessoryIndex = -1;
+    int homePresetMode = 0;
+    int tankCapacity = 5000;
+    char homePath[512] = {0}, homeName[512] = {0};
+    std::string homeNote;
+    bool showTrailerSwap = false;
+    bool trailerSwapBusy = false, trailerSwapDialogVisible = false;
+    uint64_t trailerSwapGeneration = 0;
+    int trailerSwapIndex = -1;
+    char trailerSwapName[512] = {0};
+    std::string trailerSwapNote;
+    TrailerSwapRequest trailerSwapRequest;
+    TrailerSwapInventory trailerSwapInventory;
+    PendingTrailerSwapInspection pendingTrailerSwap;
     bool showProfileSplit = false;
     GameId splitGame = GameId::Ets2;
     std::vector<ProfileSplitRow> splitRows;
@@ -308,7 +368,8 @@ void detachGame(AppState& app);void startFirstScan(AppState& app, PanelKind kind
 void startNextScan(AppState& app, PanelKind kind, ScanMode mode);
 void writePanelValues(AppState& app, PanelKind kind, bool confirmed = false);
 void togglePanelLock(AppState& app, PanelKind kind, bool lock, bool confirmed = false);
-void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled);
+void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled, bool electric = false);
+void syncAutoVehicleLocks(AppState& app);
 // 切换目标游戏：先停下所有写入线程并恢复现场，再改变选择；不满足条件时拒绝切换。
 bool selectGame(AppState& app, GameId id, const std::wstring& settingsPath = {});
 void startLocateEconomy(AppState& app);
@@ -329,6 +390,8 @@ bool validatePanelBindings(std::string* error);
 std::string writeGateReason(AppState& app);
 // 工作线程可安全调用：只读策略快照（不触碰 AppState），不强制刷新检测缓存。
 std::string writeGateReasonFromPolicy();
+// Only for the automatic fuel locker; other writers keep the strict gate.
+std::string fuelWriteGateReasonFromPolicy();
 // 界面线程在状态变化后刷新闸门策略快照（pid / 联运策略）
 void updateWriteGatePolicy(const AppState& app);
 using WriteGateOverride = std::function<std::string()>;

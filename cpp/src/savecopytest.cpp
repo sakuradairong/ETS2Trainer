@@ -243,9 +243,13 @@ std::vector<TunerTestItem> runSaveCopyTests() {
         // ---- decryptSave 加固回归（仍位于同一隔离夹具根下）----
         {
             std::vector<uint8_t> out; DecryptInfo di; std::string de;
+            size_t decodeFixtureIndex=0;
             auto runDec=[&](const std::vector<uint8_t>& bytes,size_t cap,std::vector<uint8_t>& o,DecryptInfo& d,std::string& e){
-                if(!writeFileBytes((root/L"dec_tmp.sii").wstring(),bytes)) throw std::runtime_error("dec fixture write failed");
-                return decryptSave((root/L"dec_tmp.sii").wstring(),o,&d,&e,cap);
+                // Each decoder input is independent; avoid repeatedly replacing one
+                // filename while external readers may still hold its previous version.
+                const auto path=root/(L"dec_tmp_"+std::to_wstring(++decodeFixtureIndex)+L".sii");
+                if(!writeFileBytes(path.wstring(),bytes)) throw std::runtime_error("dec fixture write failed");
+                return decryptSave(path.wstring(),o,&d,&e,cap);
             };
             const std::vector<uint8_t> plainText(infoText.begin(),infoText.end());
             const std::vector<uint8_t> plainGame(game.begin(),game.end());

@@ -1,5 +1,7 @@
 // ui.cpp —— ImGui 界面实现
 #include "ui.h"
+#include "homepreset.h"
+#include "fueltank.h"
 #include "ui_style.h"
 
 #include "economy.h"
@@ -148,10 +150,12 @@ void resetProcessState(AppState& app) {
     app.fuelLock = false;
     app.damageLock = false;
     app.autoFuelLock = false;
+    app.autoElectricLock = false;
     app.autoDamageLock = false;
     app.moneyStatus = "未附加：请重新扫描现金。";
     app.xpStatus = "未附加：请重新扫描经验。";
     app.fuelStatus = "未附加：无限油量已停止。";
+    app.electricStatus = "未附加：无限电量已停止。";
     app.damageStatus = "未附加：车辆无损已停止。";
     app.scanStatus = "未附加：扫描已失效。";
     // 结构化定位结果绑定的地址随进程失效，必须一起清掉
@@ -183,6 +187,17 @@ void resetProcessState(AppState& app) {
     app.transferNote.clear();
     app.transferInspectBusy = false; app.transferTargetReady = false;
     ++app.transferInspectionGeneration;
+    app.showFleet=false;app.fleetInspectBusy=false;app.fleetPreview=false;
+    ++app.fleetGeneration;app.fleetRequest={};app.fleetInventory={};app.fleetCounts.clear();
+    app.fleetIdleSelected.clear();app.fleetRepairCaches=false;
+    app.fleetGarageCapacity.clear();app.fleetUnownedOnly=false;
+    app.fleetName[0]=0;app.fleetSearch[0]=0;app.fleetNote.clear();
+    app.showHomeAccessories = false;
+    app.homeInspectBusy = false; app.homePreview = false;
+    app.homePresetMode = 0;
+    ++app.homeInspectionGeneration;
+    app.homeRequest = {}; app.homeInventory = {};
+    app.homeNote.clear(); app.homePath[0] = 0;
     app.showProfileSplit = false;
     app.splitRows.clear();
     app.splitUiFixture = false;
@@ -194,6 +209,10 @@ void resetProcessState(AppState& app) {
       app.pendingEconomy = PendingEconomyResult{};
       app.pendingCopy = {};
       app.pendingCopyTruck = false;
+      app.pendingCopyHome = false;
+      app.pendingCopyFleet = false;
+      app.pendingFleet = {};
+      app.pendingHomeInspection = {};
       app.pendingCopyReady = false; }
     { std::lock_guard<std::mutex> lock(app.resultMutex);
       app.pendingSplit = {}; app.pendingSplitReady = false;
@@ -360,6 +379,9 @@ bool selectGame(AppState& app, GameId id, const std::wstring& settingsPath) {
     parseSpotsInto(id == GameId::Ets2 ? app.teleportSpotsEts2 : app.teleportSpotsAts, app);
     // 存档/备份/选择等都不允许带进新游戏，否则可能在旧存档上执行新操作
     app.slots.clear();
+    app.saveProfiles.clear();
+    app.selectedSaveProfile = -1;
+    app.visibleSaveSlotCount = 0;
     app.backups.clear();
     app.selectedSlot = -1;
     app.selectedBackup = -1;
@@ -442,13 +464,14 @@ void attachGame(AppState& app) {
     // 写入闸门：油量/无损的后台周期在真正写入前都会调用它（联机保护）。
     // 不捕获 AppState：worker 线程只读线程安全的策略快照。
     app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
+    app.vehicleLocker->setFuelWriteGuard([]() { return fuelWriteGateReasonFromPolicy(); });
     app.procStatus = fmt("已附加：%s (PID %u)", W2U(exe).c_str(), pid);
     app.mpHits = detectMultiplayer(pid);
     MultiplayerStatus mp = checkMultiplayer(pid, true);
     app.mpBlocks = mp.blocksWrite();
     app.mpDetail = mp.detail;
     if (mp.blocksWrite()) {
-        logLine("警告：" + mp.detail + "；联机下改内存可能违反规则，请只在单机使用。");
+        logLine("联机保护：" + mp.detail + "；TruckersMP 仅放行自动无限油量／电量，其他内存写入仍受限。");
     }
     std::vector<Region> regions = app.mem.regions(maxRegionBytes(app));
     uint64_t total = 0;
@@ -732,7 +755,7 @@ void updateWriteGatePolicy(const AppState& app) {
 
 namespace {
 
-std::string writeGateReasonInternal(bool forceRefresh) {
+std::string writeGateReasonInternal(bool forceRefresh, bool fuelOnly = false) {
     {
         WriteGateOverride override_fn;
         {
@@ -750,10 +773,10 @@ std::string writeGateReasonInternal(bool forceRefresh) {
         }
     }
     const MultiplayerStatus status = checkMultiplayer(pid, forceRefresh);
-    // 写入类功能的既有语义：TruckersMP 一律拒绝；无法确认（Unknown，含模块枚举失败与
+    // 通用写入闸门拒绝 TruckersMP；自动油量使用独立例外。无法确认（Unknown，含模块枚举失败与
     // 读不到 game.log.txt）一律拒绝；Convoy（检测开启时）一律拒绝 —— 与联运模式策略
     // 无关（"不写内存的功能"才受 mpPolicy 影响）。
-    if (status.blocksWrite()) return status.detail;
+    if (fuelOnly ? status.blocksFuelWrite() : status.blocksWrite()) return status.detail;
     return std::string();
 }
 
@@ -762,6 +785,10 @@ std::string writeGateReasonInternal(bool forceRefresh) {
 std::string writeGateReasonFromPolicy() {
     // 任意线程可调用（含 worker 线程）：只读原子快照 + 既有全局开关
     return writeGateReasonInternal(/*forceRefresh=*/false);
+}
+
+std::string fuelWriteGateReasonFromPolicy() {
+    return writeGateReasonInternal(/*forceRefresh=*/false, /*fuelOnly=*/true);
 }
 
 std::string writeGateReason(AppState& app) {
@@ -1112,7 +1139,7 @@ void handleGlobalHotkeys(AppState& app) {
 
     // 边沿触发：每帧无条件刷新按键状态缓存，只有"松开→按下"的那一帧才触发，
     // 长按不会反复翻转开关
-    static const int kHotkeys[] = {VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_BACK};
+    static const int kHotkeys[] = {VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_BACK};
     static bool prevDown[sizeof(kHotkeys) / sizeof(kHotkeys[0])] = {};
     int fired = -1;
     for (size_t i = 0; i < sizeof(kHotkeys) / sizeof(kHotkeys[0]); ++i) {
@@ -1131,6 +1158,10 @@ void handleGlobalHotkeys(AppState& app) {
     case VK_F2:  // Ctrl + F2: 切换无限油量
         toggleAutoVehicleLock(app, true, !app.autoFuelLock);
         logLine(std::string("[热键] 无限油量: ") + (app.autoFuelLock ? "开启" : "关闭"));
+        break;
+    case VK_F6:  // Ctrl + F6: 切换无限电量
+        toggleAutoVehicleLock(app, true, !app.autoElectricLock, true);
+        logLine(std::string("[热键] 无限电量: ") + (app.autoElectricLock ? "开启" : "关闭"));
         break;
     case VK_F3:  // Ctrl + F3: 切换车辆无损
         toggleAutoVehicleLock(app, false, !app.autoDamageLock);
@@ -1156,9 +1187,21 @@ void handleGlobalHotkeys(AppState& app) {
     }
 }
 
-void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
-    bool& state = fuel ? app.autoFuelLock : app.autoDamageLock;
-    std::string& status = fuel ? app.fuelStatus : app.damageStatus;
+void syncAutoVehicleLocks(AppState& app) {
+    if (!app.vehicleLocker) return;
+    const auto commands = app.vehicleLocker->commands();
+    const auto status = app.vehicleLocker->status();
+    if (app.autoFuelLock) app.fuelStatus = status;
+    if (app.autoElectricLock) app.electricStatus = status;
+    if (app.autoDamageLock) app.damageStatus = status;
+    app.autoFuelLock = commands.fuel && !commands.electric;
+    app.autoElectricLock = commands.fuel && commands.electric;
+    app.autoDamageLock = commands.damage;
+}
+
+void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled, bool electric) {
+    bool& state = fuel ? (electric ? app.autoElectricLock : app.autoFuelLock) : app.autoDamageLock;
+    std::string& status = fuel ? (electric ? app.electricStatus : app.fuelStatus) : app.damageStatus;
     if (!enabled) {
         if (app.vehicleLocker) {
             std::string ignored;
@@ -1166,7 +1209,8 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
             else app.vehicleLocker->setDamageEnabled(false, &ignored);
         }
         state = false;
-        status = fuel ? "无限油量已关闭。" : "无损锁定已关闭。";
+        if (fuel) app.autoFuelLock = app.autoElectricLock = false;
+        status = fuel ? (electric ? "无限电量已关闭。" : "无限油量已关闭。") : "无损锁定已关闭。";
         return;
     }
     if (const std::string reason = structuralWriteBlockReason(); !reason.empty()) {
@@ -1180,7 +1224,8 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
         status = "还没有附加到游戏进程";
         return;
     }
-    if (!app.mpHits.empty()) {
+    updateWriteGatePolicy(app);
+    if (!fuel && !app.mpHits.empty()) {
         state = false;
         status = "检测到联机特征，已拒绝启用车辆锁定；请只在单机使用。";
         return;
@@ -1189,19 +1234,19 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
         MultiplayerStatus mp = checkMultiplayer(app.pid, true);
         app.mpBlocks = mp.blocksWrite();
         app.mpDetail = mp.detail;
-        if (mp.blocksWrite()) {
+        if (fuel ? mp.blocksFuelWrite() : mp.blocksWrite()) {
             state = false;
-            status = "写入类功能在联机中始终禁用：" + mp.detail;
+            status = "当前车辆锁定被联机保护拦截：" + mp.detail;
             logLine(status);
             return;
         }
     }
-    bool other = fuel ? (app.autoDamageLock)
-                      : (app.autoFuelLock);
+    bool other = app.autoFuelLock || app.autoElectricLock || app.autoDamageLock;
     if (!app.vehicleLocker) app.vehicleLocker = std::make_unique<VehicleLocker>();
     // 写入闸门：油量/无损的后台周期在真正写入前都会调用它（联机保护）。
     // 不捕获 AppState：worker 线程只读线程安全的策略快照。
     app.vehicleLocker->setWriteGuard([]() { return writeGateReasonFromPolicy(); });
+    app.vehicleLocker->setFuelWriteGuard([]() { return fuelWriteGateReasonFromPolicy(); });
     std::string error;
     // 已有另一项锁定时沿用同一条固定指针链；每轮仍会读取当前车辆并做遥测校验。
     if (!other) {
@@ -1212,9 +1257,16 @@ void toggleAutoVehicleLock(AppState& app, bool fuel, bool enabled) {
             return;
         }
     }
-    bool ok = fuel ? app.vehicleLocker->setFuelEnabled(true, &error)
+    bool ok = fuel ? app.vehicleLocker->setFuelEnabled(true, &error, electric)
                    : app.vehicleLocker->setDamageEnabled(true, &error);
+    syncAutoVehicleLocks(app);
     state = ok;
+    if (fuel && ok) {
+        app.autoFuelLock = !electric;
+        app.autoElectricLock = electric;
+        if (electric) app.fuelStatus = "无限油量已关闭（已切换到无限电量）。";
+        else app.electricStatus = "无限电量已关闭（已切换到无限油量）。";
+    }
     status = ok ? app.vehicleLocker->status() : ("自动定位安全校验未通过：" + error);
     logLine(status);
 }
@@ -1250,9 +1302,9 @@ EngineTuner::Guard engineGuardFor(DWORD pid) {
 
 std::string multiplayerSummary() {
     if (!isConvoyCheckEnabled()) {
-        return "联机保护：拦截 TruckersMP（联运检测已关闭）。";
+        return "联机保护：TruckersMP 仅放行自动无限油量／电量（联运检测已关闭）。";
     }
-    return "联机保护：阻止 TruckersMP 与官方 Convoy；状态无法确认时拒绝写入。";
+    return "联机保护：TruckersMP 仅放行自动无限油量／电量；官方 Convoy 与无法确认的状态拒绝写入。";
 }
 
 }  // namespace
@@ -1504,25 +1556,56 @@ void toggleFreeCamera(AppState& app) {
 // ==========================================================================
 // 存档工具
 // ==========================================================================
+void clearSaveSlotSelection(AppState& app) {
+    app.selectedSlot=-1;app.slotValues={};
+    app.saveMoney[0]=0;app.saveXp[0]=0;
+}
+
+void selectSaveProfile(AppState& app,int index) {
+    if(index<0 || index>=(int)app.saveProfiles.size()) return;
+    if(index==app.selectedSaveProfile) return;
+    app.selectedSaveProfile=index;
+    clearSaveSlotSelection(app);
+    app.showCopyDialog=false;app.copyRequest={};
+    app.saveNote="已切换到档案「"+app.saveProfiles[index].name+"」。请选择该档案的存档。";
+}
+
+void selectSlot(AppState& app,int index);
+
 void refreshSaves(AppState& app) {
+    std::wstring profileDir,slotDir;bool cloud=false;
+    if(app.selectedSaveProfile>=0 && app.selectedSaveProfile<(int)app.saveProfiles.size()) {
+        const auto& profile=app.saveProfiles[app.selectedSaveProfile];
+        profileDir=profile.profileDir;cloud=profile.cloud;
+    }
+    if(app.selectedSlot>=0 && app.selectedSlot<(int)app.slots.size()) {
+        const auto& slot=app.slots[app.selectedSlot];
+        profileDir=slot.profileDir;cloud=slot.cloud;slotDir=slot.slotDir;
+    }
     app.slots = listSlots();
+    app.saveProfiles=groupSaveProfiles(app.slots);
+    const auto selection=restoreSaveProfileSelection(app.slots,app.saveProfiles,profileDir,cloud,slotDir);
+    app.selectedSaveProfile=selection.profile;
+    clearSaveSlotSelection(app);
     app.backups = listBackups();
     int scs = 0, text = 0;
     for (const auto& s : app.slots) {
         if (s.format == "scs") ++scs;
         else if (s.format == "text") ++text;
     }
-    app.saveNote = fmt("共找到 %d 个存档槽（%d 个加密、%d 个明文）。选一个看看它的数值。",
-                       (int)app.slots.size(), scs, text);
-    if (app.selectedSlot >= (int)app.slots.size()) app.selectedSlot = -1;
+    app.saveNote = fmt("共找到 %d 个档案、%d 个存档槽（%d 个加密、%d 个明文）。先选档案，再选存档。",
+                       (int)app.saveProfiles.size(),(int)app.slots.size(), scs, text);
+    if(selection.slot>=0) selectSlot(app,selection.slot);
     logLine(fmt("存档列表已刷新，共 %d 个存档槽", (int)app.slots.size()));
 }
 
 void selectSlot(AppState& app, int index) {
     if (index < 0 || index >= (int)app.slots.size()) return;
     app.selectedSlot = index;
+    app.selectedSaveProfile=saveProfileForSlot(app.saveProfiles,index);
     const SaveSlot& slot = app.slots[(size_t)index];
     app.slotValues = {};
+    app.saveMoney[0]=0;app.saveXp[0]=0;
     if (slot.format != "text") {
         app.saveMoney[0] = 0;
         app.saveXp[0] = 0;
@@ -1550,13 +1633,19 @@ void selectSlot(AppState& app, int index) {
 
 void consumePendingCopy(AppState& app) {
     SaveCopyResult result;
-    bool truck = false;
+    bool truck = false, home = false, trailer = false, fleet = false;
     {
         std::lock_guard<std::mutex> lock(app.resultMutex);
         if (!app.pendingCopyReady) return;
         result = std::move(app.pendingCopy);
         truck = app.pendingCopyTruck;
+        home = app.pendingCopyHome;
+        trailer = app.pendingCopyTrailer;
+        fleet = app.pendingCopyFleet;
         app.pendingCopyTruck = false;
+        app.pendingCopyHome = false;
+        app.pendingCopyTrailer = false;
+        app.pendingCopyFleet = false;
         app.pendingCopyReady = false;
     }
     if (result.game != selectedGame()) return;
@@ -1564,9 +1653,11 @@ void consumePendingCopy(AppState& app) {
         refreshSaves(app);
         for (int i = 0; i < (int)app.slots.size(); ++i)
             if (::_wcsicmp(app.slots[i].slotDir.c_str(), result.slotDir.c_str()) == 0) { selectSlot(app, i); break; }
-        app.saveNote = std::string(truck ? "卡车已导入新存档「" : "已复制为「") + result.displayName + "」，新槽位：" + W2U(result.slotName) +
+        app.saveNote = std::string(fleet ? "车队已扩充并另存为「" : trailer ? "挂车已更换并另存为「" : home ? "Home 配件已修改并另存为「" : truck ? "卡车已导入新存档「" : "已复制为「") + result.displayName + "」，新槽位：" + W2U(result.slotName) +
             "。启动游戏后在同一档案的载入列表中查看；云存档请等待 Steam 同步完成。";
-    } else app.saveNote = std::string(truck ? "车辆导入失败：" : "复制失败：") + result.error;
+        if(fleet) app.saveNote += " 请在游戏中检查新增司机的工作状态和收益结算。";
+        if(!result.note.empty())app.saveNote+=" "+result.note;
+    } else app.saveNote = std::string(fleet ? "车队扩充失败：" : trailer ? "更换挂车失败：" : home ? "Home 配件修改失败：" : truck ? "车辆导入失败：" : "复制失败：") + result.error;
     logLine(app.saveNote);
 }
 
@@ -1693,6 +1784,8 @@ void startSaveCopy(AppState& app) {
     });
 }
 
+
+#include "fleet_ui.inc"
 
 void consumePendingTransferInspection(AppState& app) {
     PendingTransferInspection result;
@@ -1873,6 +1966,487 @@ void renderTruckTransferDialog(AppState& app) {
     ::ImGui::EndPopup();
 }
 
+
+void selectHomeAccessory(AppState& app,int index) {
+    app.homeAccessoryIndex=index;
+    app.homePreview=false;
+    app.homePath[0]=0;
+    if(index>=0 && index<(int)app.homeInventory.entries.size())
+        ::strncpy_s(app.homePath,app.homeInventory.entries[index].dataPath.c_str(),_TRUNCATE);
+}
+
+void consumePendingHomeInspection(AppState& app) {
+    PendingHomeAccessoryInspection result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if(!app.pendingHomeInspection.ready) return;
+        result=std::move(app.pendingHomeInspection); app.pendingHomeInspection={};
+    }
+    if(result.game!=selectedGame() || result.generation!=app.homeInspectionGeneration) return;
+    app.homeInspectBusy=false; app.progressDone=1;
+    app.homeInventory=result.ok ? std::move(result.inventory) : HomeAccessoryInventory{};
+    app.homeTruckIndex=0;
+    selectHomeAccessory(app,app.homeInventory.entries.empty() ? -1 : 0);
+    app.homeNote=!result.ok ? "读取配件失败："+result.error :
+        app.homeInventory.entries.empty() ? "此存档没有可读取的自有卡车配件。" :
+        app.homePresetMode==2 ? "选择卡车和目标容量，然后预览永久扩容。" :
+        "选择卡车和已有配件，粘贴新的 /def/... 路径，然后预览。";
+}
+
+void openHomeAccessories(AppState& app,int mode=0) {
+    if(app.busy) return;
+    if(selectedGame()!=GameId::Ets2) {app.saveNote="Home 配件代码目前仅支持欧卡2";return;}
+    if(app.selectedSlot<0 || app.selectedSlot>=(int)app.slots.size()) {
+        app.saveNote="请先选择要修改的存档";return;
+    }
+    joinWorker(app); consumePendingCopy(app);
+    app.homeRequest={}; app.homeRequest.game=selectedGame();
+    app.homeRequest.source=app.slots[app.selectedSlot];
+    app.homeInventory={}; app.homeTruckIndex=0; selectHomeAccessory(app,-1);
+    app.homePresetMode=mode;app.tankCapacity=5000;
+    ::strncpy_s(app.homeName,mode==2?"永久容量扩容副本":"Home 配件副本",_TRUNCATE);
+    app.homeNote="正在自动解密并读取自有卡车配件……";
+    app.showHomeAccessories=true; app.homeInspectBusy=true;
+    app.busy=true; app.cancel=false;
+    app.progressDone=0; app.progressTotal=1; app.progressNote=mode==2?"读取车辆底盘":"读取 Home 配件";
+    const auto request=app.homeRequest;
+    const uint64_t generation=++app.homeInspectionGeneration;
+    app.worker=std::thread([&app,request,generation]{
+        PendingHomeAccessoryInspection result;
+        result.game=request.game; result.generation=generation;
+        result.ok=inspectHomeAccessoriesSlot(request.source,&result.inventory,&result.error,
+                                             [&app]{return app.cancel.load();});
+        result.ready=true;
+        {std::lock_guard<std::mutex> lock(app.resultMutex);app.pendingHomeInspection=std::move(result);}
+        app.busy=false;
+    });
+}
+
+bool startHomeAccessoryCopy(AppState& app) {
+    if(app.busy || !app.homePreview || app.homeAccessoryIndex<0 ||
+       app.homeAccessoryIndex>=(int)app.homeInventory.entries.size()) return false;
+    std::string error;
+    if(copyBlockedByRunningGame(selectedGame(),&error)) {app.homeNote=error;return false;}
+    const auto& entry=app.homeInventory.entries[app.homeAccessoryIndex];
+    if(!app.homePresetMode && entry.shared) {app.homeNote="共享配件不可修改，请选择其他配件。";return false;}
+    HomeAccessoryRequest request=app.homeRequest;
+    request.truckId=entry.truckId; request.unitId=entry.unitId; request.originalPath=entry.dataPath;
+    request.newPath=app.homePath; request.displayName=app.homeName;
+    request.scaniaTvPreset=app.homePresetMode==1;
+    request.tankCapacity=app.homePresetMode==2?app.tankCapacity:0;
+    joinWorker(app); consumePendingCopy(app);
+    app.busy=true; app.cancel=false;
+    app.progressDone=0;app.progressTotal=1;app.progressNote=request.tankCapacity?"生成容量 Mod 与存档副本":request.scaniaTvPreset ? "安装三屏电视预设并另存副本" : "生成 Home 配件存档副本";
+    app.saveNote=request.tankCapacity ? "正在生成永久油箱 / 电池扩容 Mod 与存档副本……" : request.scaniaTvPreset ? "正在校验内置模型资源和挂点，并生成三屏电视存档副本……" : "正在校验配件并生成新存档，原存档保留……";
+    app.worker=std::thread([&app,request]{
+        auto result=homeAccessoryToNewSave(request,[&app]{return app.cancel.load();});
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingCopy=std::move(result);app.pendingCopyTruck=false;
+            app.pendingCopyHome=true;app.pendingCopyReady=true;
+        }
+        app.busy=false;
+    });
+    return true;
+}
+
+void renderFuelTankControls(AppState& app) {
+    ::ImGui::TextWrapped("为单辆卡车新增独立扩容底盘：柴油油箱按升、电池按 kWh。支持内置欧卡 1.61 原厂柴油底盘及斯堪尼亚 S 2024 电动 4×2；修改过底盘定义的 Mod 不在支持范围内。");
+    ::ImGui::TextWrapped("Mod 将安装到游戏文档的 mod 文件夹。生成后先在游戏 Mod 管理器启用它，再载入副本；保存、重启后容量仍生效，使用副本期间需要保持 Mod 启用。");
+    ::ImGui::Separator();
+    std::vector<int> chassis;
+    for(int i=0;i<(int)app.homeInventory.entries.size();++i) {
+        const auto& entry=app.homeInventory.entries[i];
+        if(entry.type=="vehicle_accessory"&&entry.dataPath.find("/chassis/")!=std::string::npos)chassis.push_back(i);
+    }
+    if(std::find(chassis.begin(),chassis.end(),app.homeAccessoryIndex)==chassis.end()) {
+        int preferred=chassis.empty()?-1:chassis.front();
+        for(int index:chassis) {
+            FuelTankMod probe;std::string error;
+            const auto& entry=app.homeInventory.entries[index];
+            if(!entry.shared&&buildFuelTankMod(entry.dataPath,app.tankCapacity,&probe,&error)){preferred=index;break;}
+        }
+        selectHomeAccessory(app,preferred);
+    }
+    ::ImGui::BeginDisabled(app.busy||app.homeInspectBusy);
+    const auto* entry=app.homeAccessoryIndex>=0&&app.homeAccessoryIndex<(int)app.homeInventory.entries.size()?
+        &app.homeInventory.entries[app.homeAccessoryIndex]:nullptr;
+    const auto selectedLabel=entry?entry->truckLabel+" / "+entry->truckId:"没有可读取的底盘";
+    ::ImGui::SetNextItemWidth(-100);
+    if(::ImGui::BeginCombo("选择卡车",selectedLabel.c_str())) {
+        for(int index:chassis) {
+            const auto& item=app.homeInventory.entries[index];
+            const auto label=item.truckLabel+" / "+item.truckId+(item.shared?" [共享，不可修改]":"");
+            if(::ImGui::Selectable(label.c_str(),index==app.homeAccessoryIndex))selectHomeAccessory(app,index);
+        }
+        ::ImGui::EndCombo();
+    }
+    entry=app.homeAccessoryIndex>=0&&app.homeAccessoryIndex<(int)app.homeInventory.entries.size()?
+        &app.homeInventory.entries[app.homeAccessoryIndex]:nullptr;
+    if(entry)::ImGui::TextWrapped("当前底盘：%s",entry->dataPath.c_str());
+    const bool electric=entry&&fuelTankIsElectric(entry->dataPath);
+    const char* unit=electric?"kWh":"升";
+    ::ImGui::SetNextItemWidth(200);
+    if(::ImGui::InputInt(electric?"目标电池容量（kWh）":"目标油箱容量（升）",&app.tankCapacity,100,500))app.homePreview=false;
+    ::ImGui::TextDisabled("支持 100–10000 %s，目标必须大于原厂容量。",unit);
+    ::ImGui::TextDisabled("保留存档的%s比例，实际%s按新容量计算。",electric?"电量":"油量",electric?"电量":"升数");
+    ::ImGui::SetNextItemWidth(-100);
+    if(::ImGui::InputText("新存档名称",app.homeName,sizeof(app.homeName)))app.homePreview=false;
+    FuelTankMod mod;std::string error,escaped;
+    bool valid=entry&&!entry->shared&&buildFuelTankMod(entry->dataPath,app.tankCapacity,&mod,&error);
+    if(entry&&entry->shared)error="底盘配件被多辆车共享，不能单独修改。";
+    if(valid) {
+        std::vector<std::string> engines;
+        for(const auto& item:app.homeInventory.entries)if(item.truckId==entry->truckId&&item.dataPath.find("/engine/")!=std::string::npos)
+            engines.push_back(item.dataPath);
+        valid=validateFuelTankPowertrain(mod,engines,&error);
+    }
+    if(valid)valid=siiEscapeName(app.homeName,&escaped,&error);
+    if(valid)::ImGui::Text("%s：原厂 %d %s → 新容量 %d %s",electric?"电池":"油箱",mod.originalCapacity,unit,mod.capacity,unit);
+    if(!error.empty())::ImGui::TextWrapped("%s",error.c_str());
+    ::ImGui::BeginDisabled(!valid);
+    if(::ImGui::Button("预览永久扩容"))app.homePreview=true;
+    ::ImGui::EndDisabled();
+    if(app.homePreview&&valid) {
+        app.homePreviewVisible=true;
+        ::ImGui::TextWrapped("卡车：%s / %s\n原厂 %d → %d %s\nMod：%s\n新底盘：%s\n原存档与其他卡车保留；请先退出游戏再生成。",
+            entry->truckLabel.c_str(),entry->truckId.c_str(),mod.originalCapacity,mod.capacity,unit,mod.displayName.c_str(),mod.chassisPath.c_str());
+    }
+    app.homeApplyEnabled=valid&&app.homePreview&&!app.busy;
+    ::ImGui::BeginDisabled(!valid||!app.homePreview);
+    if(ui::primaryButton(electric?"生成 Mod 与电池存档副本":"生成 Mod 与油箱存档副本"))if(startHomeAccessoryCopy(app))::ImGui::CloseCurrentPopup();
+    ::ImGui::EndDisabled();::ImGui::EndDisabled();
+    ::ImGui::Spacing();::ImGui::TextWrapped("%s",app.homeNote.c_str());
+    if(::ImGui::Button(app.homeInspectBusy?"取消读取并关闭":"关闭")) {
+        if(app.homeInspectBusy)app.cancel=true;
+        app.homeInspectBusy=false;app.homePreview=false;++app.homeInspectionGeneration;::ImGui::CloseCurrentPopup();
+    }
+}
+
+void renderHomeAccessoriesDialog(AppState& app) {
+    app.homeDialogVisible=false; app.homePreviewVisible=false; app.homeApplyEnabled=false;
+    const char* title="车辆配件与容量扩容##home_accessories";
+    if(app.showHomeAccessories){::ImGui::OpenPopup(title);app.showHomeAccessories=false;}
+    ::ImGui::SetNextWindowSize(ImVec2(900,(std::min)(740.f,::ImGui::GetIO().DisplaySize.y-40.f)),ImGuiCond_Appearing);
+    if(!::ImGui::BeginPopupModal(title,nullptr,ImGuiWindowFlags_None)) return;
+    if(selectedGame()!=GameId::Ets2 || app.homeRequest.source.slotDir.empty()) {
+        ::ImGui::CloseCurrentPopup();::ImGui::EndPopup();return;
+    }
+    app.homeDialogVisible=true;
+    ui::textf(ui::muted,"源档案：%s / 存档：%s",W2U(app.homeRequest.source.profileName).c_str(),
+              app.homeRequest.source.displayName.c_str());
+    if(app.homePresetMode==2){renderFuelTankControls(app);::ImGui::EndPopup();return;}
+    ::ImGui::TextWrapped("选择路径替换或内置 Home 预设，在同一档案生成命名副本。生成副本前请退出欧卡2。");
+    const char* modes[]={"手动替换 /def/... 配件路径","三屏电视 + 补盲镜 + 行车信息（斯堪尼亚 S 2016）"};
+    ::ImGui::BeginDisabled(app.busy);
+    ::ImGui::SetNextItemWidth(-100);
+    if(::ImGui::Combo("修改方式",&app.homePresetMode,modes,2)) {
+        app.homePreview=false;
+        ::strncpy_s(app.homeName,app.homePresetMode ? "三屏电视副本" : "Home 配件副本",_TRUNCATE);
+    }
+    ::ImGui::EndDisabled();
+    if(app.homePresetMode) {
+        ::ImGui::TextWrapped("此实验预设来自你提供的 MoRan 压缩包。需要 Cabin Accessories DLC；旧模型在当前游戏及 TMP 中的显示效果尚未验证。");
+        ::ImGui::TextWrapped("安装 14 个模型资源文件；使用 slot_1，自动补齐安装底座。已有不同资源或占用的挂点会被保留并提示冲突。");
+    } else ::ImGui::TextWrapped("仅检查路径格式，未验证资源存在或 TruckersMP 同步。请使用与游戏版本和车型匹配的配件路径。");
+    ::ImGui::Separator();
+    std::vector<const HomeAccessoryEntry*> trucks;
+    std::set<std::string> truckIds;
+    for(const auto& entry:app.homeInventory.entries)
+        if(truckIds.insert(entry.truckId).second) trucks.push_back(&entry);
+    ::ImGui::BeginDisabled(app.busy || trucks.empty());
+    if(!trucks.empty()) {
+        app.homeTruckIndex=std::clamp(app.homeTruckIndex,0,(int)trucks.size()-1);
+        const auto* truck=trucks[app.homeTruckIndex];
+        ::ImGui::SetNextItemWidth(-100);
+        if(::ImGui::BeginCombo("卡车",truck->truckLabel.c_str())) {
+            for(int i=0;i<(int)trucks.size();++i) {
+                ::ImGui::PushID(i);
+                if(::ImGui::Selectable(trucks[i]->truckLabel.c_str(),app.homeTruckIndex==i)) {
+                    app.homeTruckIndex=i;
+                    for(int j=0;j<(int)app.homeInventory.entries.size();++j)
+                        if(app.homeInventory.entries[j].truckId==trucks[i]->truckId) {selectHomeAccessory(app,j);break;}
+                }
+                ::ImGui::PopID();
+            }
+            ::ImGui::EndCombo();
+        }
+        const std::string truckId=trucks[app.homeTruckIndex]->truckId;
+        std::string accessoryLabel="请选择配件";
+        if(app.homeAccessoryIndex>=0 && app.homeAccessoryIndex<(int)app.homeInventory.entries.size()) {
+            const auto& entry=app.homeInventory.entries[app.homeAccessoryIndex];
+            accessoryLabel=entry.dataPath+(entry.shared ? " [共享，不可修改]" : "");
+        }
+        ::ImGui::SetNextItemWidth(-100);
+        if(!app.homePresetMode && ::ImGui::BeginCombo("已有配件",accessoryLabel.c_str())) {
+            for(int i=0;i<(int)app.homeInventory.entries.size();++i) {
+                const auto& entry=app.homeInventory.entries[i];
+                if(entry.truckId!=truckId) continue;
+                ::ImGui::PushID(i);
+                const std::string label=entry.dataPath+(entry.shared ? " [共享，不可修改]" : "");
+                if(::ImGui::Selectable(label.c_str(),app.homeAccessoryIndex==i)) selectHomeAccessory(app,i);
+                ::ImGui::PopID();
+            }
+            ::ImGui::EndCombo();
+        }
+    }
+    const HomeAccessoryEntry* entry=app.homeAccessoryIndex>=0 &&
+        app.homeAccessoryIndex<(int)app.homeInventory.entries.size() ?
+        &app.homeInventory.entries[app.homeAccessoryIndex] : nullptr;
+    if(entry && !app.homePresetMode) {
+        ui::textf(ui::muted,"配件类型：%s / 子类型：%s",entry->type.c_str(),entry->subtype.empty() ? "—" : entry->subtype.c_str());
+        ::ImGui::TextWrapped("当前路径：%s",entry->dataPath.c_str());
+        if(entry->shared) ui::text(ui::accent,"该配件或父配件被共享，不能修改。");
+    }
+    if(!app.homePresetMode) {
+        ::ImGui::SetNextItemWidth(-100);
+        if(::ImGui::InputText("新配件路径",app.homePath,sizeof(app.homePath))) app.homePreview=false;
+    }
+    ::ImGui::SetNextItemWidth(-100);
+    if(::ImGui::InputText("新存档名称",app.homeName,sizeof(app.homeName))) app.homePreview=false;
+    std::string error,escaped;
+    bool valid=false;
+    if(app.homePresetMode) {
+        valid=entry && entry->truckLabel=="scania.s_2016" && scaniaTvPresetAvailable();
+        if(!scaniaTvPresetAvailable()) error="此版本未包含完整的三屏电视预设资源。";
+        else if(!entry || entry->truckLabel!="scania.s_2016") error="请选择斯堪尼亚 S 2016 自有卡车。";
+    } else valid=entry && !entry->shared && validateHomeAccessoryPath(app.homePath,&error);
+    if(valid) valid=siiEscapeName(app.homeName,&escaped,&error);
+    if(valid && !app.homePresetMode && entry->dataPath==app.homePath){valid=false;error="新路径与当前路径相同，请填写要替换的路径。";}
+    if(entry && !error.empty()) ::ImGui::TextWrapped("%s",error.c_str());
+    ::ImGui::BeginDisabled(!valid);
+    if(::ImGui::Button(app.homePresetMode ? "预览导入" : "预览替换")) app.homePreview=true;
+    ::ImGui::EndDisabled();
+    if(app.homePreview && valid) {
+        app.homePreviewVisible=true;
+        if(app.homePresetMode) {
+            ui::text(ui::accent,"将导入三屏电视预设并保留原存档：");
+            ::ImGui::TextWrapped("卡车：%s\n新存档：%s\n资源位置：%s/MoRan/scania/TV",entry->truckLabel.c_str(),app.homeName,W2U(documentsDir()).c_str());
+        } else {
+            ui::text(ui::accent,"将仅替换所选配件的路径：");
+            ::ImGui::TextWrapped("原：%s",entry->dataPath.c_str());
+            ::ImGui::TextWrapped("新：%s",app.homePath);
+        }
+    }
+    app.homeApplyEnabled=valid && app.homePreview && !app.busy;
+    ::ImGui::BeginDisabled(!valid || !app.homePreview);
+    if(ui::primaryButton(app.homePresetMode ? "一键导入并生成存档副本" : "修改并生成存档副本"))
+        if(startHomeAccessoryCopy(app)) ::ImGui::CloseCurrentPopup();
+    ::ImGui::EndDisabled();
+    ::ImGui::EndDisabled();
+    ::ImGui::Spacing();
+    ::ImGui::TextWrapped("%s",app.homeNote.c_str());
+    if(::ImGui::Button(app.homeInspectBusy ? "取消读取并关闭" : "关闭")) {
+        if(app.homeInspectBusy) app.cancel=true;
+        app.homeInspectBusy=false;app.homePreview=false;++app.homeInspectionGeneration;
+        ::ImGui::CloseCurrentPopup();
+    }
+    ::ImGui::EndPopup();
+}
+
+void consumePendingTrailerSwapInspection(AppState& app) {
+    PendingTrailerSwapInspection result;
+    {
+        std::lock_guard<std::mutex> lock(app.resultMutex);
+        if(!app.pendingTrailerSwap.ready) return;
+        result=std::move(app.pendingTrailerSwap);
+        app.pendingTrailerSwap={};
+    }
+    if(result.game!=selectedGame() || result.generation!=app.trailerSwapGeneration) return;
+    app.trailerSwapBusy=false;
+    app.progressDone=1;
+    if(!result.ok) {
+        app.trailerSwapInventory={};
+        app.trailerSwapIndex=-1;
+        app.trailerSwapNote="无法读取挂车："+result.error;
+        return;
+    }
+    app.trailerSwapInventory=std::move(result.inventory);
+    app.trailerSwapIndex=-1;
+    for(int i=0;i<(int)app.trailerSwapInventory.entries.size();++i) {
+        const auto& entry=app.trailerSwapInventory.entries[i];
+        if(entry.current || entry.blocked) continue;
+        app.trailerSwapIndex=i; break;
+    }
+    std::size_t owned=0,blockedCount=0;
+    for(const auto& entry:app.trailerSwapInventory.entries) {
+        if(entry.owned) ++owned;
+        if(entry.blocked) ++blockedCount;
+    }
+    if(!app.trailerSwapInventory.hasCurrent)
+        app.trailerSwapNote=app.trailerSwapInventory.swapBlockReason;
+    else {
+        app.trailerSwapNote="共 "+std::to_string(app.trailerSwapInventory.entries.size())+
+            " 辆挂车（自有 "+std::to_string(owned)+" 辆"+
+            (app.trailerSwapInventory.onJob ? "，任务进行中" : "")+
+            (app.trailerSwapInventory.onlineJob ? "，线上任务" : "")+"）。";
+        if(!app.trailerSwapInventory.swapBlockReason.empty())
+            app.trailerSwapNote+="\n"+app.trailerSwapInventory.swapBlockReason;
+    }
+}
+
+void startTrailerSwapInspection(AppState& app) {
+    if(app.busy) return;
+    joinWorker(app);consumePendingCopy(app);
+    const auto request=app.trailerSwapRequest;
+    const uint64_t generation=++app.trailerSwapGeneration;
+    app.trailerSwapBusy=true; app.cancel=false; app.busy=true;
+    app.progressDone=0; app.progressTotal=1;
+    app.progressNote="读取存档里的挂车";
+    app.trailerSwapNote="正在自动解密和转换存档，请稍候……";
+    app.trailerSwapInventory={}; app.trailerSwapIndex=-1;
+    app.worker=std::thread([&app,request,generation]{
+        PendingTrailerSwapInspection result;
+        result.game=request.game; result.generation=generation;
+        result.ok=inspectTrailerSwapSlot(request.source,&result.inventory,&result.error,
+                                        [&app]{return app.cancel.load();});
+        result.ready=true;
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingTrailerSwap=std::move(result);
+        }
+        app.busy=false;
+    });
+}
+
+void openTrailerSwap(AppState& app) {
+    auto explain=[&](const std::string& message) {
+        app.saveNote=message; logLine("更换挂车："+message);
+    };
+    if(app.busy) {explain("当前任务正在处理中，请完成或取消后再更换挂车。");return;}
+    std::string error;
+    if(copyBlockedByRunningGame(selectedGame(),&error)){explain(error);return;}
+    if(app.selectedSlot<0 || app.selectedSlot>=(int)app.slots.size()) {
+        explain("请先在下方存档列表中选中要换挂车的存档，再点击「更换挂车」。");return;
+    }
+    app.trailerSwapRequest={};
+    app.trailerSwapRequest.game=selectedGame();
+    app.trailerSwapRequest.source=app.slots[app.selectedSlot];
+    const auto& name=app.trailerSwapRequest.source.displayName;
+    ::strncpy_s(app.trailerSwapName,(name.empty()?std::string("换挂车副本"):name+" 换挂车").c_str(),_TRUNCATE);
+    app.showTrailerSwap=true;
+    logLine("更换挂车：打开选择窗口并读取挂车列表。");
+    startTrailerSwapInspection(app);
+}
+
+bool startTrailerSwap(AppState& app) {
+    if(app.busy || app.trailerSwapIndex<0 ||
+       app.trailerSwapIndex>=(int)app.trailerSwapInventory.entries.size()) return false;
+    const auto& entry=app.trailerSwapInventory.entries[app.trailerSwapIndex];
+    if(entry.blocked || entry.current || !app.trailerSwapInventory.hasCurrent ||
+       !app.trailerSwapInventory.swapBlockReason.empty()) return false;
+    joinWorker(app);consumePendingCopy(app);
+    TrailerSwapRequest request=app.trailerSwapRequest;
+    request.targetTrailerId=entry.id;
+    request.displayName=app.trailerSwapName;
+    app.busy=true;app.cancel=false;
+    app.progressDone=0;app.progressTotal=1;app.progressNote="更换挂车并另存新档";
+    app.saveNote="正在校验挂车并生成新存档，原存档保留……";
+    app.worker=std::thread([&app,request]{
+        auto result=trailerSwapToNewSave(request,[&app]{return app.cancel.load();});
+        {
+            std::lock_guard<std::mutex> lock(app.resultMutex);
+            app.pendingCopy=std::move(result);app.pendingCopyTrailer=true;app.pendingCopyReady=true;
+        }
+        app.busy=false;
+    });
+    return true;
+}
+
+std::string trailerSwapEntryLabel(const TrailerSwapEntry& entry) {
+    std::string label=entry.label;
+    if(!entry.plate.empty()) label+=" / "+entry.plate;
+    if(entry.cargoMass>0.5f) {
+        char mass[32];::snprintf(mass,sizeof(mass),"%dt",(int)(entry.cargoMass/1000.f+0.5f));
+        label+=" / 载重 "; label+=mass;
+    }
+    label+=entry.current ? " 【当前】" : entry.owned ? "（自有）" : "（任务/市场）";
+    if(entry.blocked) label+=" 【不可选】";
+    return label;
+}
+
+void renderTrailerSwapDialog(AppState& app) {
+    const char* title="更换挂车##trailer_swap";
+    if(app.showTrailerSwap){::ImGui::OpenPopup(title);app.showTrailerSwap=false;}
+    ::ImGui::SetNextWindowSize(ImVec2(760,0),ImGuiCond_Appearing);
+    if(!::ImGui::BeginPopupModal(title,nullptr,ImGuiWindowFlags_AlwaysAutoResize)) return;
+    app.trailerSwapDialogVisible=true;
+    if(app.trailerSwapRequest.source.slotDir.empty() ||
+       app.trailerSwapRequest.game!=selectedGame()){
+        ::ImGui::CloseCurrentPopup();::ImGui::EndPopup();return;
+    }
+    ui::textf(ui::muted,"源档案：%s / 存档：%s",
+              W2U(app.trailerSwapRequest.source.profileName).c_str(),
+              app.trailerSwapRequest.source.displayName.c_str());
+    ::ImGui::TextWrapped("把当前连着的挂车换成存档里的另一辆，不需要先开回车库，挂车位原地保留。货物和任务随新挂车继续；默认另存为一个新存档，进游戏载入即生效。");
+    const auto& inv=app.trailerSwapInventory;
+    ::ImGui::Separator();
+    if(inv.hasCurrent) {
+        ::ImGui::TextWrapped("当前卡车：%s",inv.truckLabel.c_str());
+        ::ImGui::TextWrapped("当前挂车：%s%s / %s",
+                             inv.currentPlate.empty()?"":(inv.currentPlate+" / ").c_str(),
+                             inv.currentLabel.c_str(),inv.currentId.c_str());
+        if(inv.onJob)
+            ui::textf(ui::muted,"任务进行中%s（货物：%s），换车后货物挂到新挂车上。",
+                      inv.onlineJob?"，且是线上任务":"",inv.jobCargo.c_str());
+    } else ::ImGui::TextWrapped("%s",inv.swapBlockReason.c_str());
+    ::ImGui::Separator();
+    ::ImGui::BeginDisabled(app.busy || app.trailerSwapBusy);
+    if(!inv.entries.empty()) {
+        app.trailerSwapIndex=std::clamp(app.trailerSwapIndex,0,(int)inv.entries.size()-1);
+        const auto& selected=inv.entries[app.trailerSwapIndex];
+        ::ImGui::SetNextItemWidth(-100);
+        if(::ImGui::BeginCombo("换成哪辆挂车",trailerSwapEntryLabel(selected).c_str())) {
+            for(int i=0;i<(int)inv.entries.size();++i) {
+                const auto& entry=inv.entries[i];
+                ::ImGui::PushID(i);
+                if(::ImGui::Selectable(trailerSwapEntryLabel(entry).c_str(),app.trailerSwapIndex==i))
+                    app.trailerSwapIndex=i;
+                if(entry.blocked && ::ImGui::IsItemHovered())
+                    ::ImGui::SetTooltip("%s",entry.blockReason.c_str());
+                ::ImGui::PopID();
+            }
+            ::ImGui::EndCombo();
+        }
+        if(selected.blocked) ui::text(ui::accent,("不可切换："+selected.blockReason).c_str());
+        else if(selected.current) ui::text(ui::muted,"这辆就是当前挂车，请选择另一辆。");
+        else {
+            std::string detail="新车："+selected.label;
+            if(!selected.plate.empty()) detail+=" / 车牌 "+selected.plate;
+            if(selected.cargoMass>0.5f) {
+                char mass[32];::snprintf(mass,sizeof(mass),"%d 吨",(int)(selected.cargoMass/1000.f+0.5f));
+                detail+=" / 载重 "; detail+=mass;
+            }
+            ::ImGui::TextWrapped("%s",detail.c_str());
+        }
+    } else if(!app.trailerSwapBusy) ::ImGui::TextWrapped("存档里没有挂车。");
+    ::ImGui::SetNextItemWidth(-100);
+    ::ImGui::InputText("新存档名称",app.trailerSwapName,sizeof(app.trailerSwapName));
+    ::ImGui::EndDisabled();
+    std::string escaped,error;
+    const bool nameValid=siiEscapeName(app.trailerSwapName,&escaped,&error);
+    if(!nameValid) ::ImGui::TextWrapped("%s",error.c_str());
+    const bool canApply=inv.hasCurrent && inv.swapBlockReason.empty() && !inv.entries.empty() &&
+                         app.trailerSwapIndex>=0 && nameValid &&
+                         app.trailerSwapIndex<(int)inv.entries.size() &&
+                         !inv.entries[app.trailerSwapIndex].blocked &&
+                         !inv.entries[app.trailerSwapIndex].current &&
+                         !app.busy && !app.trailerSwapBusy;
+    ::ImGui::BeginDisabled(!canApply);
+    if(ui::primaryButton("更换挂车并另存为新存档"))
+        if(startTrailerSwap(app)) ::ImGui::CloseCurrentPopup();
+    ::ImGui::EndDisabled();
+    ::ImGui::SameLine();
+    if(::ImGui::Button(app.trailerSwapBusy ? "取消读取并关闭" : "关闭")) {
+        if(app.trailerSwapBusy) app.cancel=true;
+        app.trailerSwapBusy=false;++app.trailerSwapGeneration;
+        ::ImGui::CloseCurrentPopup();
+    }
+    ::ImGui::Spacing();
+    if(app.trailerSwapBusy) ui::text(ui::muted,"正在读取挂车列表……");
+    ::ImGui::TextWrapped("%s",app.trailerSwapNote.c_str());
+    ::ImGui::EndPopup();
+}
 
 void backupSelectedSlot(AppState& app) {
     if (app.selectedSlot < 0 || app.selectedSlot >= (int)app.slots.size()) {
@@ -3010,11 +3584,7 @@ void renderVehicleTabImpl(AppState& app) {
         app.telemetryAvailable = readTelemetry(&app.telemetry, &app.telemetryError);
     }
     const bool telemetry = attached && app.telemetryAvailable && app.telemetry.sdkActive;
-    if (app.vehicleLocker && (app.autoFuelLock || app.autoDamageLock)) {
-        const auto status = app.vehicleLocker->status();
-        if (app.autoFuelLock) app.fuelStatus = status;
-        if (app.autoDamageLock) app.damageStatus = status;
-    }
+    syncAutoVehicleLocks(app);
     if (app.engineTuner) {
         const auto status = app.engineTuner->status();
         if (app.engineTuner->active()) app.engineStatus = status;
@@ -3037,9 +3607,9 @@ void renderVehicleTabImpl(AppState& app) {
     ui::beginCard("##vehicle_metrics");
     if (::ImGui::BeginTable("##metrics", 3, ImGuiTableFlags_SizingStretchSame)) {
         ::ImGui::TableNextColumn();
-        ::ImGui::TextDisabled("剩余燃油");
-        ui::heading(telemetry ? fmt("%.0f L", app.telemetry.fuel).c_str() : "—", 29);
-        ::ImGui::TextDisabled(telemetry ? fmt("油箱容量 %.0f L", app.telemetry.fuelCapacity).c_str() : "等待游戏遥测");
+        ::ImGui::TextDisabled("剩余燃油 / 电量");
+        ui::heading(telemetry ? fmt("%.1f%%", 100.0f * std::clamp(app.telemetry.fuel / app.telemetry.fuelCapacity, 0.0f, 1.0f)).c_str() : "—", 29);
+        ::ImGui::TextDisabled(telemetry ? fmt("游戏能量值 %.0f / %.0f", app.telemetry.fuel, app.telemetry.fuelCapacity).c_str() : "等待游戏遥测");
         if (telemetry && app.telemetry.fuelCapacity > 0)
             ::ImGui::ProgressBar(std::clamp(app.telemetry.fuel / app.telemetry.fuelCapacity, 0.0f, 1.0f), ImVec2(-1, 4), "");
         ::ImGui::TableNextColumn();
@@ -3116,6 +3686,11 @@ void renderVehicleTabImpl(AppState& app) {
         if (::ImGui::Checkbox("无限油量", &fuel)) toggleAutoVehicleLock(app, true, fuel);
         ui::text(ui::muted, app.fuelStatus.c_str());
         ::ImGui::Spacing();
+        bool electric = app.autoElectricLock;
+        if (::ImGui::Checkbox("无限电量", &electric)) toggleAutoVehicleLock(app, true, electric, true);
+        ui::text(ui::muted, app.electricStatus.c_str());
+        ::ImGui::TextWrapped("电动车使用；与无限油量互斥。Ctrl+F6 可切换。");
+        ::ImGui::Spacing();
         ::ImGui::Separator();
         ::ImGui::Spacing();
         bool damage = app.autoDamageLock;
@@ -3123,12 +3698,13 @@ void renderVehicleTabImpl(AppState& app) {
         ui::text(ui::muted, app.damageStatus.c_str());
         ::ImGui::Spacing();
         if (::ImGui::Button("全部开启")) {
-            if (!app.autoFuelLock) toggleAutoVehicleLock(app, true, true);
+            if (!app.autoFuelLock && !app.autoElectricLock) toggleAutoVehicleLock(app, true, true);
             if (!app.autoDamageLock) toggleAutoVehicleLock(app, false, true);
         }
         ui::nextButton("全部关闭");
         if (::ImGui::Button("全部关闭")) {
             if (app.autoFuelLock) toggleAutoVehicleLock(app, true, false);
+            if (app.autoElectricLock) toggleAutoVehicleLock(app, true, false, true);
             if (app.autoDamageLock) toggleAutoVehicleLock(app, false, false);
         }
         ::ImGui::Spacing();
@@ -3637,7 +4213,7 @@ void renderConvoySection(AppState& app) {
     if (app.checkConvoy) {
         ::ImGui::Spacing();
         int policy = app.mpPolicy;
-        if (::ImGui::RadioButton("严格模式（推荐）：联机时全部禁用", &policy, 0)) {
+        if (::ImGui::RadioButton("严格模式：限制联机功能（TruckersMP 自动油量／电量除外）", &policy, 0)) {
             setMultiplayerPolicy(app, 0);
         }
         if (::ImGui::RadioButton("联运模式：联机时放开不写内存的功能", &policy, 1)) {
@@ -3650,8 +4226,9 @@ void renderConvoySection(AppState& app) {
                                       : ImVec4(1.0f, 0.75f, 0.5f, 1.0f),
                          "安全功能当前：%s", gate.empty() ? "可用" : gate.c_str());
     ui::textf(ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
-                         "写入功能：%s",
+                         "其他写入功能：%s",
                          app.mpBlocks ? "联机中已禁用" : (app.checkConvoy ? "可用（单机）" : "可用（联运检测已关闭）"));
+    ::ImGui::TextWrapped("TruckersMP 下允许车辆页的自动无限油量／电量；无损、动力、经济和手动写入仍使用原有保护。");
 }
 
 void renderFlyModeSection(AppState& app);
@@ -3813,10 +4390,19 @@ void renderFlyModeSection(AppState& app) {
 }
 
 void renderSaveTabImpl(AppState& app) {
+    if(app.slots.empty()) {app.saveProfiles.clear();app.selectedSaveProfile=-1;clearSaveSlotSelection(app);}
+    if(!app.slots.empty() && app.saveProfiles.empty()) {
+        app.saveProfiles=groupSaveProfiles(app.slots);app.selectedSaveProfile=0;
+    }
+    if(app.selectedSaveProfile<0 || app.selectedSaveProfile>=(int)app.saveProfiles.size())
+        app.selectedSaveProfile=app.saveProfiles.empty() ? -1 : 0;
+    if(app.selectedSlot>=0 && saveProfileForSlot(app.saveProfiles,app.selectedSlot)!=app.selectedSaveProfile)
+        clearSaveSlotSelection(app);
+    app.visibleSaveSlotCount=0;
     ::ImGui::BeginDisabled(app.busy);
     if (::ImGui::Button("刷新存档列表")) refreshSaves(app);
     ui::next(300);
-    ::ImGui::TextDisabled("本地 / Steam 云存档  ·  %d 个", (int)app.slots.size());
+    ::ImGui::TextDisabled("%d 个档案  ·  %d 个存档",(int)app.saveProfiles.size(), (int)app.slots.size());
     ::ImGui::Spacing();
     const int columns = ::ImGui::GetContentRegionAvail().x >= 880 ? 2 : 1;
     if (::ImGui::BeginTable("##save_workspace", columns, ImGuiTableFlags_SizingStretchProp)) {
@@ -3825,10 +4411,34 @@ void renderSaveTabImpl(AppState& app) {
             ::ImGui::TableSetupColumn("detail", ImGuiTableColumnFlags_WidthStretch, 1.4f);
         }
         ::ImGui::TableNextColumn();
-        ui::beginCard("##save_library", "我的存档");
-        ::ImGui::BeginChild("##slots", ImVec2(0, 322));
+        ui::beginCard("##save_library", "我的档案与存档");
+        ::ImGui::BeginChild("##save_profiles",ImVec2(0,144));
+        if(app.saveProfiles.empty()) ui::text(ui::muted,"尚未找到包含存档的档案。");
+        for(int i=0;i<(int)app.saveProfiles.size();++i) {
+            const auto& profile=app.saveProfiles[i];
+            ::ImGui::PushID(i);
+            const std::string label=fmt("%s  [%s]  ·  %d 个存档",profile.name.c_str(),
+                                       profile.cloud ? "Steam 云" : "本地",(int)profile.slots.size());
+            if(::ImGui::Selectable(label.c_str(),app.selectedSaveProfile==i,ImGuiSelectableFlags_None,ImVec2(0,32)))
+                selectSaveProfile(app,i);
+            if(app.saveProfileUiProbe.capture && i<3) {
+                const auto min=::ImGui::GetItemRectMin(),max=::ImGui::GetItemRectMax();
+                app.saveProfileUiProbe.rowX[i]=(min.x+max.x)*0.5f;
+                app.saveProfileUiProbe.rowY[i]=(min.y+max.y)*0.5f;
+            }
+            if(::ImGui::IsItemHovered()) ::ImGui::SetTooltip("%s\n%s",profile.name.c_str(),W2U(profile.profileDir).c_str());
+            ::ImGui::PopID();
+        }
+        ::ImGui::EndChild();
+        ::ImGui::Separator();
+        const SaveProfileGroup* selectedProfile=app.selectedSaveProfile>=0 ? &app.saveProfiles[app.selectedSaveProfile] : nullptr;
+        if(selectedProfile) ui::textf(ui::accent,"%s · %d 个存档",selectedProfile->name.c_str(),(int)selectedProfile->slots.size());
+        ::ImGui::BeginChild("##slots", ImVec2(0, 266));
         if (app.slots.empty()) ui::text(ui::muted, "还没有找到存档。可刷新列表，或确认当前选择的游戏。");
-        for (int i = 0; i < (int)app.slots.size(); ++i) {
+        const std::vector<int> noSlots;
+        for (int i : selectedProfile ? selectedProfile->slots : noSlots) {
+            if(i<0 || i>=(int)app.slots.size()) continue;
+            ++app.visibleSaveSlotCount;
             const auto& slot = app.slots[(size_t)i];
             ::ImGui::PushID(i);
             const ImVec2 pos = ::ImGui::GetCursorScreenPos();
@@ -3840,7 +4450,7 @@ void renderSaveTabImpl(AppState& app) {
             draw->PushClipRect(pos, ImVec2(pos.x + width, pos.y + 62), true);
             const std::string name = slot.displayName.empty() ? W2U(slot.slotName) : slot.displayName;
             draw->AddText(ImVec2(pos.x + 10, pos.y + 6), ::ImGui::GetColorU32(app.selectedSlot == i ? ui::accent : ui::foreground), name.c_str());
-            const std::string detail = W2U(slot.profileName) + " / " + (slot.cloud ? "Steam 云" : "本地") + " / " + localTimeString(slot.mtime);
+            const std::string detail = "槽位 "+W2U(slot.slotName) + " / " + localTimeString(slot.mtime);
             ::ImGui::PushFont(nullptr, 14);
             draw->AddText(ImVec2(pos.x + 10, pos.y + 33), ::ImGui::GetColorU32(ui::muted), detail.c_str());
             ::ImGui::PopFont();
@@ -3859,7 +4469,7 @@ void renderSaveTabImpl(AppState& app) {
             ui::textf(ui::muted, "%s  ·  %s  ·  %s", slot.cloud ? "Steam 云" : "本地", slot.formatText.c_str(), formatSize(slot.size).c_str());
             ::ImGui::Spacing();
         } else {
-            ui::text(ui::muted, "选择一个存档，查看详情、备份或导出。");
+            ui::text(ui::muted, "先选择档案，再选择其中的存档，查看详情、备份或导出。");
             ::ImGui::Spacing();
         }
     if (ui::primaryButton("备份选中存档")) backupSelectedSlot(app);
@@ -3935,8 +4545,32 @@ void renderSaveTabImpl(AppState& app) {
         ::ImGui::SetTooltip("当前任务正在处理中，请完成或取消后再复制卡车。");
     ui::next(210);
     ui::text(ui::muted, "直接选择现有存档；退出对应游戏后使用");
+    ::ImGui::Spacing();
+    ::ImGui::BeginDisabled(selectedGame()!=GameId::Ets2);
+    if(::ImGui::Button("Home 配件代码")) openHomeAccessories(app);
     ::ImGui::EndDisabled();
+    ui::next(210);
+    ui::text(ui::muted,"粘贴 /def/... 路径，预览后另存副本（欧卡2）");
+    ::ImGui::Spacing();
+    ::ImGui::BeginDisabled(selectedGame()!=GameId::Ets2);
+    if(::ImGui::Button("永久油箱 / 电池扩容"))openHomeAccessories(app,2);
+    ::ImGui::EndDisabled();
+    ui::next(210);ui::text(ui::muted,"选择卡车与容量，生成独立底盘 Mod 和存档副本");
+    ::ImGui::EndDisabled();
+    ::ImGui::Spacing();
+    if(::ImGui::Button("更换挂车")) openTrailerSwap(app);
+    ui::next(210);
+    ui::text(ui::muted,"当前连着的挂车换成存档里的另一辆，另存副本生效");
+    ::ImGui::Spacing();
+    ::ImGui::BeginDisabled(selectedGame()!=GameId::Ets2 || app.busy);
+    if(::ImGui::Button("车队经济管理")) openFleet(app);
+    ::ImGui::EndDisabled();
+    ui::next(210);
+    ui::text(ui::muted,"批量增加司机与卡车，分配到已购车库并另存副本");
+    renderFleetDialog(app);
     renderTruckTransferDialog(app);
+    renderHomeAccessoriesDialog(app);
+    renderTrailerSwapDialog(app);
     ::ImGui::BeginDisabled(app.busy);
     ::ImGui::Spacing();
     if (::ImGui::Button("拆分为独立档案")) openProfileSplit(app);
@@ -4011,7 +4645,7 @@ void renderHelpTabImpl(AppState& app) {
         "\n"
         "【改钱 / 经验】美卡：填写目标金额后直接改钱；欧卡首次需填写当前金额作为定位种子。\n"
         "　　　　　　　之后：直接填目标值再点一次即可。写的是游戏权威存储，无需锁定。\n"
-        "【车辆】无限油量和车辆无损直接勾选；动力预设与滑块只设置目标，点击「应用调校」才生效。\n"
+        "【车辆】燃油车勾选无限油量，电动车勾选无限电量，两者互斥；车辆页显示剩余能量百分比。动力目标设置后点击「应用调校」。\n"
         "　　　　点击「恢复原厂」还原动力；换车、读档自动跟随当前车辆。\n"
         "【扫描器】任意数值都可扫描；向多个候选地址写入前会要求确认。\n"
         "【存档】备份 / 还原 / 解密导出 / 导出可读 SII / 复制为新存档 / 跨存档复制卡车 / 拆分独立档案。\n"
@@ -4033,7 +4667,7 @@ void renderHelpTabImpl(AppState& app) {
         saveSettings(app);
     }
     ::ImGui::BulletText("Ctrl+F1 传送导航终点 · Ctrl+F2 无限油量 · Ctrl+F3 车辆无损");
-    ::ImGui::BulletText("Ctrl+F4 发动机动力 · Ctrl+F5 时间 09:00 · Ctrl+Backspace 撤销传送");
+    ::ImGui::BulletText("Ctrl+F4 发动机动力 · Ctrl+F5 时间 09:00 · Ctrl+F6 无限电量 · Ctrl+Backspace 撤销传送");
     ::ImGui::Spacing();
     ::ImGui::Separator();
     ::ImGui::Spacing();
@@ -4162,6 +4796,9 @@ void renderApp(AppState& app) {
     consumePendingEconomy(app);  // 经济定位线程的结构化结果由本线程统一落地
     consumePendingCopy(app);
     consumePendingTransferInspection(app);
+    consumePendingFleet(app);
+    consumePendingHomeInspection(app);
+    consumePendingTrailerSwapInspection(app);
     consumePendingSplit(app);
     consumePendingExport(app);
     // 刷新写入闸门策略快照（pid / 联运策略）：工作线程只读这份原子快照

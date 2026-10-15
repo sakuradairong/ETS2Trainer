@@ -1,9 +1,14 @@
 #include "trucktransfer.h"
+#include "fleet.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <limits>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -27,6 +32,7 @@ struct Tok {
 
 struct Prop {
     std::string name;
+    std::size_t begin = 0;
     int index = -1;
     std::vector<Tok> values;
 };
@@ -307,6 +313,7 @@ bool parseProps(const std::vector<Tok>& toks, UnitInfo* unit, std::string* error
         }
         Prop prop;
         prop.name = name.text;
+        prop.begin = name.begin;
         prop.index = index;
         std::size_t v = nextNonComment(toks, q + 1);
         std::size_t e = v;
@@ -722,6 +729,781 @@ bool cloneGraphUnit(const Doc& source, const UnitInfo& unit,
 
 }  // namespace
 
+namespace {
+using HomeReferences = std::unordered_map<std::string, std::vector<std::string>>;
+bool collectHomeReferences(const Doc& doc, HomeReferences* incoming, std::string* error,
+                           const std::function<bool()>& canceled) {
+    for (const UnitInfo& u : doc.units) {
+        if (canceled && canceled()) { setError(error, "配件读取已取消"); return false; }
+        for (const Prop& p : u.props) {
+            for (const Tok& v : p.values) {
+                if (v.kind == TokKind::Atom && doc.byId.count(v.text))
+                    (*incoming)[v.text].push_back(u.id);
+            }
+        }
+    }
+    return true;
+}
+
+bool homeAccessoryShared(const HomeReferences& incoming, const std::string& unitId,
+                         const std::string& truckId) {
+    std::unordered_set<std::string> visited;
+    std::string current = unitId;
+    // A shared ancestor also makes its child accessory shared. The vehicle itself
+    // is normally referenced by both player and garage, so stop at the owner.
+    while (current != truckId && visited.insert(current).second) {
+        const auto it = incoming.find(current);
+        if (it == incoming.end() || it->second.empty()) return true;
+        if (it->second.size() != 1) return true;
+        current = it->second.front();
+    }
+    return current != truckId;
+}
+
+bool collectOwnedTrucks(const Doc& doc, const UnitInfo& player,
+                        std::vector<const UnitInfo*>* trucks, std::string* error) {
+    const Tok* count = nullptr;
+    std::vector<const Tok*> refs;
+    if (!readArray(player, "trucks", &count, &refs, error)) return false;
+    (void)count;
+    for (const Tok* ref : refs) {
+        if (ref->kind != TokKind::Atom || !startsNameless(ref->text)) {
+            setError(error, "自有卡车引用不是单位 id");
+            return false;
+        }
+        const UnitInfo* vehicle = findById(doc, ref->text);
+        if (!vehicle || vehicle->type != "vehicle") {
+            setError(error, "自有卡车引用没有指向 vehicle：" + ref->text);
+            return false;
+        }
+        trucks->push_back(vehicle);
+    }
+    return true;
+}
+
+bool isEditableHomeAccessory(const Doc& doc, const UnitInfo& vehicle, const UnitInfo& unit,
+                             const HomeReferences& incoming,
+                             std::string* error, const std::function<bool()>& canceled) {
+    if (!isAllowedAccessoryType(unit.type)) {
+        setError(error, "所选单位不是可编辑的配件类型");
+        return false;
+    }
+    if (homeAccessoryShared(incoming, unit.id, vehicle.id)) {
+        setError(error, "该配件或其父配件被共享，修改可能影响其他车辆，已拒绝");
+        return false;
+    }
+    std::vector<std::string> order;
+    std::size_t accessoryCount = 0;
+    if (!validateTruckGraph(doc, vehicle, &accessoryCount, error, canceled, &order)) return false;
+    for (const std::string& id : order) {
+        if (idKey(id) == idKey(unit.id)) return true;
+    }
+    setError(error, "所选配件不属于该卡车，已拒绝");
+    return false;
+}
+}  // namespace
+
+bool validateHomeAccessoryPath(const std::string& path, std::string* error) {
+    if (error) error->clear();
+    if (path.empty()) {
+        setError(error, "配件路径不能为空");
+        return false;
+    }
+    if (path.size() > 260u) {
+        setError(error, "配件路径过长（最多 260 个字符）");
+        return false;
+    }
+    for (unsigned char c : path) {
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '/')) {
+            setError(error, "路径只允许英文字母、数字、下划线、连字符、点和正斜杠");
+            return false;
+        }
+    }
+    if (path.find('"') != std::string::npos) {
+        setError(error, "配件路径不能包含引号");
+        return false;
+    }
+    if (path.find('\\') != std::string::npos) {
+        setError(error, "配件路径必须使用正斜杠 /");
+        return false;
+    }
+    if (path.compare(0, 5, "/def/") != 0) {
+        setError(error, "配件路径必须以 /def/ 开头");
+        return false;
+    }
+    if (path.size() < 8 || path.compare(path.size() - 4, 4, ".sii") != 0) {
+        setError(error, "配件路径必须以 .sii 结尾");
+        return false;
+    }
+    if (path.find("..") != std::string::npos) {
+        setError(error, "配件路径不能包含 .. 目录跳转");
+        return false;
+    }
+    if (path.find("//") != std::string::npos) {
+        setError(error, "配件路径不能包含连续的 //");
+        return false;
+    }
+    if (path.find("/./") != std::string::npos || path.substr(path.find_last_of('/') + 1) == ".sii") {
+        setError(error, "配件路径不能包含空文件名或单点目录");
+        return false;
+    }
+    return true;
+}
+
+bool inspectHomeAccessoriesText(const std::string& text, HomeAccessoryInventory* inventory,
+                                std::string* error, std::function<bool()> canceled) {
+    if (error) error->clear();
+    if (inventory) inventory->entries.clear();
+    if (!inventory) {
+        setError(error, "inventory output is null");
+        return false;
+    }
+    Doc doc;
+    if (!loadDoc(text, &doc, error, canceled)) {
+        inventory->entries.clear();
+        return false;
+    }
+    const UnitInfo* player = findPlayer(doc, error);
+    if (!player) {
+        inventory->entries.clear();
+        return false;
+    }
+    std::vector<const UnitInfo*> trucks;
+    if (!collectOwnedTrucks(doc, *player, &trucks, error)) {
+        inventory->entries.clear();
+        return false;
+    }
+    HomeReferences incoming;
+    if (!collectHomeReferences(doc, &incoming, error, canceled)) return false;
+    std::vector<HomeAccessoryEntry> entries;
+    for (const UnitInfo* vehicle : trucks) {
+        std::vector<std::string> order;
+        std::size_t accessoryCount = 0;
+        if (!validateTruckGraph(doc, *vehicle, &accessoryCount, error, canceled, &order)) {
+            inventory->entries.clear();
+            return false;
+        }
+        const std::string label = labelForVehicle(doc, *vehicle);
+        for (const std::string& id : order) {
+            if (idKey(id) == idKey(vehicle->id)) continue;
+            const UnitInfo* unit = findById(doc, id);
+            if (!unit) continue;
+            const Prop* path = findScalar(*unit, "data_path");
+            if (!path || path->values.size() != 1 ||
+                (path->values[0].kind != TokKind::String && path->values[0].kind != TokKind::Atom)) continue;
+            HomeAccessoryEntry entry;
+            entry.truckId = vehicle->id;
+            entry.truckLabel = label;
+            entry.unitId = unit->id;
+            entry.type = unit->type;
+            entry.dataPath = path->values[0].text;
+            const Prop* subtype = findScalar(*unit, "subtype");
+            if (subtype && subtype->values.size() == 1) entry.subtype = subtype->values[0].text;
+            entry.shared = homeAccessoryShared(incoming, unit->id, vehicle->id);
+            entries.push_back(std::move(entry));
+        }
+    }
+    inventory->entries = std::move(entries);
+    return true;
+}
+
+bool replaceHomeAccessoryPath(const std::string& text, const std::string& truckId,
+                              const std::string& unitId, const std::string& newPath,
+                              std::string* out, std::string* error,
+                              std::function<bool()> canceled) {
+    if (error) error->clear();
+    if (out) out->clear();
+    if (!out) {
+        setError(error, "output is null");
+        return false;
+    }
+    if (!validateHomeAccessoryPath(newPath, error)) return false;
+    Doc doc;
+    if (!loadDoc(text, &doc, error, canceled)) return false;
+    const UnitInfo* player = findPlayer(doc, error);
+    if (!player) return false;
+    std::vector<const UnitInfo*> trucks;
+    if (!collectOwnedTrucks(doc, *player, &trucks, error)) return false;
+    const UnitInfo* vehicle = nullptr;
+    for (const UnitInfo* v : trucks) {
+        if (idKey(v->id) == idKey(truckId)) { vehicle = v; break; }
+    }
+    if (!vehicle) {
+        setError(error, "所选卡车不属于该存档的自有车辆");
+        return false;
+    }
+    const UnitInfo* unit = findById(doc, unitId);
+    if (!unit) {
+        setError(error, "所选配件不存在于该存档");
+        return false;
+    }
+    HomeReferences incoming;
+    if (!collectHomeReferences(doc, &incoming, error, canceled)) return false;
+    if (!isEditableHomeAccessory(doc, *vehicle, *unit, incoming, error, canceled)) return false;
+    const Prop* path = findScalar(*unit, "data_path");
+    if (!path || path->values.size() != 1 ||
+        (path->values[0].kind != TokKind::String && path->values[0].kind != TokKind::Atom)) {
+        setError(error, "所选配件没有唯一的 data_path 属性");
+        return false;
+    }
+    const Tok& value = path->values[0];
+    Replacement rep;
+    rep.begin = value.begin;
+    rep.end = value.end;
+    rep.text = "\"" + newPath + "\"";
+    std::vector<Replacement> reps{rep};
+    return applyReplacements(text, std::move(reps), out, error);
+}
+
+bool installScaniaTvPresetText(const std::string& text,const std::string& truckId,
+                               std::string* out,std::string* error,std::function<bool()> canceled) {
+    if(out) out->clear();
+    if(error) error->clear();
+    if(!out) {setError(error,"output is null");return false;}
+    Doc doc;
+    if(!loadDoc(text,&doc,error,canceled)) return false;
+    const UnitInfo* player=findPlayer(doc,error);
+    if(!player) return false;
+    std::vector<const UnitInfo*> trucks;
+    if(!collectOwnedTrucks(doc,*player,&trucks,error)) return false;
+    const UnitInfo* vehicle=nullptr;
+    for(const auto* truck:trucks) if(idKey(truck->id)==idKey(truckId)) {vehicle=truck;break;}
+    if(!vehicle || labelForVehicle(doc,*vehicle)!="scania.s_2016") {
+        setError(error,"三屏电视预设仅支持此存档的斯堪尼亚 S 2016 自有卡车");return false;
+    }
+    std::size_t graphCount=0;
+    if(!validateTruckGraph(doc,*vehicle,&graphCount,error,canceled)) return false;
+    const UnitInfo* economy=nullptr;
+    for(const auto& unit:doc.units) if(unit.type=="economy") {
+        if(economy){setError(error,"存档包含多个 economy，无法确认注册位置");return false;}
+        economy=&unit;
+    }
+    const Tok* logRef=nullptr;
+    if(!economy || !readScalar(*economy,"bus_job_log",&logRef,error)) {
+        setError(error,"存档缺少 economy.bus_job_log，不能注册此实验预设");return false;
+    }
+    const UnitInfo* log=logRef->kind==TokKind::Atom ? findById(doc,logRef->text) : nullptr;
+    const Tok* version=nullptr;
+    if(!log || log->type!="bus_job_log" || !readScalar(*log,"version",&version,error) ||
+       version->kind!=TokKind::Atom || version->text!="0") {
+        setError(error,"巴士日志不是受支持的 version 0，已拒绝导入");return false;
+    }
+    const Tok* logCount=nullptr;
+    std::vector<const Tok*> logEntries;
+    if(!readArray(*log,"entries",&logCount,&logEntries,error)) return false;
+    for(const auto* entry:logEntries) {
+        const UnitInfo* hookup=findById(doc,entry->text);
+        if(entry->kind!=TokKind::String || !hookup || hookup->type!="accessory_hookup_data") {
+            setError(error,"巴士日志已有任务或未知条目，导入不会覆盖这些数据");return false;
+        }
+    }
+    if(logEntries.size()>=256) {setError(error,"本地 hookup 注册条目过多");return false;}
+    const Tok* accessoryCount=nullptr;
+    std::vector<const Tok*> accessories;
+    if(!readArray(*vehicle,"accessories",&accessoryCount,&accessories,error)) return false;
+    if(accessories.size()>100) {setError(error,"卡车配件已超过 100 个");return false;}
+    const std::string basePath="/def/vehicle/truck/scania.s_2016/accessory/set_glass/set1.dlc_toys.sii";
+    const std::string model="/home/MoRan/scania/TV/model/MoRan_3TV.pmd";
+    const UnitInfo* base=nullptr;
+    for(const auto* ref:accessories) {
+        const auto* unit=findById(doc,ref->text);
+        const Prop* path=unit ? findScalar(*unit,"data_path") : nullptr;
+        if(unit && unit->type=="vehicle_addon_accessory" && path && path->values.size()==1 &&
+           path->values[0].text==basePath) {
+            if(base){setError(error,"找到多个相同安装底座，请先整理该卡车配件");return false;}
+            base=unit;
+        }
+    }
+    HomeReferences incoming;
+    if(!collectHomeReferences(doc,&incoming,error,canceled)) return false;
+    if(base && homeAccessoryShared(incoming,base->id,vehicle->id)) {
+        setError(error,"电视安装底座被共享，不能修改");return false;
+    }
+    std::unordered_set<std::string> used;
+    for(const auto& unit:doc.units) used.insert(idKey(unit.id));
+    std::string hookupId;
+    for(std::size_t n=1;n<=doc.units.size()+1;++n) {
+        const auto candidate="etzhome.tv"+std::to_string(n);
+        if(!used.count(candidate)){hookupId=candidate;break;}
+    }
+    if(hookupId.empty()){setError(error,"无法分配唯一 hookup 名称");return false;}
+    std::vector<Replacement> reps;
+    auto replace=[&](const Tok* token,const std::string& value) {
+        reps.push_back({token->begin,token->end,value});
+    };
+    auto appendArray=[&](const std::string& name,const Tok* count,const std::vector<const Tok*>& values,
+                         const std::string& value) {
+        replace(count,std::to_string(values.size()+1));
+        const auto pos=values.empty()?count->end:values.back()->end;
+        reps.push_back({pos,pos,"\n "+name+"["+std::to_string(values.size())+"]: "+value});
+    };
+    std::string appended;
+    if(base) {
+        const Tok* slotsCount=nullptr;const Tok* hooksCount=nullptr;
+        std::vector<const Tok*> slots,hooks;
+        if(!readArray(*base,"slot_name",&slotsCount,&slots,error) ||
+           !readArray(*base,"slot_hookup",&hooksCount,&hooks,error)) return false;
+        if(slots.size()!=hooks.size() || slots.size()>25) {
+            setError(error,"底座的挂点数组不匹配或超过 25 项");return false;
+        }
+        int found=-1;
+        for(std::size_t i=0;i<slots.size();++i) if(slots[i]->text=="slot_1") {
+            if(found>=0){setError(error,"底座包含重复 slot_1");return false;}
+            found=(int)i;
+        }
+        if(found>=0) {
+            const auto* hook=findById(doc,hooks[found]->text);
+            const auto* existingModel=hook ? findScalar(*hook,"model") : nullptr;
+            if(existingModel && existingModel->values.size()==1 && existingModel->values[0].text==model) {
+                setError(error,"所选卡车已经安装这份三屏电视预设，无需重复导入");return false;
+            }
+            if(!hooks[found]->text.empty()) {setError(error,"slot_1 已被其他配件占用，导入不会替换它");return false;}
+            replace(hooks[found],"\""+hookupId+"\"");
+        } else {
+            if(slots.size()>=25){setError(error,"安装底座已有 25 个挂点");return false;}
+            appendArray("slot_name",slotsCount,slots,"slot_1");
+            appendArray("slot_hookup",hooksCount,hooks,"\""+hookupId+"\"");
+        }
+    } else {
+        if(accessories.size()>=100){setError(error,"新增底座将超过卡车 100 个配件的上限");return false;}
+        std::string baseId;
+        for(std::size_t n=1;n<=doc.units.size()+1;++n) {
+            const auto candidate="_nameless.7ffd."+std::to_string(n);
+            if(!used.count(idKey(candidate))){baseId=candidate;break;}
+        }
+        if(baseId.empty()){setError(error,"无法分配唯一配件编号");return false;}
+        appendArray("accessories",accessoryCount,accessories,baseId);
+        appended="\nvehicle_addon_accessory : "+baseId+" {\n slot_name: 1\n slot_name[0]: slot_1\n"
+                 " slot_hookup: 1\n slot_hookup[0]: \""+hookupId+"\"\n wear: 0\n data_path: \""+basePath+"\"\n refund: 0\n}\n";
+    }
+    appendArray("entries",logCount,logEntries,"\""+hookupId+"\"");
+    appended+="\naccessory_hookup_data : "+hookupId+" {\n model: \""+model+"\"\n coll: \"\"\n look: MoRan\n variant: MoRan\n}\n";
+    const auto insert=doc.toks[doc.outerCloseTok].begin;
+    reps.push_back({insert,insert,appended});
+    std::string result;
+    if(!applyReplacements(text,std::move(reps),&result,error)) return false;
+    HomeAccessoryInventory finalInventory;
+    if(!inspectHomeAccessoriesText(result,&finalInventory,error,canceled)) return false;
+    *out=std::move(result);return true;
+}
+
+bool validateScaniaTvPresetInfo(const std::string& info,std::string* error) {
+    if(error) error->clear();
+    Doc doc;
+    if(!loadDoc(info,&doc,error)) return false;
+    if(doc.units.size()!=1 || doc.units[0].type!="save_container") {
+        setError(error,"存档信息结构无法识别，不能确认所需 DLC");return false;
+    }
+    const Tok* count=nullptr;std::vector<const Tok*> dependencies;
+    if(!readArray(doc.units[0],"dependencies",&count,&dependencies,error)) return false;
+    for(const auto* dep:dependencies) {
+        if(dep->kind!=TokKind::String) continue;
+        // 真实存档写作 "dlc|eut2_toys|DLC - Cabin Accessories" 或 "rdlc|eut2_toys|..."
+        // （rdlc/dlc 前缀因 DLC 类型而异，显示名随语言版本变化），旧测试夹具用过裸 "dlc_toys"。
+        if(dep->text=="dlc_toys" || dep->text.rfind("dlc|eut2_toys|",0)==0 ||
+           dep->text.rfind("rdlc|eut2_toys|",0)==0)
+            return true;
+    }
+    setError(error,"源存档未声明 Cabin Accessories（eut2_toys），请确认已启用该 DLC 后在游戏内重新保存");return false;
+}
+
+// =========================== 更换挂车 ===========================
+
+namespace {
+
+// "<font xscale=1.15>GS 56 87</font>|denmark" -> "GS 56 87 · denmark"
+std::string cleanLicensePlate(const std::string& raw) {
+    std::string text = raw;
+    for (;;) {
+        const std::size_t open = text.find("<font");
+        if (open == std::string::npos) break;
+        const std::size_t close = text.find('>', open);
+        if (close == std::string::npos) break;
+        text.erase(open, close - open + 1);
+        const std::size_t end = text.find("</font>", open);
+        if (end != std::string::npos) text.erase(end, 7);
+    }
+    std::string country;
+    const std::size_t bar = text.find('|');
+    if (bar != std::string::npos) {
+        country = text.substr(bar + 1);
+        text = text.substr(0, bar);
+    }
+    auto trim = [](std::string& s) {
+        const auto first = s.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) { s.clear(); return; }
+        const auto last = s.find_last_not_of(" \t\r\n");
+        s = s.substr(first, last - first + 1);
+    };
+    trim(text);
+    trim(country);
+    if (text.empty()) return std::string();
+    return country.empty() ? text : text + " · " + country;
+}
+
+// cargo_mass 来样是 "&469ab000"（IEEE 位十六进制），手工文本可能是十进制。
+bool parseFloatToken(const Tok& tok, float* out) {
+    if (tok.kind != TokKind::Atom) return false;
+    const std::string& s = tok.text;
+    if (s.size() == 9 && s[0] == '&') {
+        std::uint32_t bits = 0;
+        for (int i = 0; i < 8; ++i) {
+            const auto c = static_cast<unsigned char>(s[1 + i]);
+            const unsigned digit = c >= '0' && c <= '9' ? c - '0'
+                                 : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16u;
+            if (digit >= 16) return false;
+            bits = (bits << 4) | digit;
+        }
+        std::memcpy(out, &bits, sizeof(float));
+        return true;
+    }
+    char* end = nullptr;
+    const float value = std::strtof(s.c_str(), &end);
+    if (!end || *end != '\0' || end == s.c_str()) return false;
+    *out = value;
+    return true;
+}
+
+std::string trailerDefLabel(const Doc& doc, const UnitInfo& trailer) {
+    const Prop* def = findScalar(trailer, "trailer_definition");
+    if (!def || def->values.size() != 1) return trailer.id;
+    std::string raw = def->values[0].text;
+    if (startsNameless(raw)) {
+        const UnitInfo* unit = findById(doc, raw);
+        if (!unit || unit->type != "trailer_def") return raw;
+        const Prop* source = findScalar(*unit, "source_name");
+        if (source && source->values.size() == 1 && !source->values[0].text.empty()) {
+            raw = source->values[0].text;
+        } else {
+            const Prop* name = findScalar(*unit, "trailer");
+            if (name && name->values.size() == 1 && !name->values[0].text.empty())
+                raw = name->values[0].text;
+        }
+    }
+    if (raw.rfind("trailer_def.", 0) == 0) raw = raw.substr(12);
+    return raw.empty() ? trailer.id : raw;
+}
+
+// 解析当前耦合：活动 player_vehicles 槽位 + 可选的进行中任务。
+struct TrailerCoupling {
+    const UnitInfo* player = nullptr;
+    const UnitInfo* slot = nullptr;              // assigned_vehicles 指向的会话槽位
+    const UnitInfo* truck = nullptr;             // 槽位里的卡车（可为空）
+    const UnitInfo* currentTrailer = nullptr;    // 当前连着的挂车（可为空）
+    std::string currentTrailerId;
+    const UnitInfo* job = nullptr;               // 进行中的 player_job（可为空）
+    std::string jobTrailerId;                    // company_trailer（可为空）
+};
+
+const UnitInfo* referencedUnit(const Doc& doc, const UnitInfo& unit, const std::string& name,
+                               std::string* idOut = nullptr) {
+    const Prop* p = findScalar(unit, name);
+    if (!p || p->values.size() != 1 || p->values[0].kind != TokKind::Atom ||
+        p->values[0].text == "null")
+        return nullptr;
+    if (idOut) *idOut = p->values[0].text;
+    return findById(doc, p->values[0].text);
+}
+
+bool resolveTrailerCoupling(const Doc& doc, TrailerCoupling* out, std::string* error) {
+    const UnitInfo* player = findPlayer(doc, error);
+    if (!player) return false;
+    const std::string slotId = [&] {
+        const Prop* p = findScalar(*player, "assigned_vehicles");
+        return p && p->values.size() == 1 ? p->values[0].text : std::string();
+    }();
+    if (slotId.empty() || slotId == "null") {
+        setError(error, "这份存档没有可用的当前车辆槽位（assigned_vehicles）");
+        return false;
+    }
+    const UnitInfo* slot = findById(doc, slotId);
+    if (!slot || slot->type != "player_vehicles") {
+        setError(error, "当前车辆槽位指向无效单位：" + slotId);
+        return false;
+    }
+    out->player = player;
+    out->slot = slot;
+    out->truck = referencedUnit(doc, *slot, "vehicle");
+    referencedUnit(doc, *slot, "trailer", &out->currentTrailerId);
+    if (!out->currentTrailerId.empty()) {
+        out->currentTrailer = findById(doc, out->currentTrailerId);
+        if (!out->currentTrailer) {
+            setError(error, "当前挂车指向无效单位：" + out->currentTrailerId);
+            return false;
+        }
+    }
+    const UnitInfo* job = referencedUnit(doc, *player, "current_job");
+    if (job) {
+        if (job->type != "player_job") {
+            setError(error, "当前任务指向无效单位");
+            return false;
+        }
+        out->job = job;
+        referencedUnit(doc, *job, "company_trailer", &out->jobTrailerId);
+    }
+    return true;
+}
+
+void collectArrayRefs(const UnitInfo& unit, const std::string& name,
+                      std::unordered_set<std::string>* out) {
+    for (const Prop& p : unit.props) {
+        if (p.name != name || p.index < 0) continue;
+        for (const Tok& v : p.values)
+            if (v.kind == TokKind::Atom && v.text != "null") out->insert(idKey(v.text));
+    }
+}
+
+}  // namespace
+
+bool inspectTrailerSwapText(const std::string& text, TrailerSwapInventory* inventory,
+                            std::string* error, std::function<bool()> canceled) {
+    if (error) error->clear();
+    if (inventory) *inventory = TrailerSwapInventory{};
+    if (!inventory) {
+        setError(error, "inventory output is null");
+        return false;
+    }
+    Doc doc;
+    if (!loadDoc(text, &doc, error, canceled)) return false;
+    TrailerCoupling coupling;
+    if (!resolveTrailerCoupling(doc, &coupling, error)) return false;
+
+    TrailerSwapInventory result;
+    result.hasCurrent = !coupling.currentTrailerId.empty();
+    result.onJob = coupling.job != nullptr;
+    result.truckLabel = coupling.truck ? labelForVehicle(doc, *coupling.truck)
+                                       : std::string("未知卡车");
+    if (coupling.currentTrailer) {
+        result.currentId = coupling.currentTrailer->id;
+        result.currentLabel = trailerDefLabel(doc, *coupling.currentTrailer);
+        const Prop* plate = findScalar(*coupling.currentTrailer, "license_plate");
+        if (plate && plate->values.size() == 1)
+            result.currentPlate = cleanLicensePlate(plate->values[0].text);
+    }
+    if (coupling.job) {
+        const Prop* cargo = findScalar(*coupling.job, "cargo");
+        if (cargo && cargo->values.size() == 1 && !cargo->values[0].text.empty())
+            result.jobCargo = cargo->values[0].text;
+        const Prop* online = findScalar(*coupling.job, "online_job_id");
+        result.onlineJob = online && online->values.size() == 1 &&
+                           !online->values[0].text.empty() &&
+                           online->values[0].text.find_first_not_of("0") !=
+                               std::string::npos;
+    }
+
+    std::unordered_set<std::string> owned, driverAssigned, otherJobTrailer, slaveIds;
+    collectArrayRefs(*coupling.player, "trailers", &owned);
+    for (const UnitInfo& u : doc.units) {
+        if (canceled && canceled()) {
+            setError(error, "挂车读取已取消");
+            return false;
+        }
+        if (u.type == "driver") {
+            const std::string id = [&] {
+                const Prop* p = findScalar(u, "assigned_trailer");
+                return p && p->values.size() == 1 && p->values[0].text != "null"
+                           ? p->values[0].text : std::string();
+            }();
+            if (!id.empty()) driverAssigned.insert(idKey(id));
+        } else if (u.type == "player_job" && coupling.job && &u != coupling.job) {
+            const std::string id = [&] {
+                const Prop* p = findScalar(u, "company_trailer");
+                return p && p->values.size() == 1 && p->values[0].text != "null"
+                           ? p->values[0].text : std::string();
+            }();
+            if (!id.empty()) otherJobTrailer.insert(idKey(id));
+        } else if (u.type == "trailer") {
+            const std::string slave = [&] {
+                const Prop* p = findScalar(u, "slave_trailer");
+                return p && p->values.size() == 1 && p->values[0].text != "null"
+                           ? p->values[0].text : std::string();
+            }();
+            if (!slave.empty()) slaveIds.insert(idKey(slave));
+        }
+    }
+
+    bool currentIsDouble = false;
+    for (const UnitInfo& u : doc.units) {
+        if (u.type != "trailer") continue;
+        TrailerSwapEntry entry;
+        entry.id = u.id;
+        entry.label = trailerDefLabel(doc, u);
+        entry.owned = owned.count(idKey(u.id)) > 0;
+        entry.current = coupling.currentTrailer &&
+                        idKey(u.id) == idKey(coupling.currentTrailer->id);
+        entry.job = coupling.job && !coupling.jobTrailerId.empty() &&
+                    idKey(u.id) == idKey(coupling.jobTrailerId);
+        const Prop* plate = findScalar(u, "license_plate");
+        if (plate && plate->values.size() == 1)
+            entry.plate = cleanLicensePlate(plate->values[0].text);
+        const Prop* cargoMass = findScalar(u, "cargo_mass");
+        float mass = 0.f;
+        if (cargoMass && cargoMass->values.size() == 1)
+            parseFloatToken(cargoMass->values[0], &mass);
+        entry.cargoMass = mass;
+        const std::string slave = [&] {
+            const Prop* p = findScalar(u, "slave_trailer");
+            return p && p->values.size() == 1 && p->values[0].text != "null"
+                       ? p->values[0].text : std::string();
+        }();
+        const bool isSlave = slaveIds.count(idKey(u.id)) > 0;
+        if (!slave.empty() || isSlave) {
+            entry.blocked = true;
+            entry.blockReason = "双挂车组（带副车），暂不支持整体切换";
+            if (entry.current) currentIsDouble = true;
+        } else if (driverAssigned.count(idKey(u.id))) {
+            entry.blocked = true;
+            entry.blockReason = "AI 司机正在使用这辆挂车";
+        } else if (otherJobTrailer.count(idKey(u.id))) {
+            entry.blocked = true;
+            entry.blockReason = "被存档里的另一个任务占用";
+        } else {
+            const Prop* def = findScalar(u, "trailer_definition");
+            if (def && def->values.size() == 1 && startsNameless(def->values[0].text) &&
+                !findById(doc, def->values[0].text)) {
+                entry.blocked = true;
+                entry.blockReason = "挂车定义缺失（可能来自未启用的模组）";
+            }
+        }
+        result.entries.push_back(entry);
+    }
+    std::stable_sort(result.entries.begin(), result.entries.end(),
+                     [](const TrailerSwapEntry& a, const TrailerSwapEntry& b) {
+                         if (a.current != b.current) return a.current;
+                         if (a.owned != b.owned) return a.owned;
+                         return false;
+                     });
+    if (!result.hasCurrent) {
+        result.swapBlockReason =
+            "这份存档里卡车当前没有连接挂车。请在游戏里连上挂车后保存，再选这份存档。";
+    } else if (currentIsDouble) {
+        result.swapBlockReason = "当前是双挂车组（带副车），暂不支持整体切换";
+    }
+    *inventory = std::move(result);
+    return true;
+}
+
+bool swapTrailerText(const std::string& text, const std::string& targetTrailerId,
+                     std::string* out, std::string* error, std::function<bool()> canceled) {
+    if (error) error->clear();
+    if (out) out->clear();
+    if (!out) {
+        setError(error, "output is null");
+        return false;
+    }
+    Doc doc;
+    if (!loadDoc(text, &doc, error, canceled)) return false;
+    TrailerCoupling coupling;
+    if (!resolveTrailerCoupling(doc, &coupling, error)) return false;
+    if (coupling.currentTrailerId.empty() || !coupling.currentTrailer) {
+        setError(error, "这份存档里卡车当前没有连接挂车，无法更换");
+        return false;
+    }
+    const UnitInfo& current = *coupling.currentTrailer;
+    const UnitInfo* target = findById(doc, targetTrailerId);
+    if (!target || target->type != "trailer") {
+        setError(error, "目标挂车不存在：" + targetTrailerId);
+        return false;
+    }
+    if (idKey(target->id) == idKey(current.id)) {
+        setError(error, "所选挂车就是当前挂车，无需更换");
+        return false;
+    }
+    auto slaveOf = [](const UnitInfo& unit) -> std::string {
+        const Prop* p = findScalar(unit, "slave_trailer");
+        return p && p->values.size() == 1 && p->values[0].text != "null" ? p->values[0].text
+                                                                         : std::string();
+    };
+    if (!slaveOf(current).empty()) {
+        setError(error, "当前是双挂车组（带副车），暂不支持整体切换");
+        return false;
+    }
+    if (!slaveOf(*target).empty()) {
+        setError(error, "目标是双挂车组（带副车），暂不支持整体切换");
+        return false;
+    }
+    const Prop* targetDef = findScalar(*target, "trailer_definition");
+    if (targetDef && targetDef->values.size() == 1 &&
+        startsNameless(targetDef->values[0].text) &&
+        !findById(doc, targetDef->values[0].text)) {
+        setError(error, "目标挂车的定义缺失（可能来自未启用的模组），已拒绝");
+        return false;
+    }
+    std::unordered_set<std::string> slaveIds;
+    for (const UnitInfo& u : doc.units) {
+        if (u.type != "trailer") continue;
+        const std::string slave = slaveOf(u);
+        if (!slave.empty()) slaveIds.insert(idKey(slave));
+    }
+    if (slaveIds.count(idKey(target->id))) {
+        setError(error, "目标是双挂车组的副车，暂不支持整体切换");
+        return false;
+    }
+    for (const UnitInfo& u : doc.units) {
+        if (canceled && canceled()) {
+            setError(error, "更换挂车已取消");
+            return false;
+        }
+        if (u.type == "driver") {
+            const std::string id = [&] {
+                const Prop* p = findScalar(u, "assigned_trailer");
+                return p && p->values.size() == 1 && p->values[0].text != "null"
+                           ? p->values[0].text : std::string();
+            }();
+            if (!id.empty() && idKey(id) == idKey(target->id)) {
+                setError(error, "目标挂车正被 AI 司机使用，请先在游戏里换掉");
+                return false;
+            }
+        } else if (u.type == "player_job" && coupling.job && &u != coupling.job) {
+            const std::string id = [&] {
+                const Prop* p = findScalar(u, "company_trailer");
+                return p && p->values.size() == 1 && p->values[0].text != "null"
+                           ? p->values[0].text : std::string();
+            }();
+            if (!id.empty() && idKey(id) == idKey(target->id)) {
+                setError(error, "目标挂车被存档里的另一个任务占用，已拒绝");
+                return false;
+            }
+        }
+    }
+
+    std::vector<Replacement> reps;
+    const Prop* slotTrailer = findScalar(*coupling.slot, "trailer");
+    if (!slotTrailer || slotTrailer->values.size() != 1) {
+        setError(error, "当前槽位的挂车字段异常");
+        return false;
+    }
+    reps.push_back({slotTrailer->values[0].begin, slotTrailer->values[0].end, target->id});
+    if (coupling.job && !coupling.jobTrailerId.empty() &&
+        idKey(coupling.jobTrailerId) == idKey(current.id)) {
+        const Prop* p = findScalar(*coupling.job, "company_trailer");
+        if (p && p->values.size() == 1)
+            reps.push_back({p->values[0].begin, p->values[0].end, target->id});
+    }
+    // 货物随任务走：把旧挂车上的货物位原样搬到新挂车（无任务时两者通常都是零）。
+    for (const char* field : {"cargo_mass", "cargo_damage"}) {
+        const Prop* from = findScalar(current, field);
+        const Prop* to = findScalar(*target, field);
+        if (!from || !to || from->values.size() != 1 || to->values.size() != 1) continue;
+        reps.push_back({to->values[0].begin, to->values[0].end, from->values[0].text});
+    }
+    // 目标若还停在别的车库槽位上，先腾出那个槽（列表本身不动，挂车位保留）。
+    for (const UnitInfo& u : doc.units) {
+        if (u.type != "player_vehicles" || &u == coupling.slot) continue;
+        const Prop* p = findScalar(u, "trailer");
+        if (!p || p->values.size() != 1 || p->values[0].kind != TokKind::Atom) continue;
+        if (idKey(p->values[0].text) != idKey(target->id)) continue;
+        reps.push_back({p->values[0].begin, p->values[0].end, std::string("null")});
+        const Prop* attached = findScalar(u, "stored_trailer_attached");
+        if (attached && attached->values.size() == 1)
+            reps.push_back({attached->values[0].begin, attached->values[0].end,
+                            std::string("false")});
+    }
+    return applyReplacements(text, std::move(reps), out, error);
+}
+
 bool inspectTruckTransferText(const std::string& text, TransferInventory* inventory,
                               std::string* error, std::function<bool()> canceled) {
     if (error) error->clear();
@@ -1058,5 +1840,7 @@ bool transferTruckText(const std::string& source, const std::string& target,
     if (out) *out = std::move(result);
     return true;
 }
+
+#include "fleet_impl.inc"
 
 }  // namespace ets2

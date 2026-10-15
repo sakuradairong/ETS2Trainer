@@ -14,6 +14,7 @@ struct SaveCopyResult {
     GameId game = GameId::Ets2;
     std::wstring slotDir, slotName;
     std::string displayName, error;
+    std::string note; // Optional next steps for dependency-bearing copies.
 };
 struct SaveCopyOptions {
     std::function<bool()> canceled;

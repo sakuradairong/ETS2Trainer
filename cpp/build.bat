@@ -32,9 +32,21 @@ set "LIBS=d3d11.lib dxgi.lib bcrypt.lib user32.lib gdi32.lib shell32.lib ole32.l
 
 if /i "%~1"=="check" goto check
 if /i "%~1"=="clean" goto clean
+if not exist assets\home_presets\moran_scania_tv\MoRan\scania\TV\model\MoRan_3TV.pmd goto no_home_assets
+rc /nologo /fo build\homepreset_assets.res src\homepreset_assets.rc > build\resource.log 2>&1
+if errorlevel 1 goto resource_fail
+set "LIBS=%LIBS% build\homepreset_assets.res"
+goto home_assets_done
+:no_home_assets
+echo [build] Local Home preset assets absent; building without bundled preset.
+:home_assets_done
 if /i "%~1"=="test" goto testbuild
 set "OUTPUT=..\ETS2Trainer.exe"
 if /i "%~1"=="next" set "OUTPUT=..\ETS2Trainer_next.exe"
+if /i "%~1"=="fleet" set "OUTPUT=..\ETS2Trainer_fleet.exe"
+if /i "%~1"=="fleet-v3" set "OUTPUT=..\ETS2Trainer_fleet_v3.exe"
+if /i "%~1"=="fuel" set "OUTPUT=..\ETS2Trainer_fuel.exe"
+if /i "%~1"=="energy" set "OUTPUT=..\ETS2Trainer_energy.exe"
 if /i "%~1"=="readable" set "OUTPUT=..\ETS2Trainer_readable_export.exe"
 if /i "%~1"=="cockpit" set "OUTPUT=..\ETS2Trainer_cockpit.exe"
 
@@ -76,6 +88,11 @@ exit /b 0
 echo [test] FAILED, error lines:
 findstr /i "error" build\test_compile.log
 findstr /i "error" build\test_link.log
+exit /b 1
+
+:resource_fail
+echo [build] Home preset resource compilation failed:
+type build\resource.log
 exit /b 1
 
 :build_fail
